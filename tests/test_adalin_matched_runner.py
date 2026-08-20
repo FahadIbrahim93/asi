@@ -72,9 +72,7 @@ def test_campaign_runs_exact_five_seed_two_arm_roster(
     base_receipts: dict[bool, dict[str, object]],
 ) -> None:
     monkeypatch.setattr(runner, "run_adalin_development", _fake_runner(base_receipts))
-    result = cast(
-        dict[str, Any], runner.run_adalin_matched(*data, profile="contract-smoke")
-    )
+    result = cast(dict[str, Any], runner._execute_adalin_matched(*data, profile="contract-smoke"))
     runner.validate_adalin_matched(result, *data, profile="contract-smoke")
     assert len(runner.DEVELOPMENT_SEEDS) == 5
     assert [(row["seed"], row["arm"]) for row in result["rows"]] == [
@@ -93,9 +91,7 @@ def test_validator_rejects_self_consistent_metric_forgery_and_decision(
     base_receipts: dict[bool, dict[str, object]],
 ) -> None:
     monkeypatch.setattr(runner, "run_adalin_development", _fake_runner(base_receipts))
-    result = cast(
-        dict[str, Any], runner.run_adalin_matched(*data, profile="contract-smoke")
-    )
+    result = cast(dict[str, Any], runner._execute_adalin_matched(*data, profile="contract-smoke"))
     forged = copy.deepcopy(result)
     metrics = forged["rows"][1]["result"]["metrics"]
     metrics["task_preupdate_online_accuracy"][0] = 0.99
@@ -117,9 +113,7 @@ def test_validator_rejects_self_consistent_metric_forgery_and_decision(
     mistyped_policy["policy"]["development_only"] = 1
     _resign(mistyped_policy)
     with pytest.raises(ValueError, match="nonpromoting"):
-        runner.validate_adalin_matched(
-            mistyped_policy, *data, profile="contract-smoke"
-        )
+        runner.validate_adalin_matched(mistyped_policy, *data, profile="contract-smoke")
 
 
 def test_validator_rejects_roster_identity_and_resource_forgery(
@@ -128,9 +122,7 @@ def test_validator_rejects_roster_identity_and_resource_forgery(
     base_receipts: dict[bool, dict[str, object]],
 ) -> None:
     monkeypatch.setattr(runner, "run_adalin_development", _fake_runner(base_receipts))
-    result = cast(
-        dict[str, Any], runner.run_adalin_matched(*data, profile="contract-smoke")
-    )
+    result = cast(dict[str, Any], runner._execute_adalin_matched(*data, profile="contract-smoke"))
     missing = copy.deepcopy(result)
     missing["rows"].pop()
     _resign(missing)
@@ -157,17 +149,14 @@ def test_writer_is_create_only_and_replays(
     base_receipts: dict[bool, dict[str, object]],
 ) -> None:
     monkeypatch.setattr(runner, "run_adalin_development", _fake_runner(base_receipts))
-    result = runner.run_adalin_matched(*data, profile="contract-smoke")
+    monkeypatch.setattr(runner, "AUTHORIZATION_TRANSITION_APPROVED", True)
+    result = runner._execute_adalin_matched(*data, profile="contract-smoke")
     destination = tmp_path / "adalin-matched.json"
-    runner.write_adalin_matched(
-        destination, result, *data, profile="contract-smoke"
-    )
+    runner.write_adalin_matched(destination, result, *data, profile="contract-smoke")
     retained = json.loads(destination.read_bytes())
     runner.validate_adalin_matched(retained, *data, profile="contract-smoke")
     with pytest.raises(FileExistsError):
-        runner.write_adalin_matched(
-            destination, result, *data, profile="contract-smoke"
-        )
+        runner.write_adalin_matched(destination, result, *data, profile="contract-smoke")
 
 
 def test_preflight_rejects_dataset_before_execution(
@@ -183,10 +172,20 @@ def test_preflight_rejects_dataset_before_execution(
 
     monkeypatch.setattr(runner, "run_adalin_development", forbidden)
     with pytest.raises(ValueError, match="float32"):
-        runner.run_adalin_matched(
+        runner._execute_adalin_matched(
             data[0].astype(np.float64), *data[1:], profile="contract-smoke"
         )
     assert calls == 0
+
+
+def test_public_execution_and_cli_fail_closed_before_dataset_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner, "_load_dataset", lambda _path: pytest.fail("dataset read"))
+    with pytest.raises(RuntimeError, match="not independently authorized"):
+        runner.run_adalin_matched(object(), object(), object(), object())
+    with pytest.raises(RuntimeError, match="not independently authorized"):
+        runner.main(["--output", "/tmp/never", "--dataset", "/tmp/never"])
 
 
 def test_source_identity_covers_current_execution_closure() -> None:
@@ -195,4 +194,5 @@ def test_source_identity_covers_current_execution_closure() -> None:
         "uv.lock",
         "alberta_framework/benchmarks/adalin.py",
         "alberta_framework/evaluation/adalin_matched_runner.py",
+        "alberta_framework/evaluation/prospective_publication.py",
     }

@@ -10,7 +10,6 @@ import math
 import os
 import platform
 import sys
-import tempfile
 import zipfile
 from dataclasses import asdict
 from pathlib import Path
@@ -27,13 +26,12 @@ from alberta_framework.benchmarks.adalin import (
     run_adalin_development,
     validate_adalin_result,
 )
+from alberta_framework.evaluation.prospective_publication import publish_prepared_json_at
 
 RESULT_SCHEMA: Final = "asi.adalin.matched-development.v1"
 DEVELOPMENT_SEEDS: Final = (15710, 15711, 15712, 15713, 15714)
 ARMS: Final = ("relu_alpha_zero_mechanism_off", "adalin")
-_ARM_ENABLED: Final = MappingProxyType(
-    {"relu_alpha_zero_mechanism_off": False, "adalin": True}
-)
+_ARM_ENABLED: Final = MappingProxyType({"relu_alpha_zero_mechanism_off": False, "adalin": True})
 CAMPAIGN_PROFILES: Final = MappingProxyType(
     {
         "contract-smoke": AdaLinConfig(
@@ -61,6 +59,14 @@ _POLICY: Final = {
 _MAX_BYTES: Final = 256 * 1024 * 1024
 _MAX_JSON_NODES: Final = 100_000
 _MAX_JSON_STRING_BYTES: Final = 16_384
+_MAX_RESULT_BYTES: Final = 16 * 1024 * 1024
+EXECUTION_AUTHORIZED: Final = False
+AUTHORIZATION_TRANSITION_APPROVED: Final = False
+
+
+def _require_execution_authorized() -> None:
+    if AUTHORIZATION_TRANSITION_APPROVED is not True:
+        raise RuntimeError("AdaLin matched execution is not independently authorized")
 
 
 def _canonical(value: object) -> bytes:
@@ -127,6 +133,7 @@ def _source_identity() -> dict[str, str]:
         "uv.lock",
         "alberta_framework/benchmarks/adalin.py",
         "alberta_framework/evaluation/adalin_matched_runner.py",
+        "alberta_framework/evaluation/prospective_publication.py",
     )
     return {
         relative: hashlib.sha256((root / relative).read_bytes()).hexdigest()
@@ -154,8 +161,7 @@ def _runtime_identity() -> dict[str, object]:
         "platform_release": platform.release(),
         "machine": platform.machine(),
         "packages": {
-            name: importlib.metadata.version(name)
-            for name in ("chex", "jax", "jaxlib", "numpy")
+            name: importlib.metadata.version(name) for name in ("chex", "jax", "jaxlib", "numpy")
         },
         "backend": jax.default_backend(),
         "devices": [
@@ -228,8 +234,7 @@ def _validated_arrays(
     ):
         raise ValueError("labels are outside the configured class range")
     return tuple(
-        np.array(value, copy=True, order="C")
-        for value in (train_x, train_y, test_x, test_y)
+        np.array(value, copy=True, order="C") for value in (train_x, train_y, test_x, test_y)
     )  # type: ignore[return-value]
 
 
@@ -298,9 +303,7 @@ def _aggregate(rows: list[dict[str, object]]) -> dict[str, object]:
         "optimizer_state_bytes",
     )
     for arm in ARMS:
-        results = [
-            cast(dict[str, object], row["result"]) for row in rows if row["arm"] == arm
-        ]
+        results = [cast(dict[str, object], row["result"]) for row in rows if row["arm"] == arm]
         metrics = [cast(dict[str, object], result["metrics"]) for result in results]
         resources = [cast(dict[str, object], result["resources"]) for result in results]
         states = [cast(dict[str, object], result["state"]) for result in results]
@@ -326,14 +329,13 @@ def _aggregate(rows: list[dict[str, object]]) -> dict[str, object]:
                 for name in additive_names
             },
             "max_per_shard_state_bytes": {
-                name: max(cast(int, state[name]) for state in states)
-                for name in peak_names
+                name: max(cast(int, state[name]) for state in states) for name in peak_names
             },
         }
     return {"arms": arms, "row_count": len(rows)}
 
 
-def run_adalin_matched(
+def _execute_adalin_matched(
     train_inputs: object,
     train_labels: object,
     test_inputs: object,
@@ -400,6 +402,21 @@ def run_adalin_matched(
         reexecute=False,
     )
     return campaign
+
+
+def run_adalin_matched(
+    train_inputs: object,
+    train_labels: object,
+    test_inputs: object,
+    test_labels: object,
+    *,
+    profile: str = "bounded-development",
+) -> dict[str, object]:
+    """Fail closed until a separately reviewed change authorizes this plan."""
+    _require_execution_authorized()
+    return _execute_adalin_matched(
+        train_inputs, train_labels, test_inputs, test_labels, profile=profile
+    )
 
 
 def validate_adalin_matched(
@@ -502,9 +519,7 @@ def _validate_adalin_matched(
             train_x.shape[1],
             mechanism_enabled=enabled,
         )
-        if not _same_json_type_and_value(
-            checked_row["execution_identity"], expected_execution
-        ):
+        if not _same_json_type_and_value(checked_row["execution_identity"], expected_execution):
             raise ValueError("matched row execution identity drifted")
         validate_adalin_result(checked_row["result"])
         result = cast(dict[str, object], checked_row["result"])
@@ -516,8 +531,7 @@ def _validate_adalin_matched(
             raise ValueError("matched row dataset identity drifted")
         if (
             provenance["schedule_sha256"] != expected_execution["schedule_sha256"]
-            or provenance["initial_state_sha256"]
-            != expected_execution["initial_state_sha256"]
+            or provenance["initial_state_sha256"] != expected_execution["initial_state_sha256"]
         ):
             raise ValueError("matched row provenance identity drifted")
         observed.append((seed, arm))
@@ -550,18 +564,6 @@ def _validate_adalin_matched(
                 raise ValueError("matched row disagrees with strict current-source reexecution")
 
 
-def _preflight_destination(destination: Path) -> Path:
-    if type(destination) is not type(Path()):
-        raise TypeError("destination must be an exact Path")
-    parent = destination.parent.resolve(strict=True)
-    resolved = parent / destination.name
-    if not parent.is_dir() or destination.name in {"", ".", ".."}:
-        raise ValueError("destination parent must be an existing directory")
-    if os.path.lexists(resolved):
-        raise FileExistsError(f"refusing to replace existing result: {resolved}")
-    return resolved
-
-
 def write_adalin_matched(
     destination: Path,
     value: object,
@@ -573,39 +575,36 @@ def write_adalin_matched(
     profile: str = "bounded-development",
 ) -> None:
     """Strictly replay and publish one result without replacing retained data."""
-    resolved = _preflight_destination(destination)
-    validate_adalin_matched(
-        value,
-        train_inputs,
-        train_labels,
-        test_inputs,
-        test_labels,
-        profile=profile,
-    )
-    parent = resolved.parent
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=parent, prefix=f".{resolved.name}.", suffix=".tmp"
-    )
-    temporary = Path(temporary_name)
-    published = False
+    _require_execution_authorized()
+    if type(destination) is not type(Path()):
+        raise TypeError("destination must be an exact Path")
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    directory = os.open(destination.parent, flags)
     try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(_canonical(value) + b"\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.link(temporary, resolved, follow_symlinks=False)
-        published = True
-        directory = os.open(parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
-    except BaseException:
-        if published:
-            resolved.unlink(missing_ok=True)
-        raise
+
+        def validate(candidate: object) -> None:
+            validate_adalin_matched(
+                candidate,
+                train_inputs,
+                train_labels,
+                test_inputs,
+                test_labels,
+                profile=profile,
+            )
+
+        def prepare() -> bytes:
+            validate(value)
+            return _canonical(value) + b"\n"
+
+        publish_prepared_json_at(
+            directory,
+            destination.name,
+            prepare=prepare,
+            validate_loaded=validate,
+            max_bytes=_MAX_RESULT_BYTES,
+        )
     finally:
-        temporary.unlink(missing_ok=True)
+        os.close(directory)
 
 
 def _load_dataset(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -643,6 +642,37 @@ def _load_dataset(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.nd
         )  # type: ignore[return-value]
 
 
+def _execute_cli_to_reserved_path(destination: Path, dataset: Path, profile: str) -> None:
+    """Reserve the destination before dataset loading or campaign execution."""
+    if type(destination) is not type(Path()):
+        raise TypeError("destination must be an exact Path")
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    directory = os.open(destination.parent, flags)
+    arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
+    try:
+
+        def prepare() -> bytes:
+            nonlocal arrays
+            arrays = _load_dataset(dataset)
+            result = _execute_adalin_matched(*arrays, profile=profile)
+            return _canonical(result) + b"\n"
+
+        def validate_loaded(candidate: object) -> None:
+            if arrays is None:
+                raise RuntimeError("CLI arrays were not bound before publication validation")
+            validate_adalin_matched(candidate, *arrays, profile=profile)
+
+        publish_prepared_json_at(
+            directory,
+            destination.name,
+            prepare=prepare,
+            validate_loaded=validate_loaded,
+            max_bytes=_MAX_RESULT_BYTES,
+        )
+    finally:
+        os.close(directory)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
@@ -651,10 +681,8 @@ def main(argv: list[str] | None = None) -> int:
         "--profile", choices=tuple(CAMPAIGN_PROFILES), default="bounded-development"
     )
     args = parser.parse_args(argv)
-    _preflight_destination(args.output)
-    arrays = _load_dataset(args.dataset)
-    result = run_adalin_matched(*arrays, profile=args.profile)
-    write_adalin_matched(args.output, result, *arrays, profile=args.profile)
+    _require_execution_authorized()
+    _execute_cli_to_reserved_path(args.output, args.dataset, args.profile)
     return 0
 
 

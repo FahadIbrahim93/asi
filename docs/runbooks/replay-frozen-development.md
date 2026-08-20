@@ -16,6 +16,13 @@ resource counters. Validation recomputes every shard. Unqualified runner timing
 is discarded and canonicalized to zero; peak working set and scalar FLOPs are
 not claimed.
 
+The public campaign and retention entry points are hard-disabled. Authorization
+requires a separate reviewed change to both the plan declaration and transition
+gate. Unit tests use the private bounded executor. Once authorized, retention
+reserves the content name before strict replay through a pinned no-follow
+directory chain, then links without replacement, fsyncs, boundedly rereads, and
+strictly reload-validates the report.
+
 ## Operator sequence
 
 Do not execute this campaign from pytest. Use a new absolute run root and

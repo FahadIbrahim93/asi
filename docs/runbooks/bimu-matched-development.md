@@ -35,3 +35,10 @@ is telemetry only. Consistency hashes are not authenticated execution proof.
 Paper comparison remains closed until the official data order, five-run
 aggregate, paper-scale 1,000-task stream, and other recorded protocol gaps are
 reproduced under a separately reviewed protocol.
+
+The public runner and publisher are hard-disabled. A later, independently
+reviewed authorization change must flip both the plan authorization and the
+runner transition gate. Tests exercise only the private bounded executor.
+Publication reserves a deterministic create-only name through a pinned
+no-follow directory descriptor before strict reexecution, then uses a
+no-replace link, fsync, bounded reread, and strict reload validation.

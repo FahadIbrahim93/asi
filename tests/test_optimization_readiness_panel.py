@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 import alberta_framework.evaluation.optimization_readiness_panel as panel_module
+import alberta_framework.evaluation.prospective_publication as publication_module
 from alberta_framework.evaluation.optimization_readiness_panel import (
     PANEL_SCHEMA,
     OptimizationReadinessPanelCase,
@@ -35,7 +36,7 @@ def _cases() -> tuple[OptimizationReadinessPanelCase, ...]:
 
 def test_panel_executes_unique_real_cases_and_derives_association() -> None:
     cases = _cases()
-    result = run_optimization_readiness_panel(cases)
+    result = panel_module._execute_optimization_readiness_panel(cases)
 
     assert result["schema"] == PANEL_SCHEMA
     assert result["policy"] == {
@@ -81,7 +82,7 @@ def test_panel_executes_unique_real_cases_and_derives_association() -> None:
 
 def test_panel_validator_reexecutes_and_rejects_forged_outcome() -> None:
     cases = _cases()
-    result = run_optimization_readiness_panel(cases)
+    result = panel_module._execute_optimization_readiness_panel(cases)
     forged = copy.deepcopy(result)
     forged["association"]["status"] = "supported"
     if result["association"]["status"] == "supported":
@@ -111,7 +112,7 @@ def test_panel_requires_exact_unique_case_roster_before_execution(
         forbidden,
     )
     with pytest.raises(ValueError, match="unique"):
-        run_optimization_readiness_panel(tuple(cases))
+        panel_module._execute_optimization_readiness_panel(tuple(cases))
 
 
 def test_panel_rejects_renamed_duplicate_dataset_checkpoint_content() -> None:
@@ -128,12 +129,15 @@ def test_panel_rejects_renamed_duplicate_dataset_checkpoint_content() -> None:
     )
 
     with pytest.raises(ValueError, match="content identities must be unique"):
-        run_optimization_readiness_panel(tuple(cases))
+        panel_module._execute_optimization_readiness_panel(tuple(cases))
 
 
-def test_panel_retention_is_create_only_and_round_trips(tmp_path: Path) -> None:
+def test_panel_retention_is_create_only_and_round_trips(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(panel_module, "AUTHORIZATION_TRANSITION_APPROVED", True)
     cases = _cases()
-    result = run_optimization_readiness_panel(cases)
+    result = panel_module._execute_optimization_readiness_panel(cases)
     destination = retain_optimization_readiness_panel(
         result,
         cases=cases,
@@ -150,9 +154,12 @@ def test_panel_retention_is_create_only_and_round_trips(tmp_path: Path) -> None:
         )
 
 
-def test_panel_retention_rejects_namespace_symlink(tmp_path: Path) -> None:
+def test_panel_retention_rejects_namespace_symlink(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(panel_module, "AUTHORIZATION_TRANSITION_APPROVED", True)
     cases = _cases()
-    result = run_optimization_readiness_panel(cases)
+    result = panel_module._execute_optimization_readiness_panel(cases)
     outside = tmp_path / "outside"
     outside.mkdir()
     (tmp_path / "outputs").symlink_to(outside, target_is_directory=True)
@@ -165,13 +172,14 @@ def test_panel_retention_removes_partial_bytes_after_write_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(panel_module, "AUTHORIZATION_TRANSITION_APPROVED", True)
     cases = _cases()
-    result = run_optimization_readiness_panel(cases)
+    result = panel_module._execute_optimization_readiness_panel(cases)
 
     def failed_write(_descriptor: int, _payload: bytes) -> int:
         raise OSError("injected write failure")
 
-    monkeypatch.setattr(panel_module.os, "write", failed_write)
+    monkeypatch.setattr(publication_module.os, "write", failed_write)
     with pytest.raises(OSError, match="injected"):
         retain_optimization_readiness_panel(result, cases=cases, repository_root=tmp_path)
     destination = tmp_path / "outputs/optimization_readiness/development.v1"
@@ -188,4 +196,11 @@ def test_panel_rejects_oversized_case_roster_before_array_access(
 
     monkeypatch.setattr(np, "asarray", forbidden)
     with pytest.raises(ValueError, match="six-case"):
-        run_optimization_readiness_panel((case,) * 17)
+        panel_module._execute_optimization_readiness_panel((case,) * 17)
+
+
+def test_public_panel_and_publisher_fail_closed_before_case_work(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="not independently authorized"):
+        run_optimization_readiness_panel(object())
+    with pytest.raises(RuntimeError, match="not independently authorized"):
+        retain_optimization_readiness_panel(object(), cases=object(), repository_root=tmp_path)

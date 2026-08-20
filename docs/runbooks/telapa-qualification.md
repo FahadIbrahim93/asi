@@ -62,6 +62,12 @@ publisher at
 does not write `outputs/`. Publication remains unauthorized until this
 prospective protocol is independently reviewed and merged.
 
+The non-catalog CLI, public comparator, and publisher are hard-disabled behind
+a separate authorization transition. Contract tests use only the private
+bounded executor. Publication reserves its content name through pinned
+no-follow directory descriptors before deterministic replay validation, then
+uses a no-replace link, fsync, bounded reread, and strict reload validation.
+
 Run the CI-cheap smoke or print only its catalog:
 
 ```bash

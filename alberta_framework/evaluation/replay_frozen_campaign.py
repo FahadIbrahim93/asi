@@ -29,6 +29,10 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     build_schedule,
     init_mlp_params,
 )
+from alberta_framework.evaluation.prospective_publication import (
+    open_directory_chain,
+    publish_prepared_json_at,
+)
 from alberta_framework.evaluation.replay_frozen_ipmnist_nonpromoting import (
     DEVELOPMENT_SEEDS,
     PROTOCOL,
@@ -50,12 +54,8 @@ _MAX_SOURCE_FILES: Final = 1_024
 _MAX_CAMPAIGN_OBSERVATIONS: Final = 40_000_000
 _MAX_CAMPAIGN_MODEL_QUERIES: Final = 800_000_000
 _MAX_SCHEDULE_BYTES: Final = 128 * 1024 * 1024
-_CANONICAL_X_SHA256: Final = (
-    "b8078cd833f53d89828a5e28d728517be9add34076f13fe973399f1f16381313"
-)
-_CANONICAL_Y_SHA256: Final = (
-    "4f1dd9551f104f8153409e0add59f0a71568f7bad5a5f8e2274480c186fe219a"
-)
+_CANONICAL_X_SHA256: Final = "b8078cd833f53d89828a5e28d728517be9add34076f13fe973399f1f16381313"
+_CANONICAL_Y_SHA256: Final = "4f1dd9551f104f8153409e0add59f0a71568f7bad5a5f8e2274480c186fe219a"
 _DATASET_SOURCE: Final = {
     "provider": "openml",
     "name": "mnist_784",
@@ -74,6 +74,13 @@ _POLICY: Final = {
     "hillclimb_gate_evaluated": False,
 }
 FROZEN_CAMPAIGN_CONFIG: Final = IPMNISTConfig(n_tasks=20, task_length=5_000)
+EXECUTION_AUTHORIZED: Final = False
+AUTHORIZATION_TRANSITION_APPROVED: Final = False
+
+
+def _require_execution_authorized() -> None:
+    if AUTHORIZATION_TRANSITION_APPROVED is not True:
+        raise RuntimeError("replay/frozen execution is not independently authorized")
 
 
 def _canonical(value: object) -> bytes:
@@ -175,12 +182,16 @@ def _preflight_config(config: object) -> IPMNISTConfig:
 def _receipt_family(arm: str) -> str:
     if arm not in registered_arms():
         raise ValueError("arm is outside the replay/frozen campaign roster")
-    return "replay" if screening_spec(arm).mechanism == "replay_in_context" else {
-        "randumb_random_features": "randumb",
-        "ranpac_random_projection": "ranpac",
-        "prol_prompt_mechanism_off": "prol",
-        "prol_prompt_proxy": "prol",
-    }[arm]
+    return (
+        "replay"
+        if screening_spec(arm).mechanism == "replay_in_context"
+        else {
+            "randumb_random_features": "randumb",
+            "ranpac_random_projection": "ranpac",
+            "prol_prompt_mechanism_off": "prol",
+            "prol_prompt_proxy": "prol",
+        }[arm]
+    )
 
 
 def _validated_arrays(
@@ -211,19 +222,15 @@ def _validated_arrays(
 
 
 def _require_frozen_dataset_identity(value: object) -> dict[str, object]:
-    if type(value) is not dict or set(value) != {
-        "schema", "source", "materialization", "x", "y"
-    }:
+    if type(value) is not dict or set(value) != {"schema", "source", "materialization", "x", "y"}:
         raise ValueError("frozen dataset identity fields drifted")
     identity = cast(dict[str, object], value)
     if (
         identity["schema"] != "alberta.ipmnist_screening.dataset_provenance.v1"
         or identity["source"] != _DATASET_SOURCE
         or identity["materialization"] != _DATASET_MATERIALIZATION
-        or identity["x"]
-        != {"dtype": "<f4", "shape": [60_000, 784], "sha256": _CANONICAL_X_SHA256}
-        or identity["y"]
-        != {"dtype": "<i4", "shape": [60_000], "sha256": _CANONICAL_Y_SHA256}
+        or identity["x"] != {"dtype": "<f4", "shape": [60_000, 784], "sha256": _CANONICAL_X_SHA256}
+        or identity["y"] != {"dtype": "<i4", "shape": [60_000], "sha256": _CANONICAL_Y_SHA256}
     ):
         raise ValueError("dataset does not match the retained canonical identity")
     return identity
@@ -245,7 +252,10 @@ def _read_source(path: Path) -> bytes:
             payload.extend(chunk)
         after = os.fstat(descriptor)
         if len(payload) != before.st_size or (
-            before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            before.st_mtime_ns,
         ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
             raise ValueError("campaign source changed during its bounded read")
         return bytes(payload)
@@ -281,9 +291,14 @@ def _runtime_identity() -> dict[str, object]:
         np.__config__.CONFIG, ensure_ascii=True, separators=(",", ":"), sort_keys=True
     ).encode("ascii")
     names = (
-        "JAX_PLATFORMS", "JAX_PLATFORM_NAME", "JAX_ENABLE_X64",
-        "JAX_DEFAULT_PRNG_IMPL", "JAX_DEFAULT_MATMUL_PRECISION",
-        "JAX_RANDOM_SEED_OFFSET", "JAX_NUM_CPU_DEVICES", "XLA_FLAGS",
+        "JAX_PLATFORMS",
+        "JAX_PLATFORM_NAME",
+        "JAX_ENABLE_X64",
+        "JAX_DEFAULT_PRNG_IMPL",
+        "JAX_DEFAULT_MATMUL_PRECISION",
+        "JAX_RANDOM_SEED_OFFSET",
+        "JAX_NUM_CPU_DEVICES",
+        "XLA_FLAGS",
     )
     environment: dict[str, str | None] = {}
     for name in names:
@@ -400,8 +415,7 @@ def _seed_identity(seed: int, *, config: IPMNISTConfig, n_train: int) -> dict[st
 def _plan(config: IPMNISTConfig) -> dict[str, object]:
     raw_official = cast(dict[str, object], PROTOCOL["official_code"])
     official = {
-        name: list(value) if type(value) is tuple else value
-        for name, value in raw_official.items()
+        name: list(value) if type(value) is tuple else value for name, value in raw_official.items()
     }
     return {
         "schema": PLAN_SCHEMA,
@@ -413,7 +427,7 @@ def _plan(config: IPMNISTConfig) -> dict[str, object]:
         "rng_impl": _RNG_IMPL,
         "noise_mode": "step",
         "decision_rule": "inconclusive_only_no_selection",
-        "execution_authorized": False,
+        "execution_authorized": EXECUTION_AUTHORIZED,
         "seed_history_audit": (
             "1573001--1573005 had zero exact matches on current main or full git history "
             "when prospectively frozen on 2026-08-20; retained seeds 0--4 are excluded"
@@ -447,13 +461,8 @@ def _resources(
         cast(dict[str, object], cast(dict[str, object], row["receipt"])["resources"])
         for row in runs
     ]
-    integer_fields = sorted(
-        name for name, value in child[0].items() if type(value) is int
-    )
-    totals = {
-        name: sum(cast(int, resource[name]) for resource in child)
-        for name in integer_fields
-    }
+    integer_fields = sorted(name for name, value in child[0].items() if type(value) is int)
+    totals = {name: sum(cast(int, resource[name]) for resource in child) for name in integer_fields}
     state_bytes = sum(
         cast(int, state["numeric_bytes"])
         for seed in seeds
@@ -555,7 +564,7 @@ def _build_campaign(
     return payload
 
 
-def run_replay_frozen_campaign(
+def _execute_replay_frozen_campaign(
     data_x: object,
     data_y: object,
     *,
@@ -571,14 +580,33 @@ def run_replay_frozen_campaign(
     return result
 
 
+def run_replay_frozen_campaign(
+    data_x: object,
+    data_y: object,
+    *,
+    config: IPMNISTConfig = FROZEN_CAMPAIGN_CONFIG,
+) -> dict[str, object]:
+    """Fail closed until a separately reviewed change authorizes this plan."""
+    _require_execution_authorized()
+    return _execute_replay_frozen_campaign(data_x, data_y, config=config)
+
+
 def _static_preflight(value: object) -> dict[str, object]:
     _assert_plain_json(value)
     if type(value) is not dict:
         raise ValueError("campaign must be an exact object")
     root = cast(dict[str, object], value)
     expected = {
-        "schema", "status", "plan", "identity", "policy", "seed_identities",
-        "runs", "development_outcome", "resources", "result_sha256",
+        "schema",
+        "status",
+        "plan",
+        "identity",
+        "policy",
+        "seed_identities",
+        "runs",
+        "development_outcome",
+        "resources",
+        "result_sha256",
     }
     if set(root) != expected or root["schema"] != CAMPAIGN_SCHEMA or root["status"] != "complete":
         raise ValueError("campaign schema or fields drifted")
@@ -597,9 +625,7 @@ def _static_preflight(value: object) -> dict[str, object]:
     roster: list[tuple[object, object]] = []
     by_seed: dict[int, list[dict[str, object]]] = {seed: [] for seed in DEVELOPMENT_SEEDS}
     for row in runs:
-        if type(row) is not dict or set(row) != {
-            "seed", "arm", "seed_identity_sha256", "receipt"
-        }:
+        if type(row) is not dict or set(row) != {"seed", "arm", "seed_identity_sha256", "receipt"}:
             raise ValueError("campaign run row fields drifted")
         seed, arm = row["seed"], row["arm"]
         if type(seed) is not int or seed not in DEVELOPMENT_SEEDS:
@@ -620,9 +646,7 @@ def _static_preflight(value: object) -> dict[str, object]:
             raise ValueError("campaign run seed identity drifted")
         roster.append((seed, arm))
         by_seed[seed].append(receipt)
-    expected_roster = [
-        (seed, arm) for seed in DEVELOPMENT_SEEDS for arm in registered_arms()
-    ]
+    expected_roster = [(seed, arm) for seed in DEVELOPMENT_SEEDS for arm in registered_arms()]
     if roster != expected_roster:
         raise ValueError("campaign run roster order drifted")
     for seed in DEVELOPMENT_SEEDS:
@@ -691,74 +715,32 @@ def retain_replay_frozen_campaign(
     repository_root: Path,
 ) -> Path:
     """Validate and publish one content-named result without replacement."""
+    _require_execution_authorized()
     if type(repository_root) is not PosixPath or not repository_root.is_absolute():
         raise ValueError("repository_root must be an exact absolute POSIX Path")
-    validated = validate_replay_frozen_campaign(value, data_x, data_y, config=config)
-    encoded = _canonical(validated)
-    digest = cast(str, validated["result_sha256"])
+    if type(value) is not dict or type(value.get("result_sha256")) is not str:
+        raise ValueError("campaign lacks an exact claimed digest")
+    digest = cast(str, value["result_sha256"])
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError("campaign claimed digest is invalid")
     segments = ("outputs", "replay_frozen", "development.v1")
-    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
-    directory = os.open(repository_root, flags)
+    directory = open_directory_chain(repository_root, segments)
     destination = f"result.{digest}.json"
-    temporary = f".result.{digest}.tmp"
-    published = False
     try:
-        for segment in segments:
-            try:
-                os.mkdir(segment, mode=0o755, dir_fd=directory)
-            except FileExistsError:
-                pass
-            next_directory = os.open(segment, flags, dir_fd=directory)
-            os.close(directory)
-            directory = next_directory
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o444,
-            dir_fd=directory,
-        )
-        try:
-            offset = 0
-            while offset < len(encoded):
-                written = os.write(descriptor, encoded[offset:])
-                if written <= 0:
-                    raise OSError("campaign retention write made no progress")
-                offset += written
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-        try:
-            os.link(
-                temporary,
-                destination,
-                src_dir_fd=directory,
-                dst_dir_fd=directory,
-                follow_symlinks=False,
-            )
-            published = True
-        finally:
-            os.unlink(temporary, dir_fd=directory)
-        descriptor = os.open(
+
+        def validate(candidate: object) -> None:
+            validate_replay_frozen_campaign(candidate, data_x, data_y, config=config)
+
+        def prepare() -> bytes:
+            return _canonical(validate_replay_frozen_campaign(value, data_x, data_y, config=config))
+
+        publish_prepared_json_at(
+            directory,
             destination,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=directory,
+            prepare=prepare,
+            validate_loaded=validate,
+            max_bytes=_MAX_RESULT_BYTES,
         )
-        try:
-            loaded = bytearray()
-            while len(loaded) <= _MAX_RESULT_BYTES:
-                chunk = os.read(descriptor, min(64 * 1024, _MAX_RESULT_BYTES + 1 - len(loaded)))
-                if not chunk:
-                    break
-                loaded.extend(chunk)
-        finally:
-            os.close(descriptor)
-        if bytes(loaded) != encoded:
-            raise RuntimeError("retained campaign bytes changed during publication")
-        os.fsync(directory)
-    except BaseException:
-        if published:
-            os.unlink(destination, dir_fd=directory)
-        raise
     finally:
         os.close(directory)
     return repository_root.joinpath(*segments, destination)

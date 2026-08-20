@@ -12,6 +12,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path, PosixPath
@@ -24,6 +25,7 @@ import numpy as np
 from jax import Array
 
 import alberta_framework.core.policy_archive as policy_archive_module
+import alberta_framework.evaluation.prospective_publication as prospective_publication_module
 import alberta_framework.streams.closed_loop as closed_loop_module
 from alberta_framework.benchmarks.qualification_provenance import (
     QualificationIdentity,
@@ -31,8 +33,11 @@ from alberta_framework.benchmarks.qualification_provenance import (
     identity_from_payload,
     require_current_identity,
 )
-from alberta_framework.benchmarks.upgd_ipmnist import atomic_write_new
 from alberta_framework.core.policy_archive import BoundedPolicyArchive, PolicyEntry
+from alberta_framework.evaluation.prospective_publication import (
+    open_directory_chain,
+    publish_prepared_json_at,
+)
 from alberta_framework.streams.closed_loop import SwitchingTwoStateConfig, SwitchingTwoStateMDP
 
 SCHEMA = "asi.telapa_qualification_smoke.development.v2"
@@ -94,12 +99,23 @@ _PAPER_REGISTRY = (
     ("repository_revision", None),
     ("repository_tree_digest", None),
 )
+EXECUTION_AUTHORIZED = False
+AUTHORIZATION_TRANSITION_APPROVED = False
+
+
+def _require_execution_authorized() -> None:
+    if AUTHORIZATION_TRANSITION_APPROVED is not True:
+        raise RuntimeError("TeLAPA local comparator is not independently authorized")
 
 
 def _current_identity() -> QualificationIdentity:
     return collect_qualification_identity(
         lane_module=sys.modules[__name__],
-        dependency_modules=(policy_archive_module, closed_loop_module),
+        dependency_modules=(
+            policy_archive_module,
+            prospective_publication_module,
+            closed_loop_module,
+        ),
         workload_registry=_WORKLOAD_REGISTRY,
         paper_registry=_PAPER_REGISTRY,
     )
@@ -283,9 +299,7 @@ class TeLAPASmokeConfig:
         maximum_entry_bytes = maximum_identity_bytes + _POLICY_BYTES + 4 * 8 + 8
         required_archive_bytes = maximum_entry_bytes * (self.steps // self.phase_length)
         if self.archive_byte_budget < required_archive_bytes:
-            raise ValueError(
-                "archive_byte_budget cannot retain the worst-case matched diverse arm"
-            )
+            raise ValueError("archive_byte_budget cannot retain the worst-case matched diverse arm")
         for name, value, upper in (
             ("min_latent_distance", self.min_latent_distance, 10.0),
             ("learning_rate", self.learning_rate, 1.0),
@@ -308,9 +322,7 @@ def _config_payload(config: TeLAPASmokeConfig) -> dict[str, object]:
 
 
 @jax.jit
-def rollout_latent_descriptor(
-    observations: Array, actions: Array, rewards: Array
-) -> Array:
+def rollout_latent_descriptor(observations: Array, actions: Array, rewards: Array) -> Array:
     """Return a fixed behavioral descriptor from one phase of live experience."""
 
     return jnp.stack(
@@ -358,10 +370,7 @@ class SwitchingPolicyLifeAdapter:
 
     def init(self, key: Array) -> tuple[Any, np.ndarray]:
         environment_state = self.environment.init(jr.fold_in(key, 0))
-        policy = (
-            np.asarray(jr.normal(jr.fold_in(key, 1), _POLICY_SHAPE), dtype=np.float32)
-            * 0.01
-        )
+        policy = np.asarray(jr.normal(jr.fold_in(key, 1), _POLICY_SHAPE), dtype=np.float32) * 0.01
         return environment_state, policy
 
     def step(
@@ -568,7 +577,7 @@ def _comparison_payloads(
     return comparisons
 
 
-def run_smoke(config: TeLAPASmokeConfig | None = None) -> dict[str, Any]:
+def _execute_smoke(config: TeLAPASmokeConfig | None = None) -> dict[str, Any]:
     """Execute the bounded matched development matrix in-process."""
 
     config = TeLAPASmokeConfig() if config is None else config
@@ -636,6 +645,12 @@ def run_smoke(config: TeLAPASmokeConfig | None = None) -> dict[str, Any]:
     return result
 
 
+def run_smoke(config: TeLAPASmokeConfig | None = None) -> dict[str, Any]:
+    """Fail closed until a separately reviewed change authorizes this comparator."""
+    _require_execution_authorized()
+    return _execute_smoke(config)
+
+
 def _require_exact_keys(value: object, expected: set[str], name: str) -> dict[str, Any]:
     if type(value) is not dict:
         raise ValueError(f"{name} must be an exact object")
@@ -652,10 +667,20 @@ def validate_result(value: object) -> None:
     root = _require_exact_keys(
         value,
         {
-            "schema", "identity", "catalog", "config", "matched_axes", "allowed_information",
-            "mechanism_off_parity", "records", "comparisons", "negative_retention",
+            "schema",
+            "identity",
+            "catalog",
+            "config",
+            "matched_axes",
+            "allowed_information",
+            "mechanism_off_parity",
+            "records",
+            "comparisons",
+            "negative_retention",
             "classification",
-            "scientific_promotion_allowed", "paper_parity_claimed", "performance_claimed",
+            "scientific_promotion_allowed",
+            "paper_parity_claimed",
+            "performance_claimed",
         },
         "result",
     )
@@ -683,9 +708,15 @@ def validate_result(value: object) -> None:
     config_payload["seeds"] = tuple(config_payload["seeds"])
     config = TeLAPASmokeConfig(**config_payload)
     expected_axes = [
-        "seed", "environment_steps", "observations_consumed", "policy_updates",
-        "policy_queries", "rng_root_keys", "rng_key_derivations",
-        "rng_root_persistent_bytes", "descriptor_model_queries",
+        "seed",
+        "environment_steps",
+        "observations_consumed",
+        "policy_updates",
+        "policy_queries",
+        "rng_root_keys",
+        "rng_key_derivations",
+        "rng_root_persistent_bytes",
+        "descriptor_model_queries",
         "task_boundary_disclosures",
     ]
     if (
@@ -725,8 +756,8 @@ def validate_result(value: object) -> None:
         or type(negative["policy"]) is not str
         or negative
         != {
-        "required": True,
-        "policy": "retain every valid development outcome, including ties and regressions",
+            "required": True,
+            "policy": "retain every valid development outcome, including ties and regressions",
         }
     ):
         raise ValueError("negative retention must remain mandatory")
@@ -734,20 +765,41 @@ def validate_result(value: object) -> None:
     if type(records) is not list or len(records) != len(config.seeds) * len(_ARMS):
         raise ValueError("record matrix is incomplete")
     record_keys = {
-        "arm", "seed", "observation_sha256", "action_sha256", "reward_sha256",
-        "initial_policy_sha256", "final_policy_sha256", "reward_sum", "mean_reward",
-        "archive_entry_count", "resource_receipt",
+        "arm",
+        "seed",
+        "observation_sha256",
+        "action_sha256",
+        "reward_sha256",
+        "initial_policy_sha256",
+        "final_policy_sha256",
+        "reward_sum",
+        "mean_reward",
+        "archive_entry_count",
+        "resource_receipt",
     }
     receipt_keys = {
-        "environment_steps", "observations_consumed", "policy_updates", "policy_queries",
-        "rng_implementation", "rng_root_keys", "rng_key_derivations",
+        "environment_steps",
+        "observations_consumed",
+        "policy_updates",
+        "policy_queries",
+        "rng_implementation",
+        "rng_root_keys",
+        "rng_key_derivations",
         "rng_root_persistent_bytes",
-        "descriptor_model_queries", "archive_selection_entry_queries",
-        "anchor_selection_queries", "task_boundary_disclosures",
-        "observation_bytes", "action_bytes", "reward_bytes",
-        "active_policy_persistent_bytes", "archive_persistent_bytes",
-        "mechanism_off_anchor_bytes", "descriptor_model_persistent_bytes",
-        "environment_state_persistent_bytes", "timing", "timing_policy",
+        "descriptor_model_queries",
+        "archive_selection_entry_queries",
+        "anchor_selection_queries",
+        "task_boundary_disclosures",
+        "observation_bytes",
+        "action_bytes",
+        "reward_bytes",
+        "active_policy_persistent_bytes",
+        "archive_persistent_bytes",
+        "mechanism_off_anchor_bytes",
+        "descriptor_model_persistent_bytes",
+        "environment_state_persistent_bytes",
+        "timing",
+        "timing_policy",
     }
     expected_pairs = {(seed, arm) for seed in config.seeds for arm in _ARMS}
     observed_pairs: set[tuple[int, str]] = set()
@@ -762,8 +814,11 @@ def validate_result(value: object) -> None:
         observed_pairs.add(pair)
         by_pair[pair] = record
         for field in (
-            "observation_sha256", "action_sha256", "reward_sha256",
-            "initial_policy_sha256", "final_policy_sha256",
+            "observation_sha256",
+            "action_sha256",
+            "reward_sha256",
+            "initial_policy_sha256",
+            "final_policy_sha256",
         ):
             digest = record[field]
             if (
@@ -781,9 +836,7 @@ def validate_result(value: object) -> None:
             raise ValueError("mean_reward is outside the fixed reward lattice bounds")
         if (
             type(record["archive_entry_count"]) is not int
-            or not 0
-            <= record["archive_entry_count"]
-            <= config.steps // config.phase_length
+            or not 0 <= record["archive_entry_count"] <= config.steps // config.phase_length
         ):
             raise ValueError("archive entry count is invalid")
         receipt = _require_exact_keys(record["resource_receipt"], receipt_keys, "resource receipt")
@@ -836,15 +889,13 @@ def validate_result(value: object) -> None:
                 or receipt["archive_persistent_bytes"] != 0
                 or receipt["mechanism_off_anchor_bytes"] != _POLICY_BYTES
                 or receipt["archive_selection_entry_queries"] != 0
-                or receipt["anchor_selection_queries"]
-                != config.steps // config.phase_length
+                or receipt["anchor_selection_queries"] != config.steps // config.phase_length
             ):
                 raise ValueError("mechanism-off resource reduction is invalid")
         elif (
             receipt["mechanism_off_anchor_bytes"] != 0
             or receipt["anchor_selection_queries"] != 0
-            or receipt["archive_selection_entry_queries"]
-            < config.steps // config.phase_length
+            or receipt["archive_selection_entry_queries"] < config.steps // config.phase_length
         ):
             raise ValueError("archive-arm selection resources are invalid")
         expected_record = _run_arm(config, record["seed"], cast(Arm, record["arm"]))
@@ -858,8 +909,11 @@ def validate_result(value: object) -> None:
         fixed = by_pair[(seed, "fixed_snapshot")]
         off = by_pair[(seed, "mechanism_off")]
         for field in (
-            "observation_sha256", "action_sha256", "reward_sha256",
-            "initial_policy_sha256", "final_policy_sha256",
+            "observation_sha256",
+            "action_sha256",
+            "reward_sha256",
+            "initial_policy_sha256",
+            "final_policy_sha256",
         ):
             if fixed[field] != off[field]:
                 raise ValueError("mechanism-off exact parity failed")
@@ -868,16 +922,30 @@ def validate_result(value: object) -> None:
 def retain_local_comparator_result(value: object, *, repository_root: Path) -> Path:
     """Retain one validated local comparator at a new content-addressed path."""
 
+    _require_execution_authorized()
     if type(repository_root) is not PosixPath or not repository_root.is_absolute():
         raise ValueError("repository_root must be an exact absolute POSIX Path")
-    validate_result(value)
     encoded = _bounded_json_bytes(value) + b"\n"
     digest = hashlib.sha256(encoded).hexdigest()
-    directory = repository_root / "outputs" / "telapa" / "local-comparator.v2"
-    directory.mkdir(parents=True, exist_ok=True)
-    if not directory.resolve().is_relative_to(repository_root.resolve()):
-        raise ValueError("local comparator output directory escapes repository_root")
-    return atomic_write_new(directory / f"result.{digest}.json", encoded)
+    segments = ("outputs", "telapa", "local-comparator.v2")
+    directory = open_directory_chain(repository_root, segments)
+    name = f"result.{digest}.json"
+    try:
+
+        def prepare() -> bytes:
+            validate_result(value)
+            return encoded
+
+        publish_prepared_json_at(
+            directory,
+            name,
+            prepare=prepare,
+            validate_loaded=validate_result,
+            max_bytes=_MAX_JSON_BYTES + 1,
+        )
+    finally:
+        os.close(directory)
+    return repository_root.joinpath(*segments, name)
 
 
 def load_local_comparator_result(path: Path) -> dict[str, Any]:

@@ -51,7 +51,7 @@ def test_frozen_plan_is_five_seed_three_arm_and_permanently_nonpromoting() -> No
 
 
 def test_campaign_executes_exact_roster_and_strictly_replays_all_five_runs() -> None:
-    report = campaign.run_gradual_micro_phase_campaign(*_data())
+    report = campaign._execute(*_data())
     assert campaign.validate_gradual_micro_phase_campaign(report, *_data()) == report
     assert [(r["seed"], r["arm"]) for r in report["records"]] == [
         (seed, arm) for seed in campaign.SEEDS for arm in campaign.ARM_IDS
@@ -71,15 +71,15 @@ def test_campaign_executes_exact_roster_and_strictly_replays_all_five_runs() -> 
 
 def test_seed_identity_and_execution_are_ambient_prng_invariant() -> None:
     with jax.default_prng_impl("threefry2x32"):
-        first = campaign.run_gradual_micro_phase_campaign(*_data())
+        first = campaign._execute(*_data())
     with jax.default_prng_impl("rbg"):
-        second = campaign.run_gradual_micro_phase_campaign(*_data())
+        second = campaign._execute(*_data())
     assert first["seed_identities"] == second["seed_identities"]
     assert first["records"] == second["records"]
 
 
 def test_validator_rejects_hostile_self_consistent_forgery_before_acceptance() -> None:
-    report = campaign.run_gradual_micro_phase_campaign(*_data())
+    report = campaign._execute(*_data())
     mutations: list[tuple[dict[str, object], str]] = []
     metric = copy.deepcopy(report)
     metric["records"][0]["training_loss_sums"][0] += 0.25
@@ -113,7 +113,7 @@ def test_validator_rejects_hostile_self_consistent_forgery_before_acceptance() -
 
 
 def test_validator_rejects_source_runtime_and_nonexact_json() -> None:
-    report = campaign.run_gradual_micro_phase_campaign(*_data())
+    report = campaign._execute(*_data())
     source = copy.deepcopy(report)
     source["identity"]["sources"][0]["sha256"] = "0" * 64
     campaign._resign_for_test(source)
@@ -137,7 +137,7 @@ def test_validator_rejects_source_runtime_and_nonexact_json() -> None:
 
     old_x, old_y, new_x, new_y = _data()
     with pytest.raises(ValueError, match="exactly one row-aligned phase"):
-        campaign.run_gradual_micro_phase_campaign(
+        campaign._execute(
             np.concatenate((old_x, old_x)),
             np.concatenate((old_y, old_y)),
             np.concatenate((new_x, new_x)),
@@ -146,13 +146,19 @@ def test_validator_rejects_source_runtime_and_nonexact_json() -> None:
     out_of_domain = old_x.copy()
     out_of_domain[0, 0] = np.float32(-1.25)
     with pytest.raises(ValueError, match=r"\[-1, 1\]"):
-        campaign.run_gradual_micro_phase_campaign(
-            out_of_domain, old_y, out_of_domain.copy(), new_y
-        )
+        campaign._execute(out_of_domain, old_y, out_of_domain.copy(), new_y)
 
 
-def test_create_only_writer_validates_and_never_overwrites(tmp_path: Path) -> None:
-    report = campaign.run_gradual_micro_phase_campaign(*_data())
+def test_public_runner_fails_closed_before_array_work() -> None:
+    with pytest.raises(RuntimeError, match="not independently authorized"):
+        campaign.run_gradual_micro_phase_campaign(object(), object(), object(), object())
+
+
+def test_create_only_writer_validates_and_never_overwrites(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(campaign, "AUTHORIZATION_TRANSITION_APPROVED", True)
+    report = campaign._execute(*_data())
     path = tmp_path / "campaign.json"
     assert campaign.write_gradual_micro_phase_campaign_new(path, report, *_data()) == path
     assert os.stat(path).st_mode & 0o222 == 0

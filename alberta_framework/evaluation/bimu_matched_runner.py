@@ -6,7 +6,6 @@ import hashlib
 import json
 import math
 import os
-import tempfile
 from pathlib import Path
 from typing import Final, cast
 
@@ -32,6 +31,7 @@ from alberta_framework.evaluation.bimu_matched_nonpromoting import (
     _plan_payload,
     _runtime_identity,
 )
+from alberta_framework.evaluation.prospective_publication import publish_prepared_json_at
 
 RESULT_SCHEMA: Final = "asi.bimu.matched-development-result.v1"
 _POLICY: Final = {
@@ -55,6 +55,14 @@ _RESOURCE_FIELDS: Final = (
     "final_persistent_numeric_bytes",
 )
 _MAX_DATASET_BYTES: Final = 16 * 1024 * 1024
+_MAX_RESULT_BYTES: Final = 16 * 1024 * 1024
+EXECUTION_AUTHORIZED: Final = False
+AUTHORIZATION_TRANSITION_APPROVED: Final = False
+
+
+def _require_execution_authorized() -> None:
+    if AUTHORIZATION_TRANSITION_APPROVED is not True:
+        raise RuntimeError("BiMU matched execution is not independently authorized")
 
 
 def _canonical(value: object) -> bytes:
@@ -78,6 +86,7 @@ def _source_identity() -> dict[str, str]:
         "alberta_framework/benchmarks/bimu.py",
         "alberta_framework/evaluation/bimu_matched_nonpromoting.py",
         "alberta_framework/evaluation/bimu_matched_runner.py",
+        "alberta_framework/evaluation/prospective_publication.py",
     )
     return {
         relative: hashlib.sha256((root / relative).read_bytes()).hexdigest()
@@ -121,9 +130,7 @@ def _validated_arrays(
     return arrays[0], arrays[1], arrays[2], arrays[3]
 
 
-def _expected_fixed_identities(
-    plan: BiMUMatchedDevelopmentPlan, seed: int
-) -> tuple[str, str]:
+def _expected_fixed_identities(plan: BiMUMatchedDevelopmentPlan, seed: int) -> tuple[str, str]:
     config = plan.control_config
     if config.query_threshold != 0.0:
         raise ValueError("matched runner requires the frozen zero query threshold")
@@ -198,7 +205,7 @@ def _aggregate(
     }
 
 
-def run_bimu_matched_development(
+def _execute_bimu_matched_development(
     train_x: object,
     train_y: object,
     test_x: object,
@@ -237,6 +244,19 @@ def run_bimu_matched_development(
     result["result_sha256"] = hashlib.sha256(_canonical(result)).hexdigest()
     validate_bimu_matched_result(result, *arrays, plan=checked_plan)
     return result
+
+
+def run_bimu_matched_development(
+    train_x: object,
+    train_y: object,
+    test_x: object,
+    test_y: object,
+    *,
+    plan: BiMUMatchedDevelopmentPlan = FROZEN_BIMU_MATCHED_PLAN,
+) -> dict[str, object]:
+    """Fail closed until a separately reviewed change authorizes this plan."""
+    _require_execution_authorized()
+    return _execute_bimu_matched_development(train_x, train_y, test_x, test_y, plan=plan)
 
 
 def validate_bimu_matched_result(
@@ -279,9 +299,7 @@ def validate_bimu_matched_result(
     if type(raw_rows) is not list or len(raw_rows) != len(checked_plan.seeds) * 2:
         raise ValueError("matched result roster is incomplete")
     rows = cast(list[dict[str, object]], raw_rows)
-    expected_roster = [
-        (seed, arm) for seed in checked_plan.seeds for arm in checked_plan.arm_names
-    ]
+    expected_roster = [(seed, arm) for seed in checked_plan.seeds for arm in checked_plan.arm_names]
     observed_roster: list[tuple[object, object]] = []
     for row in rows:
         checked_row = _exact_object(row, {"seed", "arm", "result"}, "matched row")
@@ -353,8 +371,7 @@ def validate_bimu_matched_result(
         control_resources = cast(dict[str, object], control["resources"])
         candidate_resources = cast(dict[str, object], candidate["resources"])
         if any(
-            control_resources[field] != candidate_resources[field]
-            for field in _RESOURCE_FIELDS
+            control_resources[field] != candidate_resources[field] for field in _RESOURCE_FIELDS
         ):
             raise ValueError("matched pair resources drifted")
     if root["aggregate"] != _aggregate(rows, checked_plan):
@@ -376,36 +393,26 @@ def write_bimu_matched_result(
     plan: BiMUMatchedDevelopmentPlan = FROZEN_BIMU_MATCHED_PLAN,
 ) -> None:
     """Durably publish one validated result without replacing existing evidence."""
+    _require_execution_authorized()
     if type(destination) is not type(Path()):
         raise TypeError("destination must be an exact Path")
-    validate_bimu_matched_result(value, train_x, train_y, test_x, test_y, plan=plan)
-    parent = destination.parent.resolve(strict=True)
-    if not parent.is_dir() or destination.name in {"", ".", ".."}:
-        raise ValueError("destination parent must be an existing directory")
-    resolved = parent / destination.name
-    if os.path.lexists(resolved):
-        raise FileExistsError(f"refusing to replace existing result: {resolved}")
-    raw = _canonical(value) + b"\n"
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=parent, prefix=f".{destination.name}.", suffix=".tmp"
-    )
-    temporary = Path(temporary_name)
-    published = False
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    directory = os.open(destination.parent, flags)
     try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.link(temporary, resolved, follow_symlinks=False)
-        published = True
-        directory_descriptor = os.open(parent, os.O_RDONLY)
-        try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
-    except BaseException:
-        if published:
-            resolved.unlink(missing_ok=True)
-        raise
+
+        def prepare() -> bytes:
+            validate_bimu_matched_result(value, train_x, train_y, test_x, test_y, plan=plan)
+            return _canonical(value) + b"\n"
+
+        def validate_loaded(loaded: object) -> None:
+            validate_bimu_matched_result(loaded, train_x, train_y, test_x, test_y, plan=plan)
+
+        publish_prepared_json_at(
+            directory,
+            destination.name,
+            prepare=prepare,
+            validate_loaded=validate_loaded,
+            max_bytes=_MAX_RESULT_BYTES,
+        )
     finally:
-        temporary.unlink(missing_ok=True)
+        os.close(directory)

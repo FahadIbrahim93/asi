@@ -22,6 +22,10 @@ import numpy as np
 from alberta_framework.evaluation.optimization_readiness_executor import (
     execute_optimization_readiness,
 )
+from alberta_framework.evaluation.prospective_publication import (
+    open_directory_chain,
+    publish_prepared_json_at,
+)
 
 PANEL_SCHEMA: Final[str] = "asi.optimization-readiness.checkpoint-panel.v1"
 _MIN_CASES: Final[int] = 6
@@ -41,6 +45,13 @@ _PREDICTORS: Final[tuple[tuple[str, str], ...]] = (
 FROZEN_PANEL_ROSTER: Final[tuple[tuple[str, str, int], ...]] = tuple(
     ("ipmnist-linear-readiness", f"checkpoint-{index}", 1_568_001 + index) for index in range(6)
 )
+EXECUTION_AUTHORIZED: Final = False
+AUTHORIZATION_TRANSITION_APPROVED: Final = False
+
+
+def _require_execution_authorized() -> None:
+    if AUTHORIZATION_TRANSITION_APPROVED is not True:
+        raise RuntimeError("Optimization Readiness panel is not independently authorized")
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,30 +184,36 @@ def _internal_int(value: object) -> int:
 
 
 def _panel_source_sha256() -> str:
-    path = Path(__file__).resolve()
+    paths = (
+        Path(__file__).resolve(),
+        Path(__file__).with_name("prospective_publication.py").resolve(),
+    )
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(path, flags)
-    try:
-        before = os.fstat(descriptor)
-        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= 2 * 1024 * 1024:
-            raise ValueError("panel source must be a bounded regular file")
-        payload = bytearray()
-        while len(payload) <= before.st_size:
-            chunk = os.read(descriptor, min(64 * 1024, before.st_size + 1 - len(payload)))
-            if not chunk:
-                break
-            payload.extend(chunk)
-        after = os.fstat(descriptor)
-        if len(payload) != before.st_size or (
-            after.st_dev,
-            after.st_ino,
-            after.st_size,
-            after.st_mtime_ns,
-        ) != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns):
-            raise ValueError("panel source changed during its bounded read")
-    finally:
-        os.close(descriptor)
-    return hashlib.sha256(payload).hexdigest()
+    digest = hashlib.sha256()
+    for path in paths:
+        descriptor = os.open(path, flags)
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= 2 * 1024 * 1024:
+                raise ValueError("panel source must be a bounded regular file")
+            payload = bytearray()
+            while len(payload) <= before.st_size:
+                chunk = os.read(descriptor, min(64 * 1024, before.st_size + 1 - len(payload)))
+                if not chunk:
+                    break
+                payload.extend(chunk)
+            after = os.fstat(descriptor)
+            if len(payload) != before.st_size or (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ) != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns):
+                raise ValueError("panel source changed during its bounded read")
+            digest.update(path.name.encode("ascii") + b"\0" + payload)
+        finally:
+            os.close(descriptor)
+    return digest.hexdigest()
 
 
 def _assert_plain_json(value: object) -> None:
@@ -245,7 +262,7 @@ def _assert_plain_json(value: object) -> None:
         raise ValueError("panel artifact must be exact plain JSON")
 
 
-def run_optimization_readiness_panel(
+def _execute_optimization_readiness_panel(
     cases: object,
 ) -> dict[str, object]:
     """Execute and aggregate a bounded matched checkpoint panel."""
@@ -374,7 +391,7 @@ def run_optimization_readiness_panel(
                 "strictly exceeds every registered baseline at all three horizons; ties or "
                 "undefined correlations are inconclusive; otherwise rejected"
             ),
-            "execution_authorized": False,
+            "execution_authorized": EXECUTION_AUTHORIZED,
             "seed_history_audit": (
                 "1568001--1568006 had zero exact matches on current main when prospectively "
                 "frozen on 2026-08-20"
@@ -386,6 +403,14 @@ def run_optimization_readiness_panel(
     }
     payload["result_sha256"] = hashlib.sha256(_canonical_bytes(payload)).hexdigest()
     return payload
+
+
+def run_optimization_readiness_panel(
+    cases: object,
+) -> dict[str, object]:
+    """Fail closed until a separately reviewed change authorizes this plan."""
+    _require_execution_authorized()
+    return _execute_optimization_readiness_panel(cases)
 
 
 def validate_optimization_readiness_panel(
@@ -411,7 +436,7 @@ def validate_optimization_readiness_panel(
     if any(type(key) is not str or key not in expected_keys for key in dict.keys(payload)):
         raise ValueError("panel artifact has unexpected keys")
     _assert_plain_json(payload)
-    recomputed = run_optimization_readiness_panel(cases)
+    recomputed = _execute_optimization_readiness_panel(cases)
     if payload != recomputed:
         raise ValueError("panel artifact does not recompute exactly")
     return recomputed
@@ -424,83 +449,32 @@ def retain_optimization_readiness_panel(
     repository_root: Path,
 ) -> Path:
     """Publish one validated panel atomically without replacing prior bytes."""
+    _require_execution_authorized()
     if type(repository_root) is not PosixPath or not repository_root.is_absolute():
         raise ValueError("repository_root must be an exact absolute POSIX Path")
-    validated = validate_optimization_readiness_panel(payload, cases=cases)
-    encoded = _canonical_bytes(validated)
-    if len(encoded) > _MAX_RESULT_BYTES:
-        raise ValueError("panel artifact exceeds its encoded byte ceiling")
-    digest = cast(str, validated["result_sha256"])
+    if type(payload) is not dict or type(payload.get("result_sha256")) is not str:
+        raise ValueError("panel artifact lacks an exact claimed digest")
+    digest = cast(str, payload["result_sha256"])
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError("panel artifact claimed digest is invalid")
     segments = ("outputs", "optimization_readiness", "development.v1")
-    directory_descriptor = os.open(
-        repository_root,
-        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-    )
+    directory_descriptor = open_directory_chain(repository_root, segments)
     try:
-        for segment in segments:
-            try:
-                os.mkdir(segment, mode=0o755, dir_fd=directory_descriptor)
-            except FileExistsError:
-                pass
-            next_descriptor = os.open(
-                segment,
-                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=directory_descriptor,
-            )
-            os.close(directory_descriptor)
-            directory_descriptor = next_descriptor
         name = f"result.{digest}.json"
-        temporary_name = f".result.{digest}.tmp"
-        descriptor = os.open(
-            temporary_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o444,
-            dir_fd=directory_descriptor,
-        )
-        try:
-            offset = 0
-            while offset < len(encoded):
-                written = os.write(descriptor, encoded[offset:])
-                if written <= 0:
-                    raise OSError("panel publication write made no progress")
-                offset += written
-            os.fsync(descriptor)
-        except BaseException:
-            os.close(descriptor)
-            os.unlink(temporary_name, dir_fd=directory_descriptor)
-            raise
-        else:
-            os.close(descriptor)
-        try:
-            os.link(
-                temporary_name,
-                name,
-                src_dir_fd=directory_descriptor,
-                dst_dir_fd=directory_descriptor,
-                follow_symlinks=False,
-            )
-        finally:
-            os.unlink(temporary_name, dir_fd=directory_descriptor)
-        read_descriptor = os.open(
+
+        def validate(candidate: object) -> None:
+            validate_optimization_readiness_panel(candidate, cases=cases)
+
+        def prepare() -> bytes:
+            return _canonical_bytes(validate_optimization_readiness_panel(payload, cases=cases))
+
+        publish_prepared_json_at(
+            directory_descriptor,
             name,
-            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-            dir_fd=directory_descriptor,
+            prepare=prepare,
+            validate_loaded=validate,
+            max_bytes=_MAX_RESULT_BYTES,
         )
-        try:
-            loaded = bytearray()
-            while len(loaded) <= _MAX_RESULT_BYTES:
-                chunk = os.read(
-                    read_descriptor,
-                    min(64 * 1024, _MAX_RESULT_BYTES + 1 - len(loaded)),
-                )
-                if not chunk:
-                    break
-                loaded.extend(chunk)
-        finally:
-            os.close(read_descriptor)
-        if bytes(loaded) != encoded:
-            raise RuntimeError("retained panel bytes changed during publication")
-        os.fsync(directory_descriptor)
     finally:
         os.close(directory_descriptor)
     return repository_root.joinpath(*segments, f"result.{digest}.json")

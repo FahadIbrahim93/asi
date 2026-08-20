@@ -31,7 +31,7 @@ pytestmark = pytest.mark.unit
 
 
 def _result() -> dict[str, Any]:
-    return run_smoke(TeLAPASmokeConfig(steps=8, phase_length=2))
+    return telapa._execute_smoke(TeLAPASmokeConfig(steps=8, phase_length=2))
 
 
 def test_catalog_fails_closed_without_immutable_anonymous_revision() -> None:
@@ -82,9 +82,7 @@ def test_current_life_adapter_is_deterministic_for_the_same_key() -> None:
     second = SwitchingPolicyLifeAdapter(phase_length=2, learning_rate=0.125)
     first_state, first_policy = first.init(jax.random.key(7, impl="threefry2x32"))
     second_state, second_policy = second.init(jax.random.key(7, impl="threefry2x32"))
-    first_step = first.step(
-        first_state, first_policy, key=jax.random.key(8, impl="threefry2x32")
-    )
+    first_step = first.step(first_state, first_policy, key=jax.random.key(8, impl="threefry2x32"))
     second_step = second.step(
         second_state, second_policy, key=jax.random.key(8, impl="threefry2x32")
     )
@@ -161,9 +159,7 @@ def test_result_contains_replayed_descriptive_archive_vs_control_comparisons() -
         assert comparison["metric"] == "mean_reward"
         assert comparison["classification"] == "descriptive_nonpromoting"
         assert comparison["direction"] in {"improved", "tied", "regressed"}
-        assert [item["seed"] for item in comparison["per_seed"]] == list(
-            TeLAPASmokeConfig().seeds
-        )
+        assert [item["seed"] for item in comparison["per_seed"]] == list(TeLAPASmokeConfig().seeds)
         expected_delta = sum(item["delta"] for item in comparison["per_seed"]) / 3
         assert comparison["mean_delta"] == expected_delta
 
@@ -234,9 +230,7 @@ def test_validator_rejects_nan_extra_fields_and_unbounded_config() -> None:
     with pytest.raises(ValueError, match="fields"):
         validate_result(payload)
     payload = _result()
-    payload["records"][0]["resource_receipt"][
-        "archive_selection_entry_queries"
-    ] = float("nan")
+    payload["records"][0]["resource_receipt"]["archive_selection_entry_queries"] = float("nan")
     with pytest.raises(ValueError, match="finite JSON"):
         validate_result(payload)
     with pytest.raises(ValueError, match=r"\[1, 64\]"):
@@ -326,7 +320,7 @@ def test_serializer_recursion_is_normalized_after_preflight(
         _bounded_json_bytes({"legal": [1, 2, 3]})
 
 
-def test_cli_executes_and_round_trips() -> None:
+def test_cli_execution_fails_closed_but_catalog_remains_available() -> None:
     process = subprocess.run(
         [
             sys.executable,
@@ -337,16 +331,25 @@ def test_cli_executes_and_round_trips() -> None:
             "--phase-length",
             "2",
         ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert process.returncode != 0
+    assert "not independently authorized" in process.stderr
+    catalog = subprocess.run(
+        [sys.executable, "-m", "alberta_framework.benchmarks.telapa_qualification", "--catalog"],
         check=True,
         capture_output=True,
         text=True,
     )
-    payload = json.loads(process.stdout)
-    validate_result(payload)
-    assert len(payload["records"]) == 12
+    assert json.loads(catalog.stdout)["paper_revision"] == telapa.PAPER_REVISION
 
 
-def test_local_comparator_retention_is_content_named_and_create_only(tmp_path: Path) -> None:
+def test_local_comparator_retention_is_content_named_and_create_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(telapa, "AUTHORIZATION_TRANSITION_APPROVED", True)
     result = _result()
     destination = retain_local_comparator_result(result, repository_root=tmp_path)
     assert destination.name.startswith("result.")
@@ -354,3 +357,10 @@ def test_local_comparator_retention_is_content_named_and_create_only(tmp_path: P
     assert load_local_comparator_result(destination) == result
     with pytest.raises(FileExistsError):
         retain_local_comparator_result(result, repository_root=tmp_path)
+
+
+def test_public_smoke_and_publisher_fail_closed_before_config_work(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="not independently authorized"):
+        run_smoke(object())
+    with pytest.raises(RuntimeError, match="not independently authorized"):
+        retain_local_comparator_result(object(), repository_root=tmp_path)

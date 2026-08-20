@@ -108,7 +108,10 @@ def _bounded_campaign_dependencies(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture
 def completed_campaign() -> dict[str, Any]:
     x, y = _data()
-    return cast(dict[str, Any], run_replay_frozen_campaign(x, y, config=_config()))
+    return cast(
+        dict[str, Any],
+        campaign_module._execute_replay_frozen_campaign(x, y, config=_config()),
+    )
 
 
 def test_campaign_has_exact_roster_inconclusive_policy_and_limitations(
@@ -133,9 +136,10 @@ def test_campaign_has_exact_roster_inconclusive_policy_and_limitations(
     assert completed_campaign["resources"]["run_count"] == 40
     assert completed_campaign["resources"]["timing_measured"] is False
     assert completed_campaign["resources"]["peak_working_set_claimed"] is False
-    assert completed_campaign["resources"][
-        "persistent_numeric_bytes_across_seed_arm_identities"
-    ] == completed_campaign["resources"]["receipt_integer_totals"]["persistent_bytes"]
+    assert (
+        completed_campaign["resources"]["persistent_numeric_bytes_across_seed_arm_identities"]
+        == completed_campaign["resources"]["receipt_integer_totals"]["persistent_bytes"]
+    )
     assert all(row["receipt"]["outcome"] == "inconclusive" for row in completed_campaign["runs"])
 
 
@@ -163,8 +167,7 @@ def test_seed_identity_binds_explicit_threefry_schedule_parameters_and_all_state
     )
     by_seed = {item["seed"]: item["identity_sha256"] for item in identities}
     assert all(
-        row["seed_identity_sha256"] == by_seed[row["seed"]]
-        for row in completed_campaign["runs"]
+        row["seed_identity_sha256"] == by_seed[row["seed"]] for row in completed_campaign["runs"]
     )
 
 
@@ -251,7 +254,7 @@ def test_input_preflight_rejects_before_execution(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(campaign_module, "run_screening_config", forbidden)
     with pytest.raises(ValueError, match="float32"):
-        run_replay_frozen_campaign(x.astype(np.float64), y, config=_config())
+        campaign_module._execute_replay_frozen_campaign(x.astype(np.float64), y, config=_config())
 
 
 @pytest.mark.parametrize("field", ("source", "materialization", "x", "y"))
@@ -292,7 +295,7 @@ def test_source_drift_across_execution_is_rejected(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(campaign_module, "_source_identity", drifting_source)
     with pytest.raises(RuntimeError, match="source changed"):
-        run_replay_frozen_campaign(x, y, config=_config())
+        campaign_module._execute_replay_frozen_campaign(x, y, config=_config())
 
 
 def test_oversized_json_rejects_before_execution(
@@ -311,8 +314,9 @@ def test_oversized_json_rejects_before_execution(
 
 
 def test_create_only_retention_roundtrip(
-    completed_campaign: dict[str, Any], tmp_path: Path
+    completed_campaign: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(campaign_module, "AUTHORIZATION_TRANSITION_APPROVED", True)
     x, y = _data()
     destination = retain_replay_frozen_campaign(
         completed_campaign,
@@ -334,8 +338,9 @@ def test_create_only_retention_roundtrip(
 
 
 def test_retention_rejects_namespace_symlink(
-    completed_campaign: dict[str, Any], tmp_path: Path
+    completed_campaign: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(campaign_module, "AUTHORIZATION_TRANSITION_APPROVED", True)
     x, y = _data()
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -349,3 +354,10 @@ def test_retention_rejects_namespace_symlink(
             repository_root=tmp_path,
         )
     assert list(outside.iterdir()) == []
+
+
+def test_public_runner_and_publisher_fail_closed_before_input_work(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="not independently authorized"):
+        run_replay_frozen_campaign(object(), object())
+    with pytest.raises(RuntimeError, match="not independently authorized"):
+        retain_replay_frozen_campaign(object(), object(), object(), repository_root=tmp_path)

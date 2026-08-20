@@ -33,3 +33,8 @@ The following gates remain open before any paper-level or scientific conclusion:
 
 Consistency hashes detect drift but are not authenticated execution attestation. Timing
 remains telemetry-only, and the lane makes no performance, scientific, or SOTA claim.
+
+The public runner, CLI, and publisher are hard-disabled pending a separate
+authorization review. The CLI reserves its deterministic create-only name
+through a pinned no-follow directory descriptor before dataset loading or
+execution. Strict reread and replay validation occur before acceptance.

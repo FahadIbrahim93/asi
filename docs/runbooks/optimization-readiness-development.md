@@ -79,3 +79,9 @@ Readiness is positive and strictly exceeds every baseline at all horizons;
 ties and undefined correlations are inconclusive. No result is supplied by the
 repository: binding the six labels to real continual checkpoint bytes,
 independently reviewing the protocol, and retaining all outcomes remain open.
+
+The public panel and publisher are hard-disabled while the plan authorization
+and separate transition gate are false. Tests use only the private six-case
+executor. Publication first reserves its content name through a pinned
+no-follow directory chain, then strictly reexecutes, links without replacement,
+fsyncs, boundedly rereads, and reload-validates the JSON.

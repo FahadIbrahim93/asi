@@ -32,10 +32,10 @@ from alberta_framework.benchmarks.ipmnist_gradual_family import (
 from alberta_framework.benchmarks.upgd_ipmnist import (
     IPMNISTConfig,
     _make_adamw_learner,
-    atomic_write_new,
     init_mlp_params,
     validated_ipmnist_data,
 )
+from alberta_framework.evaluation.prospective_publication import publish_prepared_json_at
 
 SCHEMA: Final[str] = "asi.gradual-micro-phase.matched-campaign.v1"
 SEEDS: Final[tuple[int, ...]] = (156901, 156902, 156903, 156904, 156905)
@@ -67,6 +67,7 @@ _MAX_DATASET_BYTES = 256 * 1024 * 1024
 _ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_FILES = (
     "alberta_framework/evaluation/gradual_micro_phase_campaign.py",
+    "alberta_framework/evaluation/prospective_publication.py",
     "alberta_framework/_seed_validation.py",
     "alberta_framework/benchmarks/ipmnist_gradual_family.py",
     "alberta_framework/benchmarks/ipmnist_gradual.py",
@@ -77,6 +78,13 @@ _SOURCE_FILES = (
     "pyproject.toml",
     "uv.lock",
 )
+EXECUTION_AUTHORIZED: Final = False
+AUTHORIZATION_TRANSITION_APPROVED: Final = False
+
+
+def _require_execution_authorized() -> None:
+    if AUTHORIZATION_TRANSITION_APPROVED is not True:
+        raise RuntimeError("gradual micro-phase execution is not independently authorized")
 
 
 def _canonical(value: object) -> bytes:
@@ -413,7 +421,7 @@ def _execute(
         "row_alignment": "old_x_equals_new_x_exactly",
         "feature_domain": "finite_float32_closed_interval_-1_1",
         "paper_scale": False,
-        "execution_authorized": False,
+        "execution_authorized": EXECUTION_AUTHORIZED,
         "seed_history_audit": (
             "156901--156905 had no exact current-main use when prospectively reserved on "
             "2026-08-20; seeds are immutable after merge"
@@ -439,6 +447,7 @@ def _execute(
 def run_gradual_micro_phase_campaign(
     old_x: np.ndarray, old_y: np.ndarray, new_x: np.ndarray, new_y: np.ndarray
 ) -> dict[str, object]:
+    _require_execution_authorized()
     result = _execute(old_x, old_y, new_x, new_y)
     _json_preflight(result)
     return result
@@ -560,16 +569,39 @@ def write_gradual_micro_phase_campaign_new(
     new_x: np.ndarray,
     new_y: np.ndarray,
 ) -> Path:
-    validated = validate_gradual_micro_phase_campaign(value, old_x, old_y, new_x, new_y)
-    encoded = (
-        json.dumps(validated, allow_nan=False, ensure_ascii=True, indent=2, sort_keys=True).encode(
-            "ascii"
+    _require_execution_authorized()
+    if type(path) is not type(Path()):
+        raise TypeError("path must be an exact Path")
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    directory = os.open(path.parent, flags)
+    try:
+
+        def validate(candidate: object) -> None:
+            validate_gradual_micro_phase_campaign(candidate, old_x, old_y, new_x, new_y)
+
+        def prepare() -> bytes:
+            validated = validate_gradual_micro_phase_campaign(value, old_x, old_y, new_x, new_y)
+            return (
+                json.dumps(
+                    validated,
+                    allow_nan=False,
+                    ensure_ascii=True,
+                    indent=2,
+                    sort_keys=True,
+                ).encode("ascii")
+                + b"\n"
+            )
+
+        publish_prepared_json_at(
+            directory,
+            path.name,
+            prepare=prepare,
+            validate_loaded=validate,
+            max_bytes=_MAX_JSON_BYTES,
         )
-        + b"\n"
-    )
-    if len(encoded) > _MAX_JSON_BYTES:
-        raise ValueError("campaign JSON byte bound exceeded")
-    return atomic_write_new(Path(path), encoded)
+    finally:
+        os.close(directory)
+    return path
 
 
 def load_gradual_micro_phase_campaign(

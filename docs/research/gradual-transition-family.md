@@ -70,3 +70,9 @@ Run the bounded contract checks with:
 ```bash
 .venv/bin/python -m pytest tests/test_ipmnist_gradual_family.py -q
 ```
+
+The public campaign and publisher fail closed while both the frozen plan and
+separate transition gate are unauthorized. Tests use only the private bounded
+executor. Publication reserves a deterministic name before strict reexecution
+and uses pinned no-follow directory operations, no-replace linking, fsync,
+bounded reread, and strict reload validation.
