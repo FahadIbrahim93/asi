@@ -271,6 +271,24 @@ def test_fixed_namespace_publication_is_append_only(
         campaign.main(["validate", "--root", str(tmp_path)])
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign validation is Linux-only")
+def test_incomplete_namespace_rejects_broken_expected_shard_symlink(
+    tmp_path: Path, tiny_campaign: Any
+) -> None:
+    campaign.publish_json(
+        campaign.campaign_path(tmp_path, "plan"),
+        campaign.build_plan_document(),
+        root=tmp_path,
+    )
+    shard_path = campaign.campaign_path(
+        tmp_path, "shard", arm="memory_off", seed=157001
+    )
+    shard_path.symlink_to(tmp_path / "absent.json")
+
+    with pytest.raises(ValueError, match="regular non-symlink"):
+        campaign.main(["validate", "--root", str(tmp_path)])
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
 def test_publication_parent_swap_never_writes_through_replacement(
     tmp_path: Path, tiny_campaign: Any, monkeypatch: pytest.MonkeyPatch

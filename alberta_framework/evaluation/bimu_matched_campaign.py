@@ -1085,7 +1085,10 @@ def _validate_namespace(
         for seed in FROZEN_BIMU_MATCHED_PLAN.seeds
         for arm in _ARMS
     }
-    observed_shards = {entry.name for entry in shards_directory.iterdir()}
+    shard_entries = list(shards_directory.iterdir())
+    if any(entry.is_symlink() or not entry.is_file() for entry in shard_entries):
+        _fail("campaign shard namespace entries must be regular non-symlink files")
+    observed_shards = {entry.name for entry in shard_entries}
     if require_complete_shards:
         if observed_shards != expected_shards:
             _fail("campaign shard namespace is not the exact complete roster")
