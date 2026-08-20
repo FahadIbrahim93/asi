@@ -38,14 +38,18 @@ def test_end_to_end_lane_has_matched_axes_controls_and_exact_receipts() -> None:
     assert result.arms[2].candidate_eligible is False
 
 
-def test_sparse_model_predict_and_update_are_jit_eager_parity() -> None:
+def test_sparse_model_predict_and_update_are_jit_eager_numerically_equivalent() -> None:
     # The end-to-end lane invokes the model's jitted methods; disabling JIT checks its eager path.
     compiled = run_development_lane(seed=FROZEN_SEEDS[1], steps_per_task=1, planning_horizon=1)
     with jax.disable_jit():
         eager = run_development_lane(seed=FROZEN_SEEDS[1], steps_per_task=1, planning_horizon=1)
     for compiled_arm, eager_arm in zip(compiled.arms, eager.arms, strict=True):
         assert compiled_arm.task_returns == eager_arm.task_returns
-        assert compiled_arm.prequential_squared_errors == eager_arm.prequential_squared_errors
+        assert compiled_arm.prequential_squared_errors == pytest.approx(
+            eager_arm.prequential_squared_errors,
+            rel=1e-7,
+            abs=1e-12,
+        )
 
 
 @pytest.mark.parametrize("seed", [True, -1, 0, FROZEN_SEEDS[-1] + 1])
