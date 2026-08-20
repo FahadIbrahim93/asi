@@ -922,67 +922,28 @@ class _TwoStepEpisodeEnv:
         return observation, 0.0, self._step == 2, False, {}
 
 
-class TestCollectTrajectoryNextStateMode:
-    """collect_trajectory NEXT_STATE targets.
+def test_collect_trajectory_next_state_preserves_terminal_target_across_reset() -> None:
+    """NEXT_STATE targets use post-step observations, including at reset boundaries."""
+    observations, targets = collect_trajectory(
+        _TwoStepEpisodeEnv(),  # type: ignore[arg-type]
+        lambda _observation: 0,
+        num_steps=4,
+        mode=PredictionMode.NEXT_STATE,
+        include_action_in_features=True,
+        seed=42,
+    )
 
-    The only PredictionMode this function's own dispatch (as opposed to
-    ``GymnasiumStream``'s separate dispatch) was never exercised end to
-    end anywhere in this suite.
-    """
-
-    def test_target_dim_matches_observation_dim(self) -> None:
-        """target_dim is observation_dim for NEXT_STATE.
-
-        Independent of include_action_in_features (which only changes
-        the feature width).
-        """
-        observations, targets = collect_trajectory(
-            _TwoStepEpisodeEnv(),  # type: ignore[arg-type]
-            lambda _observation: 0,
-            num_steps=3,
-            mode=PredictionMode.NEXT_STATE,
-            include_action_in_features=True,
-            seed=1,
-        )
-        assert observations.shape == (3, 3)  # obs(2) + action(1)
-        assert targets.shape == (3, 2)  # observation_dim, not feature_dim
-
-    def test_target_equals_next_observation_within_episode(self) -> None:
-        """Within an episode (no reset), target[i] equals features[i + 1].
-
-        Compared over the shared two-dimensional observation part of each
-        feature row.
-        """
-        observations, targets = collect_trajectory(
-            _TwoStepEpisodeEnv(),  # type: ignore[arg-type]
-            lambda _observation: 0,
-            num_steps=4,
-            mode=PredictionMode.NEXT_STATE,
-            include_action_in_features=True,
-            seed=42,
-        )
-        matches = jnp.all(jnp.isclose(observations[1:, :2], targets[:-1]), axis=1)
-        # Step 1 continues, step 2 terminates and resets, step 3 continues.
-        np.testing.assert_array_equal(
-            np.asarray(matches), np.asarray((True, False, True))
-        )
-
-    def test_target_is_true_terminal_observation_not_the_reset(self) -> None:
-        """At a terminal step, target[i] is the real post-step observation.
-
-        It is the observation the episode ended on, not clobbered by the reset
-        that seeds the following row's features.
-        """
-        observations, targets = collect_trajectory(
-            _TwoStepEpisodeEnv(),  # type: ignore[arg-type]
-            lambda _observation: 0,
-            num_steps=3,
-            mode=PredictionMode.NEXT_STATE,
-            include_action_in_features=False,
-            seed=42,
-        )
-        # Row 1 terminates at [2, -2]. Row 2 begins after reset at [100, -100].
-        np.testing.assert_array_equal(np.asarray(targets[1]), np.asarray((2.0, -2.0)))
-        np.testing.assert_array_equal(
-            np.asarray(observations[2]), np.asarray((100.0, -100.0))
-        )
+    assert observations.shape == (4, 3)  # observation(2) + action(1)
+    assert targets.shape == (4, 2)
+    matches_next_feature = jnp.all(
+        jnp.isclose(observations[1:, :2], targets[:-1]), axis=1
+    )
+    # The middle target is the terminal [2, -2], while the next feature starts
+    # the reset episode at [100, -100]. The surrounding transitions continue.
+    np.testing.assert_array_equal(
+        np.asarray(matches_next_feature), np.asarray((True, False, True))
+    )
+    np.testing.assert_array_equal(np.asarray(targets[1]), np.asarray((2.0, -2.0)))
+    np.testing.assert_array_equal(
+        np.asarray(observations[2, :2]), np.asarray((100.0, -100.0))
+    )
