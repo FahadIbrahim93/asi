@@ -3,7 +3,7 @@
 Issue #1561 is split into two compatible-within-family subprotocols: the existing batch-size-one
 IPMNIST adapter, and a recurring two-state continuing-MDP consumer for linear TD(0), TD(lambda),
 and Q(lambda). Metrics are paired only inside each family; the report does not rank supervised
-accuracy against prediction error or control reward.
+accuracy against TD prediction or control error.
 
 The mechanism is pinned to `arXiv:2604.19033v1` and author code revision
 `sharifnassab/Intentional_RL@e86e26fd8613ac212e9a52c3fed8a01d0a31f685`. The control consumer

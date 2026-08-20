@@ -8,6 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Never
 
+import jax
 import numpy as np
 import pytest
 
@@ -138,6 +139,7 @@ def test_prediction_and_control_information_and_rng_are_explicit() -> None:
     )
     assert prediction["resources"]["action_queries"] == 0
     assert prediction["resources"]["rng_fold_ins"] == 17
+    assert prediction["resources"]["rng_integer_draws"] == 17
     assert control["resources"]["action_queries"] == 0
     assert control["resources"]["rng_fold_ins"] == 17
     assert control["resources"]["rng_splits"] == 0
@@ -166,12 +168,19 @@ def test_pairs_share_one_exogenous_behavior_trajectory(
         assert control["trajectory"][field] == intentional["trajectory"][field]
 
 
-def test_seed_roster_produces_independent_behavior_schedules() -> None:
+def test_test_seed_roster_produces_distinct_behavior_schedules() -> None:
     schedules = {
         tuple(_control("fixed_td0", seed=seed, horizon=64)["trajectory"]["actions"])
         for seed in lane.SEEDS
     }
     assert len(schedules) == len(lane.SEEDS)
+
+
+def test_behavior_trajectory_is_invariant_to_jax_x64_mode() -> None:
+    expected = _control("fixed_td0", seed=lane.SEEDS[0], horizon=64, phase_length=8)
+    with jax.enable_x64():
+        actual = _control("fixed_td0", seed=lane.SEEDS[0], horizon=64, phase_length=8)
+    assert actual["trajectory"] == expected["trajectory"]
 
 
 def test_validator_rejects_nested_subclasses_without_hooks() -> None:
@@ -324,6 +333,16 @@ def test_report_recomputes_all_four_bonferroni_paired_questions(
         item["outcome"] in {"supported", "rejected", "inconclusive"}
         for item in report["paired_comparisons"].values()
     )
+    expected_q_deltas = []
+    for run in report["runs"]:
+        controls = {record["arm"]: record for record in run["control"]}
+        fixed = controls["fixed_q_lambda"]["metrics"]
+        intentional = controls["intentional_q_lambda"]["metrics"]
+        assert fixed["mean_reward"] == intentional["mean_reward"]
+        expected_q_deltas.append(
+            fixed["mean_squared_td_error"] - intentional["mean_squared_td_error"]
+        )
+    assert report["paired_comparisons"]["q_lambda"]["deltas"] == expected_q_deltas
     assert lane.validate_report(report, require_current_source=True) == report
 
 

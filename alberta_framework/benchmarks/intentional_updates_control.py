@@ -313,7 +313,7 @@ def _transition(state: int, action: int, step: int, phase_length: int) -> tuple[
 
 def _behavior_action(key: jax.Array) -> int:
     """Return one arm-independent action from the paired behavior stream."""
-    return int(jr.randint(key, (), 0, 2))
+    return int(jr.randint(key, (), 0, 2, dtype=np.int32))
 
 
 def _intentional_update(
@@ -372,7 +372,7 @@ def _run(
     sigma = np.float32(0.0)
     clip_ema = np.float32(0.0)
     root = jr.key(seed, impl=_AGENT_RNG_IMPL)
-    state = int(jr.randint(jr.fold_in(root, _MAX_HORIZON), (), 0, 2))
+    state = int(jr.randint(jr.fold_in(root, _MAX_HORIZON), (), 0, 2, dtype=np.int32))
     states = [state]
     actions: list[int] = []
     rewards: list[float] = []
