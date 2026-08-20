@@ -32,6 +32,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._scan_resources import ScanBudget, require_scan_steps
 from alberta_framework.benchmarks.forager import (
     FORAGER_ENVIRONMENT_RNG_SCHEDULE,
     FORAGER_FOV_EMA_DECAY,
@@ -86,15 +87,16 @@ def _require_exact_str(name: object, value: object) -> str:
     if type(value) is not str:
         raise ValueError(f"{name} must be an exact string")
     return value
+
+
 _INT32_MAX = int(np.iinfo(np.int32).max)
+_CAUSAL_MAP_CHUNK_BUDGET = ScanBudget("causal-map JAX chunk", 10_000)
 _MAX_CAUSAL_MAP_CELLS = 4_096
-_MAX_SAFE_FLOAT32_INT32 = float(
-    np.nextafter(np.float32(_INT32_MAX), np.float32(-np.inf))
-)
+_MAX_SAFE_FLOAT32_INT32 = float(np.nextafter(np.float32(_INT32_MAX), np.float32(-np.inf)))
 _FLOAT32_SCORE_HEADROOM = float(np.finfo(np.float32).max) / 8.0
 _DIRECTION_STEPS = (
-    (0, 1),   # action 0: +y
-    (1, 0),   # action 1: +x
+    (0, 1),  # action 0: +y
+    (1, 0),  # action 1: +x
     (0, -1),  # action 2: -y
     (-1, 0),  # action 3: -x
 )
@@ -107,9 +109,7 @@ _DIRECTIONS = jnp.asarray(
 def causal_map_rng_contract() -> dict[str, Any]:
     """Describe the causal-map agent's seed-isolated PRNG root."""
     return {
-        "root": (
-            "jax.random.fold_in(jax.random.key(seed, impl=prng_impl), namespace)"
-        ),
+        "root": ("jax.random.fold_in(jax.random.key(seed, impl=prng_impl), namespace)"),
         "namespace": _CAUSAL_MAP_RNG_NAMESPACE,
         "prng_impl": _CAUSAL_MAP_PRNG_IMPL,
         "jax_threefry_partitionable": _threefry_partitionable_mode(),
@@ -183,11 +183,7 @@ def _deterministic_inv_cdf(p: float) -> float:
                     (
                         (
                             (
-                                (
-                                    2.5090809287301226727e3 * r
-                                    + 3.3430575583588128105e4
-                                )
-                                * r
+                                (2.5090809287301226727e3 * r + 3.3430575583588128105e4) * r
                                 + 6.7265770927008700853e4
                             )
                             * r
@@ -210,26 +206,21 @@ def _deterministic_inv_cdf(p: float) -> float:
                 (
                     (
                         (
-                            (
-                                (5.2264952788528545610e3 * r + 2.8729085735721942674e4)
-                                * r
-                                + 3.9307895800092710610e4
-                            )
-                            * r
-                            + 2.1213794301586595867e4
+                            (5.2264952788528545610e3 * r + 2.8729085735721942674e4) * r
+                            + 3.9307895800092710610e4
                         )
                         * r
-                        + 5.3941960214247511077e3
+                        + 2.1213794301586595867e4
                     )
                     * r
-                    + 6.8718700749205790830e2
+                    + 5.3941960214247511077e3
                 )
                 * r
-                + 4.2313330701600911252e1
+                + 6.8718700749205790830e2
             )
             * r
-            + 1.0
-        )
+            + 4.2313330701600911252e1
+        ) * r + 1.0
         return num / den
     r = p if q <= 0.0 else 1.0 - p
     r = math.sqrt(-math.log(r))
@@ -240,57 +231,41 @@ def _deterministic_inv_cdf(p: float) -> float:
                 (
                     (
                         (
-                            (
-                                (
-                                    7.74545014278341407640e-4 * r
-                                    + 2.27238449892691845833e-2
-                                )
-                                * r
-                                + 2.41780725177450611770e-1
-                            )
-                            * r
-                            + 1.27045825245236838258e0
+                            (7.74545014278341407640e-4 * r + 2.27238449892691845833e-2) * r
+                            + 2.41780725177450611770e-1
                         )
                         * r
-                        + 3.64784832476320460504e0
+                        + 1.27045825245236838258e0
                     )
                     * r
-                    + 5.76949722146069140550e0
+                    + 3.64784832476320460504e0
                 )
                 * r
-                + 4.63033784615654529590e0
+                + 5.76949722146069140550e0
             )
             * r
-            + 1.42343711074968357734e0
-        )
+            + 4.63033784615654529590e0
+        ) * r + 1.42343711074968357734e0
         den = (
             (
                 (
                     (
                         (
-                            (
-                                (
-                                    1.05075007164441684324e-9 * r
-                                    + 5.47593808499534494600e-4
-                                )
-                                * r
-                                + 1.51986665636164571966e-2
-                            )
-                            * r
-                            + 1.48103976427480074590e-1
+                            (1.05075007164441684324e-9 * r + 5.47593808499534494600e-4) * r
+                            + 1.51986665636164571966e-2
                         )
                         * r
-                        + 6.89767334985100004550e-1
+                        + 1.48103976427480074590e-1
                     )
                     * r
-                    + 1.67638483018380384940e0
+                    + 6.89767334985100004550e-1
                 )
                 * r
-                + 2.05319162663775882187e0
+                + 1.67638483018380384940e0
             )
             * r
-            + 1.0
-        )
+            + 2.05319162663775882187e0
+        ) * r + 1.0
     else:
         r = r - 5.0
         num = (
@@ -298,57 +273,41 @@ def _deterministic_inv_cdf(p: float) -> float:
                 (
                     (
                         (
-                            (
-                                (
-                                    2.01033439929228813265e-7 * r
-                                    + 2.71155556874348757815e-5
-                                )
-                                * r
-                                + 1.24266094738807843860e-3
-                            )
-                            * r
-                            + 2.65321895265761230930e-2
+                            (2.01033439929228813265e-7 * r + 2.71155556874348757815e-5) * r
+                            + 1.24266094738807843860e-3
                         )
                         * r
-                        + 2.96560571828504891230e-1
+                        + 2.65321895265761230930e-2
                     )
                     * r
-                    + 1.78482653991729133580e0
+                    + 2.96560571828504891230e-1
                 )
                 * r
-                + 5.46378491116411436990e0
+                + 1.78482653991729133580e0
             )
             * r
-            + 6.65790464350110377720e0
-        )
+            + 5.46378491116411436990e0
+        ) * r + 6.65790464350110377720e0
         den = (
             (
                 (
                     (
                         (
-                            (
-                                (
-                                    2.04426310338993978564e-15 * r
-                                    + 1.42151175831644588870e-7
-                                )
-                                * r
-                                + 1.84631831751005468180e-5
-                            )
-                            * r
-                            + 7.86869131145613259100e-4
+                            (2.04426310338993978564e-15 * r + 1.42151175831644588870e-7) * r
+                            + 1.84631831751005468180e-5
                         )
                         * r
-                        + 1.48753612908506148525e-2
+                        + 7.86869131145613259100e-4
                     )
                     * r
-                    + 1.36929880922735805310e-1
+                    + 1.48753612908506148525e-2
                 )
                 * r
-                + 5.99832206555887937690e-1
+                + 1.36929880922735805310e-1
             )
             * r
-            + 1.0
-        )
+            + 5.99832206555887937690e-1
+        ) * r + 1.0
     x = num / den
     if q < 0.0:
         x = -x
@@ -407,8 +366,7 @@ class CausalMapForagerConfig:
             type(self.world_shape) is not tuple
             or len(self.world_shape) != 2
             or any(
-                type(value) is not int or value < 1
-                or value > _INT32_MAX
+                type(value) is not int or value < 1 or value > _INT32_MAX
                 for value in self.world_shape
             )
             or math.prod(self.world_shape) > _MAX_CAUSAL_MAP_CELLS
@@ -453,9 +411,7 @@ class CausalMapForagerConfig:
                 raise ValueError(f"{name} must be finite and positive")
             object.__setattr__(self, name, float(value))
         if np.float32(self.respawn_safety_factor) < np.float32(1.0):
-            raise ValueError(
-                "respawn_safety_factor must be at least 1.0 after float32 conversion"
-            )
+            raise ValueError("respawn_safety_factor must be at least 1.0 after float32 conversion")
         nonnegative_float = (
             "reverse_action_penalty",
             "visit_penalty",
@@ -494,11 +450,7 @@ class CausalMapForagerConfig:
         )
         for name in positive_int:
             value = getattr(self, name)
-            if (
-                type(value) not in _EXACT_INTEGER_TYPES
-                or value < 1
-                or value > _INT32_MAX
-            ):
+            if type(value) not in _EXACT_INTEGER_TYPES or value < 1 or value > _INT32_MAX:
                 raise ValueError(f"{name} must be a positive integer")
             object.__setattr__(self, name, int(value))
         if (
@@ -517,9 +469,7 @@ class CausalMapForagerConfig:
             or self.maximum_exact_interval_width < 0
             or self.maximum_exact_interval_width > _INT32_MAX
         ):
-            raise ValueError(
-                "maximum_exact_interval_width must be a non-negative integer"
-            )
+            raise ValueError("maximum_exact_interval_width must be a non-negative integer")
         object.__setattr__(
             self,
             "maximum_exact_interval_width",
@@ -533,9 +483,7 @@ class CausalMapForagerConfig:
         if self.maximum_retry_delay < self.initial_retry_delay:
             raise ValueError("maximum_retry_delay must be at least initial_retry_delay")
         if self.maximum_respawn_delay < self.minimum_respawn_delay:
-            raise ValueError(
-                "maximum_respawn_delay must be at least minimum_respawn_delay"
-            )
+            raise ValueError("maximum_respawn_delay must be at least minimum_respawn_delay")
         if (
             type(self.respawn_safety_quantile) not in _EXACT_REAL_TYPES
             or not math.isfinite(self.respawn_safety_quantile)
@@ -550,10 +498,9 @@ class CausalMapForagerConfig:
         )
         if not _finite_float32(self.respawn_quantile_z):
             raise ValueError("respawn_safety_quantile produces a non-finite float32 z")
-        if (
-            not 0.0 < self.one_hot_tolerance < 0.5
-            or not np.float32(self.one_hot_tolerance) < np.float32(0.5)
-        ):
+        if not 0.0 < self.one_hot_tolerance < 0.5 or not np.float32(
+            self.one_hot_tolerance
+        ) < np.float32(0.5):
             raise ValueError("one_hot_tolerance must lie strictly between 0 and 0.5")
         # Every configurable term below is combined in float32 inside the JAX
         # planner.  Individual float32 representability is insufficient: for
@@ -576,15 +523,9 @@ class CausalMapForagerConfig:
                 + self.reverse_action_penalty
                 + self.tie_break_scale
             ),
-            "exploration": (
-                _INT32_MAX
-                + self.reverse_action_penalty
-                + self.tie_break_scale
-            ),
+            "exploration": (_INT32_MAX + self.reverse_action_penalty + self.tie_break_scale),
             "respawn": (
-                self.respawn_safety_factor
-                * (1.0 + abs(self.respawn_quantile_z))
-                * _INT32_MAX
+                self.respawn_safety_factor * (1.0 + abs(self.respawn_quantile_z)) * _INT32_MAX
             ),
         }
         invalid_bounds = [
@@ -623,8 +564,7 @@ class CausalMapForagerConfig:
             for name, value in data.items()
         }
         data["world_shape"] = [
-            value.item() if isinstance(value, np.generic) else value
-            for value in self.world_shape
+            value.item() if isinstance(value, np.generic) else value for value in self.world_shape
         ]
         data["respawn_quantile_z"] = self.respawn_quantile_z
         return data
@@ -659,9 +599,7 @@ class CausalMapForagerConfig:
                 abs_tol=1e-15,
             )
         ):
-            raise ValueError(
-                "respawn_quantile_z does not match respawn_safety_quantile"
-            )
+            raise ValueError("respawn_quantile_z does not match respawn_safety_quantile")
         return config
 
     def fingerprint(self) -> str:
@@ -753,10 +691,7 @@ _STATE_BOOLEAN_FIELDS = frozenset(
     }
 )
 _STATE_FLOAT_FIELDS = frozenset(CausalMapForagerState._fields) - (
-    _STATE_INTEGER_FIELDS
-    | _STATE_UINT32_FIELDS
-    | _STATE_BOOLEAN_FIELDS
-    | {"rng_key"}
+    _STATE_INTEGER_FIELDS | _STATE_UINT32_FIELDS | _STATE_BOOLEAN_FIELDS | {"rng_key"}
 )
 _STATE_SERIALIZED_DTYPES = {
     name: (
@@ -765,8 +700,7 @@ _STATE_SERIALIZED_DTYPES = {
         else (
             "uint32"
             if name in _STATE_UINT32_FIELDS
-            else
-            "int32"
+            else "int32"
             if name in _STATE_INTEGER_FIELDS
             else "bool"
             if name in _STATE_BOOLEAN_FIELDS
@@ -787,9 +721,7 @@ def _image(observation: Any) -> Array:
     try:
         raw_image = jnp.asarray(image)
     except (OverflowError, TypeError, ValueError) as exc:
-        raise ValueError(
-            "causal-map observation must have a real numeric dtype"
-        ) from exc
+        raise ValueError("causal-map observation must have a real numeric dtype") from exc
     if not (
         jnp.issubdtype(raw_image.dtype, jnp.integer)
         or jnp.issubdtype(raw_image.dtype, jnp.floating)
@@ -812,21 +744,16 @@ def _validated_seed(seed: int | Array) -> Array:
             or host_seed.dtype.kind not in ("i", "u")
             or not 0 <= int(host_seed) <= np.iinfo(np.uint32).max
         ):
-            raise ValueError(
-                "causal-map seed must be one non-bool uint32-compatible integer"
-            )
+            raise ValueError("causal-map seed must be one non-bool uint32-compatible integer")
         return jnp.asarray(int(host_seed), dtype=jnp.uint32)
 
     raw_seed = jnp.asarray(seed)
     if raw_seed.ndim != 0 or not jnp.issubdtype(raw_seed.dtype, jnp.integer):
-        raise ValueError(
-            "causal-map seed must be one non-bool uint32-compatible integer"
-        )
+        raise ValueError("causal-map seed must be one non-bool uint32-compatible integer")
     valid_range = raw_seed >= 0
     if raw_seed.dtype.itemsize > np.dtype(np.uint32).itemsize:
         valid_range = valid_range & (
-            raw_seed
-            <= jnp.asarray(np.iinfo(np.uint32).max, dtype=raw_seed.dtype)
+            raw_seed <= jnp.asarray(np.iinfo(np.uint32).max, dtype=raw_seed.dtype)
         )
     checked_seed = _runtime_require(
         valid_range,
@@ -846,12 +773,7 @@ def _validate_observation_host(
     aperture_h, aperture_w, channels = image.shape
     if channels < 1:
         raise ValueError("causal-map Forager requires at least one object/color channel")
-    if (
-        aperture_h < 3
-        or aperture_w < 3
-        or aperture_h % 2 == 0
-        or aperture_w % 2 == 0
-    ):
+    if aperture_h < 3 or aperture_w < 3 or aperture_h % 2 == 0 or aperture_w % 2 == 0:
         raise ValueError(
             "causal-map Forager requires an odd aperture of at least 3; "
             "aperture 1 cannot causally identify a collected destination channel"
@@ -866,9 +788,7 @@ def _validate_observation_host(
     channel_sums = np.sum(image, axis=-1)
     if np.any(channel_sums > 1.0 + tolerance):
         raise ValueError("causal-map planner requires one-hot color/object channels")
-    near_binary = np.isclose(image, 0.0, atol=tolerance) | np.isclose(
-        image, 1.0, atol=tolerance
-    )
+    near_binary = np.isclose(image, 0.0, atol=tolerance) | np.isclose(image, 1.0, atol=tolerance)
     if not bool(np.all(near_binary)):
         raise ValueError("causal-map planner requires binary one-hot observations")
     return aperture_h, aperture_w, channels
@@ -884,12 +804,7 @@ def _validate_static_observation_shape(
     aperture_h, aperture_w, channels = image.shape
     if channels < 1:
         raise ValueError("causal-map Forager requires at least one object/color channel")
-    if (
-        aperture_h < 3
-        or aperture_w < 3
-        or aperture_h % 2 == 0
-        or aperture_w % 2 == 0
-    ):
+    if aperture_h < 3 or aperture_w < 3 or aperture_h % 2 == 0 or aperture_w % 2 == 0:
         raise ValueError(
             "causal-map Forager requires an odd aperture of at least 3; "
             "aperture 1 cannot causally identify a collected destination channel"
@@ -942,16 +857,13 @@ def _validated_observation_image(
     tolerance = jnp.asarray(config.one_hot_tolerance, dtype=jnp.float32)
     finite = jnp.all(jnp.isfinite(image))
     in_range = jnp.all((image >= -tolerance) & (image <= 1.0 + tolerance))
-    binary = jnp.all(
-        (jnp.abs(image) <= tolerance) | (jnp.abs(image - 1.0) <= tolerance)
-    )
+    binary = jnp.all((jnp.abs(image) <= tolerance) | (jnp.abs(image - 1.0) <= tolerance))
     one_hot = jnp.all(jnp.sum(image, axis=-1) <= 1.0 + tolerance)
     return _runtime_require(
         finite & in_range & binary & one_hot,
         image,
         message=(
-            "causal-map observation must be finite, [0, 1]-bounded, binary, "
-            "and one-hot per pixel"
+            "causal-map observation must be finite, [0, 1]-bounded, binary, and one-hot per pixel"
         ),
     )
 
@@ -1072,9 +984,7 @@ def _retry_delay(
     config: CausalMapForagerConfig,
 ) -> Array:
     """Return a positive, saturating exponential retry delay."""
-    maximum_safe_exponent = (
-        _INT32_MAX // config.initial_retry_delay
-    ).bit_length() - 1
+    maximum_safe_exponent = (_INT32_MAX // config.initial_retry_delay).bit_length() - 1
     safe_exponent = jnp.minimum(
         jnp.asarray(retry_count, dtype=jnp.int32),
         jnp.asarray(maximum_safe_exponent, dtype=jnp.int32),
@@ -1122,8 +1032,7 @@ def _estimated_respawn_delay(
     denominator = jnp.maximum(exact_count - 1, 1)
     exact_variance = jnp.where(
         exact_count > 1,
-        state.respawn_exact_m2[safe_channel]
-        / denominator.astype(jnp.float32),
+        state.respawn_exact_m2[safe_channel] / denominator.astype(jnp.float32),
         0.0,
     )
     exact_quantile = state.respawn_exact_mean[safe_channel] + jnp.asarray(
@@ -1132,9 +1041,7 @@ def _estimated_respawn_delay(
     ) * jnp.sqrt(jnp.maximum(exact_variance, 0.0))
     identified_upper = _saturating_add_int32(
         state.respawn_interval_upper_floor[safe_channel],
-        (state.respawn_interval_upper_remainder[safe_channel] > 0).astype(
-            jnp.int32
-        ),
+        (state.respawn_interval_upper_remainder[safe_channel] > 0).astype(jnp.int32),
     )
     conservative_upper = jnp.maximum(
         identified_upper.astype(jnp.float32),
@@ -1145,8 +1052,7 @@ def _estimated_respawn_delay(
         ),
     )
     estimate = jnp.ceil(
-        jnp.asarray(config.respawn_safety_factor, dtype=jnp.float32)
-        * conservative_upper
+        jnp.asarray(config.respawn_safety_factor, dtype=jnp.float32) * conservative_upper
     )
     # Do not cast a float32 value above its largest int32-safe representation:
     # the mathematical int32 maximum rounds upward in float32 and can wrap
@@ -1194,8 +1100,7 @@ def _rational_mean_float32(
     """Evaluate a quotient/remainder mean under one explicit float32 contract."""
     denominator = jnp.maximum(jnp.asarray(count, dtype=jnp.int32), 1)
     return jnp.asarray(floor, dtype=jnp.float32) + (
-        jnp.asarray(remainder, dtype=jnp.float32)
-        / denominator.astype(jnp.float32)
+        jnp.asarray(remainder, dtype=jnp.float32) / denominator.astype(jnp.float32)
     )
 
 
@@ -1210,13 +1115,9 @@ def _add_exact_mean_sample(
     # floor((r + x - q) / (n + 1)).  Split positive and negative cases so no
     # signed intermediate can overflow; r+x fits exactly in uint32.
     floor_minus_sample = floor - sample
-    nonnegative = (sample >= floor) | (
-        (sample < floor) & (remainder >= floor_minus_sample)
-    )
+    nonnegative = (sample >= floor) | ((sample < floor) & (remainder >= floor_minus_sample))
     positive_numerator = (
-        remainder.astype(jnp.uint32)
-        + sample.astype(jnp.uint32)
-        - floor.astype(jnp.uint32)
+        remainder.astype(jnp.uint32) + sample.astype(jnp.uint32) - floor.astype(jnp.uint32)
     )
     unsigned_count = next_count.astype(jnp.uint32)
     positive_adjustment = (positive_numerator // unsigned_count).astype(jnp.int32)
@@ -1294,12 +1195,7 @@ def _merge_channel_interval_bounds(
         channel, lower_bound, upper_bound, enabled = sample_data
         safe_channel = jnp.clip(channel, 0, channel_count - 1)
         old_count = current_count[safe_channel]
-        accepted = (
-            enabled
-            & (channel >= 0)
-            & (channel < channel_count)
-            & (old_count < _INT32_MAX)
-        )
+        accepted = enabled & (channel >= 0) & (channel < channel_count) & (old_count < _INT32_MAX)
         next_count = old_count + accepted.astype(jnp.int32)
         next_lower_floor, next_lower_remainder = _add_exact_mean_sample(
             current_lower_floor[safe_channel],
@@ -1404,12 +1300,7 @@ def _merge_exact_channel_samples(
         channel, sample, enabled = sample_data
         safe_channel = jnp.clip(channel, 0, channel_count - 1)
         old_count = current_count[safe_channel]
-        accepted = (
-            enabled
-            & (channel >= 0)
-            & (channel < channel_count)
-            & (old_count < _INT32_MAX)
-        )
+        accepted = enabled & (channel >= 0) & (channel < channel_count) & (old_count < _INT32_MAX)
         next_count = old_count + accepted.astype(jnp.int32)
         denominator = jnp.maximum(next_count, 1)
         next_floor, next_remainder = _add_exact_mean_sample(
@@ -1433,9 +1324,7 @@ def _merge_exact_channel_samples(
             denominator,
         )
         center_delta = provisional_mean - canonical_mean
-        centered_m2 = provisional_m2 + (
-            denominator_float * jnp.square(center_delta)
-        )
+        centered_m2 = provisional_m2 + (denominator_float * jnp.square(center_delta))
         return (
             (
                 current_count.at[safe_channel].set(next_count),
@@ -1499,11 +1388,7 @@ def _integrate_observation(
     old_ready = state.cell_ready_step[ys, xs]
     old_retry = state.cell_retry_count[ys, xs]
     old_last_absent = state.cell_last_absent_step[ys, xs]
-    reappeared = (
-        flat_active
-        & (old_collection >= 0)
-        & (old_collection < state.step_count)
-    )
+    reappeared = flat_active & (old_collection >= 0) & (old_collection < state.step_count)
     upper_elapsed = state.step_count - old_collection
     lower_elapsed = jnp.maximum(
         old_last_absent + 1 - old_collection,
@@ -1511,8 +1396,7 @@ def _integrate_observation(
     ).astype(jnp.int32)
     interval_width = upper_elapsed - lower_elapsed
     exact_reappearance = reappeared & (
-        interval_width
-        <= jnp.asarray(config.maximum_exact_interval_width, dtype=jnp.int32)
+        interval_width <= jnp.asarray(config.maximum_exact_interval_width, dtype=jnp.int32)
     )
     sample_channels = jnp.where(old_channel >= 0, old_channel, flat_channels)
 
@@ -1554,10 +1438,7 @@ def _integrate_observation(
     )
 
     visible_retry_miss = (
-        ~flat_active
-        & (old_collection >= 0)
-        & (old_ready >= 0)
-        & (state.step_count >= old_ready)
+        ~flat_active & (old_collection >= 0) & (old_ready >= 0) & (state.step_count >= old_ready)
     )
     next_retry = _increment_retry_count(old_retry, config)
     retry_delay = _retry_delay(next_retry, config)
@@ -1590,25 +1471,29 @@ def _integrate_observation(
     )
     learned_count = jnp.sum(reappeared, dtype=jnp.int32)
     visible_retry_count = jnp.sum(visible_retry_miss, dtype=jnp.int32)
-    return state._replace(
-        cell_channel=cell_channel,
-        cell_active=cell_active,
-        cell_collection_step=collection_step,
-        cell_ready_step=ready_step,
-        cell_retry_count=retry_count,
-        cell_last_seen_step=last_seen,
-        cell_last_absent_step=last_absent,
-        respawn_interval_count=respawn_interval_count,
-        respawn_interval_lower_floor=respawn_interval_lower_floor,
-        respawn_interval_lower_remainder=respawn_interval_lower_remainder,
-        respawn_interval_upper_floor=respawn_interval_upper_floor,
-        respawn_interval_upper_remainder=respawn_interval_upper_remainder,
-        respawn_exact_count=respawn_exact_count,
-        respawn_exact_floor=respawn_exact_floor,
-        respawn_exact_remainder=respawn_exact_remainder,
-        respawn_exact_mean=respawn_exact_mean,
-        respawn_exact_m2=respawn_exact_m2,
-    ), learned_count, visible_retry_count
+    return (
+        state._replace(
+            cell_channel=cell_channel,
+            cell_active=cell_active,
+            cell_collection_step=collection_step,
+            cell_ready_step=ready_step,
+            cell_retry_count=retry_count,
+            cell_last_seen_step=last_seen,
+            cell_last_absent_step=last_absent,
+            respawn_interval_count=respawn_interval_count,
+            respawn_interval_lower_floor=respawn_interval_lower_floor,
+            respawn_interval_lower_remainder=respawn_interval_lower_remainder,
+            respawn_interval_upper_floor=respawn_interval_upper_floor,
+            respawn_interval_upper_remainder=respawn_interval_upper_remainder,
+            respawn_exact_count=respawn_exact_count,
+            respawn_exact_floor=respawn_exact_floor,
+            respawn_exact_remainder=respawn_exact_remainder,
+            respawn_exact_mean=respawn_exact_mean,
+            respawn_exact_m2=respawn_exact_m2,
+        ),
+        learned_count,
+        visible_retry_count,
+    )
 
 
 def _channel_values(
@@ -1653,10 +1538,7 @@ def _cost_aware_route_grid(
     base = jnp.asarray(cell_count + 1, dtype=jnp.int32)
     infinity = jnp.asarray((cell_count + 1) * (cell_count + 2), dtype=jnp.int32)
     source_x, source_y = source[0], source[1]
-    entry_cost = (
-        negative_cells.astype(jnp.int32) * base
-        + jnp.asarray(1, dtype=jnp.int32)
-    )
+    entry_cost = negative_cells.astype(jnp.int32) * base + jnp.asarray(1, dtype=jnp.int32)
     encoded = jnp.full(config.world_shape, infinity, dtype=jnp.int32)
     encoded = encoded.at[source_y, source_x].set(0)
 
@@ -1762,9 +1644,7 @@ def _choose_action(
         ),
         maximum_entry_penalty,
     )
-    route_negative_cost = (
-        route_negative_entries.astype(jnp.float32) * negative_entry_penalty
-    )
+    route_negative_cost = route_negative_entries.astype(jnp.float32) * negative_entry_penalty
     target_noise = jr.uniform(
         target_key,
         state.cell_channel.shape,
@@ -1870,15 +1750,13 @@ def _choose_action(
             jnp.asarray(path_infinity, dtype=jnp.int32),
         )
     )
-    pursuit_allowed = (
-        (target_distances_int < path_infinity)
-        & (target_negative_entries == minimum_route_negative_entries)
+    pursuit_allowed = (target_distances_int < path_infinity) & (
+        target_negative_entries == minimum_route_negative_entries
     )
     neighbor_visits = state.visit_count[neighbor_y, neighbor_x].astype(jnp.float32)
     reverse_action = jnp.mod(state.last_action + 2, 4)
     reverse_cost = (
-        (state.last_action >= 0)
-        & (jnp.arange(4, dtype=jnp.int32) == reverse_action)
+        (state.last_action >= 0) & (jnp.arange(4, dtype=jnp.int32) == reverse_action)
     ).astype(jnp.float32) * jnp.asarray(
         config.reverse_action_penalty,
         dtype=jnp.float32,
@@ -1889,16 +1767,11 @@ def _choose_action(
     )
     pursuit_cost = (
         target_distances
-        + jnp.asarray(config.visit_penalty, dtype=jnp.float32)
-        * jnp.log1p(neighbor_visits)
+        + jnp.asarray(config.visit_penalty, dtype=jnp.float32) * jnp.log1p(neighbor_visits)
         + reverse_cost
         + action_noise
     )
-    exploration_cost = (
-        neighbor_visits
-        + reverse_cost
-        + action_noise
-    )
+    exploration_cost = neighbor_visits + reverse_cost + action_noise
     pursuing = has_target & route_available
     costs = jnp.where(pursuing, pursuit_cost, exploration_cost)
     selected_allowed = jnp.where(pursuing, pursuit_allowed, allowed)
@@ -1914,9 +1787,9 @@ def _choose_action(
         jnp.arange(4, dtype=jnp.float32),
         jnp.inf,
     )
-    action = jnp.argmin(
-        jnp.where(has_finite_action, finite_costs, fallback_costs)
-    ).astype(jnp.int32)
+    action = jnp.argmin(jnp.where(has_finite_action, finite_costs, fallback_costs)).astype(
+        jnp.int32
+    )
 
     destination = neighbor_positions[action]
     destination_y, destination_x = destination[1], destination[0]
@@ -1975,16 +1848,12 @@ def causal_map_step(
     )
     image = _validated_observation_image(observation, config)
     if image.shape[-1] != state.reward_sum.shape[0]:
-        raise ValueError(
-            "causal-map observation channel count changed during the continuing run"
-        )
+        raise ValueError("causal-map observation channel count changed during the continuing run")
     mode_checked_step_count = _runtime_require(
         state.jax_threefry_partitionable
         == jnp.asarray(_threefry_partitionable_mode(), dtype=jnp.bool_),
         state.step_count,
-        message=(
-            "causal-map state jax_threefry_partitionable mode does not match runtime"
-        ),
+        message=("causal-map state jax_threefry_partitionable mode does not match runtime"),
     )
     checked_step_count = _require_unsaturated_step_count(mode_checked_step_count)
     position = jnp.mod(
@@ -1999,9 +1868,7 @@ def causal_map_step(
         state.visit_count[position[1], position[0]],
         jnp.asarray(1, dtype=jnp.int32),
     )
-    visit_count = state.visit_count.at[position[1], position[0]].set(
-        next_visit_count
-    )
+    visit_count = state.visit_count.at[position[1], position[0]].set(next_visit_count)
     state = state._replace(
         step_count=step_count,
         position=position,
@@ -2010,14 +1877,10 @@ def causal_map_step(
 
     valid_channel = state.last_target_channel >= 0
     observed_reward = (
-        valid_channel
-        & jnp.isfinite(reward)
-        & (jnp.abs(reward) > config.reward_observation_epsilon)
+        valid_channel & jnp.isfinite(reward) & (jnp.abs(reward) > config.reward_observation_epsilon)
     )
     safe_channel = jnp.maximum(state.last_target_channel, 0)
-    reward_sum = state.reward_sum.at[safe_channel].add(
-        jnp.where(observed_reward, reward, 0.0)
-    )
+    reward_sum = state.reward_sum.at[safe_channel].add(jnp.where(observed_reward, reward, 0.0))
     reward_sum = _runtime_require(
         jnp.all(jnp.isfinite(reward_sum)),
         reward_sum,
@@ -2027,9 +1890,7 @@ def causal_map_step(
         state.reward_count[safe_channel],
         observed_reward.astype(jnp.int32),
     )
-    reward_count = state.reward_count.at[safe_channel].set(
-        next_reward_count
-    )
+    reward_count = state.reward_count.at[safe_channel].set(next_reward_count)
 
     # A reward collected from a cell that was still pending proves that the
     # previous object reappeared before it was immediately collected again.
@@ -2184,8 +2045,7 @@ def validate_causal_map_state(
             host_impl = _require_exact_str("impl", impl)
             if host_impl != _CAUSAL_MAP_PRNG_IMPL:
                 raise ValueError(
-                    "rng_key must use the causal-map PRNG implementation "
-                    f"'{_CAUSAL_MAP_PRNG_IMPL}'"
+                    f"rng_key must use the causal-map PRNG implementation '{_CAUSAL_MAP_PRNG_IMPL}'"
                 )
             if array.shape != (2,) or array.dtype != np.dtype(np.uint32):
                 raise ValueError("rng_key must contain exactly two uint32 words")
@@ -2201,9 +2061,7 @@ def validate_causal_map_state(
                 else np.float32
             )
             if array.dtype != expected_dtype:
-                raise ValueError(
-                    f"{name} must have dtype {expected_dtype}, found {array.dtype}"
-                )
+                raise ValueError(f"{name} must have dtype {expected_dtype}, found {array.dtype}")
         arrays[name] = array
 
     scalar_fields = (
@@ -2251,8 +2109,7 @@ def validate_causal_map_state(
     if channel_count < 1:
         raise ValueError("state must contain at least one observation channel")
     if observation_channels is not None and (
-        type(observation_channels) not in _EXACT_INTEGER_TYPES
-        or observation_channels < 1
+        type(observation_channels) not in _EXACT_INTEGER_TYPES or observation_channels < 1
     ):
         raise ValueError("observation_channels must be a positive integer")
     if observation_channels is not None and channel_count != int(observation_channels):
@@ -2274,9 +2131,7 @@ def validate_causal_map_state(
     if not 0 <= initial_seed <= np.iinfo(np.uint32).max:
         raise ValueError("initial_seed must be uint32-compatible")
     if bool(arrays["jax_threefry_partitionable"]) != _threefry_partitionable_mode():
-        raise ValueError(
-            "state jax_threefry_partitionable mode does not match runtime"
-        )
+        raise ValueError("state jax_threefry_partitionable mode does not match runtime")
     last_action = int(arrays["last_action"])
     if last_action not in (-1, 0, 1, 2, 3):
         raise ValueError("last_action must be -1 or one of the four public actions")
@@ -2316,9 +2171,7 @@ def validate_causal_map_state(
             raise ValueError(f"{name} exceeds the causal map/step bound")
         if int(np.sum(arrays[name], dtype=np.int64)) > maximum_reappearances:
             raise ValueError(f"total {name} exceeds the causal map/step bound")
-    if np.any(
-        arrays["respawn_exact_count"] > arrays["respawn_interval_count"]
-    ):
+    if np.any(arrays["respawn_exact_count"] > arrays["respawn_interval_count"]):
         raise ValueError("exact respawn counts cannot exceed all reappearance counts")
     if np.any(arrays["visit_count"] > min(step_count + 1, _INT32_MAX)):
         raise ValueError("visit_count cannot exceed the number of visited states")
@@ -2377,8 +2230,7 @@ def validate_causal_map_state(
     expected_cell_active = last_seen > last_absent
     if not np.array_equal(arrays["cell_active"], expected_cell_active):
         raise ValueError(
-            "cell_active must exactly match whether the last observation "
-            "followed the last absence"
+            "cell_active must exactly match whether the last observation followed the last absence"
         )
     if np.any(has_collection & (last_absent < collection)):
         raise ValueError("collected cells must be observed absent at collection time")
@@ -2394,9 +2246,7 @@ def validate_causal_map_state(
         accounted_collections,
         arrays["reward_count"].astype(np.int64),
     ):
-        raise ValueError(
-            "reward counts must equal reappearances plus pending collections"
-        )
+        raise ValueError("reward counts must equal reappearances plus pending collections")
 
     if last_action >= 0:
         direction_x, direction_y = _DIRECTION_STEPS[last_action]
@@ -2408,31 +2258,21 @@ def validate_causal_map_state(
             dtype=np.int32,
         )
         if not np.array_equal(arrays["last_target_position"], expected_target):
-            raise ValueError(
-                "last_target_position must be the destination of last_action"
-            )
+            raise ValueError("last_target_position must be the destination of last_action")
         target_x, target_y = (int(value) for value in expected_target)
         expected_channel = int(channels[target_y, target_x])
         if last_target_channel != expected_channel:
-            raise ValueError(
-                "last_target_channel must match the destination map cell"
-            )
+            raise ValueError("last_target_channel must match the destination map cell")
         predicted_ready = bool(
             collection[target_y, target_x] >= 0
             and ready[target_y, target_x] >= 0
             and step_count >= ready[target_y, target_x]
         )
         expected_active = bool(
-            expected_channel >= 0
-            and (
-                arrays["cell_active"][target_y, target_x]
-                or predicted_ready
-            )
+            expected_channel >= 0 and (arrays["cell_active"][target_y, target_x] or predicted_ready)
         )
         if bool(arrays["last_target_expected_active"]) != expected_active:
-            raise ValueError(
-                "last_target_expected_active does not match destination state"
-            )
+            raise ValueError("last_target_expected_active does not match destination state")
     elif (
         last_target_channel != -1
         or bool(arrays["last_target_expected_active"])
@@ -2461,23 +2301,15 @@ def validate_causal_map_state(
     if any(np.any(interval_empty & (arrays[name] != 0)) for name in interval_fields):
         raise ValueError("zero-count respawn interval bounds must be zero")
     interval_populated = ~interval_empty
-    if np.any(
-        interval_populated & (arrays["respawn_interval_lower_floor"] < 1)
-    ):
+    if np.any(interval_populated & (arrays["respawn_interval_lower_floor"] < 1)):
         raise ValueError("respawn interval lower floors must be at least one step")
     if np.any(
         interval_populated
         & (
             (arrays["respawn_interval_lower_remainder"] < 0)
             | (arrays["respawn_interval_upper_remainder"] < 0)
-            | (
-                arrays["respawn_interval_lower_remainder"]
-                >= arrays["respawn_interval_count"]
-            )
-            | (
-                arrays["respawn_interval_upper_remainder"]
-                >= arrays["respawn_interval_count"]
-            )
+            | (arrays["respawn_interval_lower_remainder"] >= arrays["respawn_interval_count"])
+            | (arrays["respawn_interval_upper_remainder"] >= arrays["respawn_interval_count"])
         )
     ):
         raise ValueError("respawn interval remainders must lie in [0, count)")
@@ -2510,10 +2342,7 @@ def validate_causal_map_state(
         )
     ):
         raise ValueError("zero-count exact respawn statistics must be zero")
-    if np.any(
-        (arrays["respawn_exact_count"] <= 1)
-        & (arrays["respawn_exact_m2"] != 0.0)
-    ):
+    if np.any((arrays["respawn_exact_count"] <= 1) & (arrays["respawn_exact_m2"] != 0.0)):
         raise ValueError("exact respawn M2 must be zero with at most one sample")
     exact_populated = ~exact_empty
     exact_floor = arrays["respawn_exact_floor"]
@@ -2521,10 +2350,7 @@ def validate_causal_map_state(
     exact_count = arrays["respawn_exact_count"]
     if np.any(exact_populated & (exact_floor < 1)):
         raise ValueError("populated exact respawn floors must be at least one step")
-    if np.any(
-        exact_populated
-        & ((exact_remainder < 0) | (exact_remainder >= exact_count))
-    ):
+    if np.any(exact_populated & ((exact_remainder < 0) | (exact_remainder >= exact_count))):
         raise ValueError("exact respawn remainders must lie in [0, count)")
     if np.any(
         exact_populated
@@ -2541,38 +2367,21 @@ def validate_causal_map_state(
         exact_fraction,
         dtype=np.float32,
     )
-    if np.any(
-        canonical_exact_mean.view(np.uint32)
-        != arrays["respawn_exact_mean"].view(np.uint32)
-    ):
+    if np.any(canonical_exact_mean.view(np.uint32) != arrays["respawn_exact_mean"].view(np.uint32)):
         raise ValueError(
             "exact respawn mean must match its rational sample sum under the "
             "schema float32 contract"
         )
 
-    exact_population = (
-        arrays["respawn_exact_count"] == arrays["respawn_interval_count"]
-    )
+    exact_population = arrays["respawn_exact_count"] == arrays["respawn_interval_count"]
     if np.any(
-        exact_population
-        & (
-            (lower_floor != upper_floor)
-            | (lower_remainder != upper_remainder)
-        )
+        exact_population & ((lower_floor != upper_floor) | (lower_remainder != upper_remainder))
     ):
-        raise ValueError(
-            "all-exact respawn intervals must have identical rational endpoints"
-        )
+        raise ValueError("all-exact respawn intervals must have identical rational endpoints")
     if np.any(
-        exact_population
-        & (
-            (lower_floor != exact_floor)
-            | (lower_remainder != exact_remainder)
-        )
+        exact_population & ((lower_floor != exact_floor) | (lower_remainder != exact_remainder))
     ):
-        raise ValueError(
-            "all-exact respawn interval and exact-sample rational means must match"
-        )
+        raise ValueError("all-exact respawn interval and exact-sample rational means must match")
 
 
 def causal_map_state_to_dict(
@@ -2591,9 +2400,7 @@ def causal_map_state_to_dict(
     return {
         "schema": CAUSAL_MAP_STATE_SCHEMA,
         "prng_impl": _prng_impl_name(state.rng_key),
-        "jax_threefry_partitionable": bool(
-            np.asarray(state.jax_threefry_partitionable)
-        ),
+        "jax_threefry_partitionable": bool(np.asarray(state.jax_threefry_partitionable)),
         "config": config.to_dict(),
         "config_sha256": config.fingerprint(),
         "dtypes": dict(_STATE_SERIALIZED_DTYPES),
@@ -2609,15 +2416,14 @@ def _raw_json_array(
     kind: str,
 ) -> None:
     """Validate a JSON field without relying on coercive NumPy conversion."""
+
     def require_json_shape(value: Any, dimensions: tuple[int, ...]) -> None:
         if not dimensions:
             if isinstance(value, (list, tuple, Mapping)):
                 raise ValueError(f"serialized {name} must contain JSON scalars")
             return
         if type(value) is not list or len(value) != dimensions[0]:
-            raise ValueError(
-                f"serialized {name} must use JSON arrays with shape {shape}"
-            )
+            raise ValueError(f"serialized {name} must use JSON arrays with shape {shape}")
         for child in value:
             require_json_shape(child, dimensions[1:])
 
@@ -2631,10 +2437,7 @@ def _raw_json_array(
 
     for value in array.reshape(-1):
         if kind == "int32":
-            valid = (
-                type(value) is int
-                and np.iinfo(np.int32).min <= value <= np.iinfo(np.int32).max
-            )
+            valid = type(value) is int and np.iinfo(np.int32).min <= value <= np.iinfo(np.int32).max
         elif kind == "uint32-key-data":
             valid = type(value) is int and 0 <= value <= np.iinfo(np.uint32).max
         elif kind == "uint32":
@@ -2644,17 +2447,12 @@ def _raw_json_array(
         elif kind == "float32":
             valid = type(value) is float and math.isfinite(value)
             if valid:
-                valid = (
-                    abs(value) <= np.finfo(np.float32).max
-                    and float(np.float32(value)) == value
-                )
+                valid = abs(value) <= np.finfo(np.float32).max and float(np.float32(value)) == value
         else:  # pragma: no cover - internal schema table is closed
             host_kind = _require_exact_str("kind", kind)
             raise RuntimeError(f"unknown serialized state kind '{host_kind}'")
         if not valid:
-            raise ValueError(
-                f"serialized {name} contains a value incompatible with {kind}"
-            )
+            raise ValueError(f"serialized {name} contains a value incompatible with {kind}")
 
 
 def _require_raw_json_value(value: Any, *, path: str) -> None:
@@ -2704,13 +2502,9 @@ def causal_map_state_from_dict(
         raise ValueError("serialized state PRNG implementation does not match")
     checkpoint_partitionable = payload.get("jax_threefry_partitionable")
     if type(checkpoint_partitionable) is not bool:
-        raise ValueError(
-            "serialized state jax_threefry_partitionable mode must be boolean"
-        )
+        raise ValueError("serialized state jax_threefry_partitionable mode must be boolean")
     if checkpoint_partitionable != _threefry_partitionable_mode():
-        raise ValueError(
-            "serialized state jax_threefry_partitionable mode does not match runtime"
-        )
+        raise ValueError("serialized state jax_threefry_partitionable mode does not match runtime")
     declared_config_value = payload.get("config")
     _require_raw_json_value(
         declared_config_value,
@@ -2742,24 +2536,17 @@ def causal_map_state_from_dict(
     declared_config_sha256 = hashlib.sha256(declared_config.encode()).hexdigest()
     raw_config_sha256 = payload.get("config_sha256")
     declared_hash_matches = (
-        type(raw_config_sha256) is str
-        and raw_config_sha256 == declared_config_sha256
+        type(raw_config_sha256) is str and raw_config_sha256 == declared_config_sha256
     )
     current_config_matches = (
-        declared_config == expected_config
-        and declared_config_sha256 == config.fingerprint()
+        declared_config == expected_config and declared_config_sha256 == config.fingerprint()
     )
     # State v5 predates the scheduling option but its state tuple is unchanged.
     # A field-absent checkpoint therefore remains resumable only under the
     # explicit legacy decision-time policy.  Never silently resume it under the
     # new arrival-aware default, which would change continuation behavior.
-    legacy_config_matches = (
-        not config.arrival_aware_readiness
-        and declared_config == legacy_config
-    )
-    if not declared_hash_matches or not (
-        current_config_matches or legacy_config_matches
-    ):
+    legacy_config_matches = not config.arrival_aware_readiness and declared_config == legacy_config
+    if not declared_hash_matches or not (current_config_matches or legacy_config_matches):
         raise ValueError("serialized state embeds a different configuration")
     raw_dtypes = payload.get("dtypes")
     if not isinstance(raw_dtypes, Mapping) or dict(raw_dtypes) != _STATE_SERIALIZED_DTYPES:
@@ -2816,13 +2603,9 @@ def causal_map_state_from_dict(
             shape=shape,
             kind=_STATE_SERIALIZED_DTYPES[name],
         )
-    if (
-        raw_fields["jax_threefry_partitionable"]
-        is not checkpoint_partitionable
-    ):
+    if raw_fields["jax_threefry_partitionable"] is not checkpoint_partitionable:
         raise ValueError(
-            "serialized state-bound and top-level jax_threefry_partitionable "
-            "modes do not match"
+            "serialized state-bound and top-level jax_threefry_partitionable modes do not match"
         )
 
     values: dict[str, Array] = {}
@@ -2921,9 +2704,7 @@ class CausalMapForagerAgent:
             raise ValueError("reward must be one finite float32 scalar")
         _, _, channels = _validate_observation_host(observation, self.config)
         if channels != self._state.reward_sum.shape[0]:
-            raise ValueError(
-                "observation channel count changed during the continuing run"
-            )
+            raise ValueError("observation channel count changed during the continuing run")
         self._state, action, _ = causal_map_step(
             self._state,
             jnp.asarray(reward_value, dtype=jnp.float32),
@@ -2953,9 +2734,7 @@ class CausalMapForagerAgent:
             "config": self.config.to_dict(),
             "config_sha256": self.config.fingerprint(),
             "status_claim": "candidate; no SOTA claim without matched-seed evidence",
-            "update_semantics": (
-                "one causal map/reward/schedule update per transition; no replay"
-            ),
+            "update_semantics": ("one causal map/reward/schedule update per transition; no replay"),
             "world_model": {
                 "kind": "relative_toroidal_cognitive_map",
                 "origin": "arbitrary initial agent location",
@@ -3057,10 +2836,7 @@ def causal_map_variant_spec(
         "jax_threefry_partitionable": _threefry_partitionable_mode(),
         "config": config.to_dict(),
         "config_sha256": config.fingerprint(),
-        "implementation": (
-            "alberta_framework.benchmarks.causal_map_forager:"
-            "CausalMapForagerAgent"
-        ),
+        "implementation": ("alberta_framework.benchmarks.causal_map_forager:CausalMapForagerAgent"),
     }
 
 
@@ -3074,21 +2850,14 @@ def _validate_benchmark_contract(
         or benchmark_config.steps < 1
         or benchmark_config.steps >= _INT32_MAX
     ):
-        raise ValueError(
-            "causal-map benchmark steps must be a positive int below int32 maximum"
-        )
-    if (
-        type(benchmark_config.jax_chunk_size) is not int
-        or benchmark_config.jax_chunk_size < 1
-        or benchmark_config.jax_chunk_size > 10_000
-    ):
-        raise ValueError(
-            "causal-map jax_chunk_size must be an integer in [1, 10000]"
-        )
+        raise ValueError("causal-map benchmark steps must be a positive int below int32 maximum")
+    require_scan_steps(
+        "causal-map jax_chunk_size",
+        benchmark_config.jax_chunk_size,
+        _CAUSAL_MAP_CHUNK_BUDGET,
+    )
     if env.preset != "field_of_view" or env.resolved_env_id != "ForagaxTwoBiomeLarge-v1":
-        raise ValueError(
-            "causal-map variant is defined only for stationary Forager field_of_view"
-        )
+        raise ValueError("causal-map variant is defined only for stationary Forager field_of_view")
     if env.require_exact_version is not True:
         raise ValueError("causal-map benchmark requires the exact pinned Foragax build")
     if env.resolved_observation_type != "color":
@@ -3114,9 +2883,7 @@ def _validate_benchmark_contract(
         raise ValueError("aperture cannot exceed the configured world")
     maximum_batch_observations = env.aperture_size * env.aperture_size
     if benchmark_config.steps * maximum_batch_observations >= _INT32_MAX:
-        raise ValueError(
-            "causal-map horizon and aperture can overflow int32 reappearance counts"
-        )
+        raise ValueError("causal-map horizon and aperture can overflow int32 reappearance counts")
 
 
 class _LaneMetrics:
@@ -3125,9 +2892,7 @@ class _LaneMetrics:
     def __init__(self, config: ForagerBenchmarkConfig) -> None:
         self.config = config
         self.target_steps = [1]
-        self.target_steps.extend(
-            range(config.record_every, config.steps + 1, config.record_every)
-        )
+        self.target_steps.extend(range(config.record_every, config.steps + 1, config.record_every))
         if self.target_steps[-1] != config.steps:
             self.target_steps.append(config.steps)
         self.target_steps = sorted(set(self.target_steps))
@@ -3167,10 +2932,7 @@ class _LaneMetrics:
             decay=FORAGER_FOV_EMA_DECAY,
             filter_state=self.fov_filter_state,
         )
-        fov_mask = (
-            np.arange(completed, completed + active) % FORAGER_FOV_EMA_SUBSAMPLE
-            == 0
-        )
+        fov_mask = np.arange(completed, completed + active) % FORAGER_FOV_EMA_SUBSAMPLE == 0
         self.fov_samples.extend(float(value) for value in fov[fov_mask])
         self.final_ewm = float(ewm[-1])
         self.all_finite = self.all_finite and bool(np.all(finite))
@@ -3196,13 +2958,9 @@ class _LaneMetrics:
             start = max(0, end - self.config.final_window)
             self.curve_steps.append(step_number)
             self.curve_ewm.append(float(ewm[local_count - 1]))
-            self.curve_window.append(
-                float((prefix[end] - prefix[start]) / (end - start))
-            )
+            self.curve_window.append(float((prefix[end] - prefix[start]) / (end - start)))
             self.target_index += 1
-        self.reward_tail = combined[
-            -min(self.config.final_window, combined.size) :
-        ]
+        self.reward_tail = combined[-min(self.config.final_window, combined.size) :]
 
 
 def _make_scan_chunk(
@@ -3315,8 +3073,7 @@ def _require_host_threefry_mode(expected: bool) -> None:
     """Reject host-side runtime drift from a trajectory's state-bound mode."""
     if _threefry_partitionable_mode() != expected:
         raise RuntimeError(
-            "causal-map runner jax_threefry_partitionable mode drifted "
-            "before trace finalization"
+            "causal-map runner jax_threefry_partitionable mode drifted before trace finalization"
         )
 
 
@@ -3402,8 +3159,7 @@ def _build_causal_map_result(
                 math.sqrt(
                     max(
                         0.0,
-                        lane_respawn_exact_m2[index]
-                        / (lane_respawn_exact_count[index] - 1),
+                        lane_respawn_exact_m2[index] / (lane_respawn_exact_count[index] - 1),
                     )
                 )
             )
@@ -3415,9 +3171,7 @@ def _build_causal_map_result(
     lane_cell_channel = np.asarray(lane_state.cell_channel, dtype=np.int32)
     negative_channel_mask = np.asarray(
         [
-            channel_count > 0
-            and mean is not None
-            and mean < agent_config.negative_reward_threshold
+            channel_count > 0 and mean is not None and mean < agent_config.negative_reward_threshold
             for channel_count, mean in zip(
                 lane_reward_count,
                 learned_reward_means,
@@ -3427,16 +3181,12 @@ def _build_causal_map_result(
         dtype=np.bool_,
     )
     known_mask = lane_cell_channel >= 0
-    known_negative_mask = known_mask & negative_channel_mask[
-        np.maximum(lane_cell_channel, 0)
-    ]
+    known_negative_mask = known_mask & negative_channel_mask[np.maximum(lane_cell_channel, 0)]
     metadata["final_causal_diagnostics"] = {
         "reward_count_by_observed_channel": lane_reward_count.tolist(),
         "reward_sum_by_observed_channel": lane_reward_sum.tolist(),
         "reward_mean_by_observed_channel": learned_reward_means,
-        "respawn_interval_count_by_observed_channel": (
-            lane_respawn_interval_count.tolist()
-        ),
+        "respawn_interval_count_by_observed_channel": (lane_respawn_interval_count.tolist()),
         "respawn_interval_lower_floor_by_observed_channel": (
             lane_respawn_interval_lower_floor.tolist()
         ),
@@ -3457,15 +3207,9 @@ def _build_causal_map_result(
         ),
         "exact_respawn_count_by_observed_channel": lane_respawn_exact_count.tolist(),
         "exact_respawn_floor_by_observed_channel": lane_respawn_exact_floor.tolist(),
-        "exact_respawn_remainder_by_observed_channel": (
-            lane_respawn_exact_remainder.tolist()
-        ),
-        "exact_respawn_delay_mean_by_observed_channel": (
-            lane_respawn_exact_mean.tolist()
-        ),
-        "exact_respawn_delay_sample_std_by_observed_channel": (
-            learned_respawn_exact_std
-        ),
+        "exact_respawn_remainder_by_observed_channel": (lane_respawn_exact_remainder.tolist()),
+        "exact_respawn_delay_mean_by_observed_channel": (lane_respawn_exact_mean.tolist()),
+        "exact_respawn_delay_sample_std_by_observed_channel": (learned_respawn_exact_std),
         "known_fixed_cells": int(np.sum(known_mask)),
         "known_learned_negative_cells": int(np.sum(known_negative_mask)),
         "map_cells": int(agent_config.height * agent_config.width),
@@ -3593,13 +3337,10 @@ def _run_causal_map_lanes(
             jax.block_until_ready(outputs)  # type: ignore[no-untyped-call]
             raw_rewards = _host_metric_array(rewards_device[:, :active])
             raw_regrets = _host_metric_array(regrets_device[:, :active])
-            if (
-                raw_rewards.dtype != np.dtype(np.float32)
-                or raw_regrets.dtype != np.dtype(np.float32)
+            if raw_rewards.dtype != np.dtype(np.float32) or raw_regrets.dtype != np.dtype(
+                np.float32
             ):
-                raise TypeError(
-                    "Foragax evaluator outputs must retain exact float32 dtype"
-                )
+                raise TypeError("Foragax evaluator outputs must retain exact float32 dtype")
             rewards = raw_rewards.astype(np.float64)
             regrets = raw_regrets.astype(np.float64)
             done = _host_metric_array(done_device[:, :active], dtype=np.bool_)
@@ -3634,9 +3375,7 @@ def _run_causal_map_lanes(
             if jnp.issubdtype(leaf.dtype, jnp.inexact)
         )
         if not state_finite or not all(item.all_finite for item in metrics):
-            raise FloatingPointError(
-                "causal-map Alberta variant produced non-finite values"
-            )
+            raise FloatingPointError("causal-map Alberta variant produced non-finite values")
         validated_lane_states: list[CausalMapForagerState] = []
         for lane in range(len(seeds)):
             lane_state = jax.device_get(
@@ -3653,13 +3392,10 @@ def _run_causal_map_lanes(
                 )
             validated_lane_states.append(lane_state)
         bound_partitionable_modes = {
-            bool(np.asarray(state.jax_threefry_partitionable))
-            for state in validated_lane_states
+            bool(np.asarray(state.jax_threefry_partitionable)) for state in validated_lane_states
         }
         if len(bound_partitionable_modes) != 1:
-            raise ValueError(
-                "causal-map lanes disagree on jax_threefry_partitionable mode"
-            )
+            raise ValueError("causal-map lanes disagree on jax_threefry_partitionable mode")
         bound_partitionable_mode = bound_partitionable_modes.pop()
     except BaseException:
         _abort_reward_trace_sinks(trace_sinks)
@@ -3667,12 +3403,8 @@ def _run_causal_map_lanes(
     try:
         base_metadata_by_lane: list[Mapping[str, Any]] = []
         for seed in seeds:
-            base_metadata = dict(
-                CausalMapForagerAgent(agent_config, seed=seed).metadata()
-            )
-            base_metadata["jax_threefry_partitionable"] = (
-                bound_partitionable_mode
-            )
+            base_metadata = dict(CausalMapForagerAgent(agent_config, seed=seed).metadata())
+            base_metadata["jax_threefry_partitionable"] = bound_partitionable_mode
             base_metadata_by_lane.append(base_metadata)
         # This is the final fallible runtime-mode check before trace sealing.
         # Result construction below uses only the captured state-bound mode.
@@ -3690,9 +3422,7 @@ def _run_causal_map_lanes(
                 lane_metrics=lane_metrics,
                 lane_state=lane_state,
                 base_metadata=base_metadata_by_lane[lane],
-                trace_metadata=(
-                    trace_metadata[lane] if trace_metadata else None
-                ),
+                trace_metadata=(trace_metadata[lane] if trace_metadata else None),
                 overall_duration=overall_duration,
                 overall_started=overall_started,
                 compile_started=compile_started,
@@ -3749,10 +3479,7 @@ def run_causal_map_forager_seeds(
     raw_seeds = tuple(seeds)
     if not raw_seeds:
         raise ValueError("seeds must be non-empty")
-    if any(
-        type(seed) not in _EXACT_INTEGER_TYPES
-        for seed in raw_seeds
-    ):
+    if any(type(seed) not in _EXACT_INTEGER_TYPES for seed in raw_seeds):
         raise ValueError("seeds must be uint32-compatible integers without coercion")
     ordered = tuple(int(seed) for seed in raw_seeds)
     if len(set(ordered)) != len(ordered):
