@@ -61,10 +61,15 @@ resource, arithmetic, roster, identity, reexecution, or policy drift.
 
 Two separate literal flags are frozen `False`. Public execution fails before output
 reservation, dataset loading, or runner dispatch. A later reviewed transition must change
-both literals. The single run-and-publish transaction pins each output-directory component
+both literals. Public strict reexecution of the campaign roster is closed by the same gate;
+the disjoint test-only roster remains available for regression tests. The single
+run-and-publish transaction pins each output-directory component
 with `O_DIRECTORY|O_NOFOLLOW`, acquires the canonical NEW-path reservation with `O_EXCL`
-before dataset work, and publishes a strictly validated anonymous inode by no-replace link
-plus directory `fsync`. After the first runner dispatch, any failure leaves an inode-owned
+before dataset work, proves that its held parent remains the visible registered parent, and
+publishes a strictly validated anonymous inode by no-replace link plus directory `fsync`.
+The linked and reread file must remain that exact prepared inode; same-byte replacement is
+rejected. Reservation, output, and tombstone writes require complete progress. After the
+first runner dispatch, any failure leaves an inode-owned
 `consumed-without-result` tombstone, permanently preventing retry at that namespace.
 
 All accepted and negative outcomes remain development-only and nonpromoting. Negative

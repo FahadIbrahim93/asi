@@ -658,13 +658,20 @@ def validate_report(
         raise ValueError("CPR config must be an exact IPMNISTConfig")
     if type(seeds) is not tuple or any(type(seed) is not int for seed in seeds):
         raise ValueError("CPR seeds must be an exact integer tuple")
-    if len(seeds) != 5 or not any(
-        all(seed == roster[index] for index, seed in enumerate(seeds))
-        for roster in (CAMPAIGN_SEEDS, TEST_ONLY_SEEDS)
-    ):
+    campaign_roster = len(seeds) == len(CAMPAIGN_SEEDS) and all(
+        seed == CAMPAIGN_SEEDS[index] for index, seed in enumerate(seeds)
+    )
+    test_roster = len(seeds) == len(TEST_ONLY_SEEDS) and all(
+        seed == TEST_ONLY_SEEDS[index] for index, seed in enumerate(seeds)
+    )
+    if not campaign_roster and not test_roster:
         raise ValueError("CPR seed roster differs from the campaign or test-only contract")
     if type(reexecute) is not bool:
         raise ValueError("CPR reexecution selector must be an exact bool")
+    if reexecute and campaign_roster and (
+        _REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True
+    ):
+        raise RuntimeError("CPR campaign reexecution is not authorized")
     report = cast(dict[str, object], _bounded_json(value))
     report = _exact_object(
         report, ("schema", "plan", "identity", "rows", "aggregate", "policy", "sha256"), "report"
@@ -788,6 +795,26 @@ def _open_parent(path: Path) -> int:
         raise
 
 
+def _require_live_parent(path: Path, directory: int) -> None:
+    held = os.fstat(directory)
+    visible = os.stat(path.parent, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(held.st_mode)
+        or not stat.S_ISDIR(visible.st_mode)
+        or (held.st_dev, held.st_ino) != (visible.st_dev, visible.st_ino)
+    ):
+        raise RuntimeError("CPR output parent changed during publication")
+
+
+def _write_all(descriptor: int, raw: bytes, *, label: str) -> None:
+    view = memoryview(raw)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            raise OSError(f"CPR {label} write made no progress")
+        view = view[written:]
+
+
 def _reserve(path: Path) -> Reservation:
     if type(path) is not type(Path()) or path.absolute() != OUTPUT_PATH.absolute():
         raise ValueError("CPR output must be the exact frozen NEW path")
@@ -809,10 +836,11 @@ def _reserve(path: Path) -> Reservation:
             0o400,
             dir_fd=directory,
         )
-        os.write(marker_fd, b"asi-cpr-reserved-v1\n")
+        _write_all(marker_fd, b"asi-cpr-reserved-v1\n", label="reservation")
         os.fsync(marker_fd)
         metadata = os.fstat(marker_fd)
         os.fsync(directory)
+        _require_live_parent(path, directory)
         return directory, path.name, marker_name, marker_fd, metadata.st_dev, metadata.st_ino
     except BaseException:
         if marker_fd >= 0:
@@ -849,9 +877,15 @@ def _finish_reservation(reservation: Reservation, *, consumed: bool) -> None:
         if consumed:
             os.ftruncate(marker_fd, 0)
             os.lseek(marker_fd, 0, os.SEEK_SET)
-            os.write(marker_fd, b"asi-cpr-consumed-without-result-v1\n")
+            _write_all(
+                marker_fd,
+                b"asi-cpr-consumed-without-result-v1\n",
+                label="consumed tombstone",
+            )
             os.fsync(marker_fd)
             os.fsync(directory)
+            _require_live_parent(OUTPUT_PATH, directory)
+            _owned(reservation)
         else:
             current = os.stat(marker, dir_fd=directory, follow_symlinks=False)
             if (current.st_dev, current.st_ino) == (device, inode):
@@ -885,6 +919,7 @@ def _publish(
     if capability is not _EXECUTION_CAPABILITY and capability is not _TEST_EXECUTION_CAPABILITY:
         raise RuntimeError("CPR publication capability is invalid")
     directory, name, _marker, _marker_fd, _device, _inode = reservation
+    _require_live_parent(OUTPUT_PATH, directory)
     _owned(reservation)
     validate_report(report, x, y, config=config, seeds=seeds, reexecute=True)
     encoded = _canonical(report) + b"\n"
@@ -926,6 +961,7 @@ def _publish(
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
             raise ValueError("CPR staged report is not strict bounded JSON") from error
         validate_report(staged_report, x, y, config=config, seeds=seeds, reexecute=False)
+        _require_live_parent(OUTPUT_PATH, directory)
         _owned(reservation)
         published_identity = (staged.st_dev, staged.st_ino)
         _link_tmpfile(descriptor, directory, name)
@@ -941,6 +977,7 @@ def _publish(
             if (
                 not stat.S_ISREG(before.st_mode)
                 or before.st_nlink != 1
+                or (before.st_dev, before.st_ino) != published_identity
                 or raw != encoded
                 or (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
                 != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
@@ -954,6 +991,15 @@ def _publish(
             validate_report(reread, x, y, config=config, seeds=seeds, reexecute=False)
         finally:
             os.close(read_fd)
+        os.fsync(directory)
+        _require_live_parent(OUTPUT_PATH, directory)
+        visible = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(visible.st_mode)
+            or visible.st_nlink != 1
+            or (visible.st_dev, visible.st_ino) != published_identity
+        ):
+            raise RuntimeError("CPR published output name changed after synchronization")
     except BaseException:
         if published_identity is not None:
             try:

@@ -107,6 +107,30 @@ def test_public_transaction_is_closed_before_reservation_or_consumer(
     assert calls == 0
 
 
+def test_campaign_reexecution_is_closed_before_validation_or_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("campaign work preceded reexecution authorization")
+
+    monkeypatch.setattr(lane, "_bounded_json", forbidden)
+    monkeypatch.setattr(lane, "run_screening_config", forbidden)
+    with pytest.raises(RuntimeError, match="reexecution is not authorized"):
+        lane.validate_report(
+            {},
+            object(),
+            object(),
+            config=lane.CAMPAIGN_CONFIG,
+            seeds=lane.CAMPAIGN_SEEDS,
+            reexecute=True,
+        )
+    assert calls == 0
+
+
 def test_private_runner_covers_complete_roster_and_strict_reexecution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -349,3 +373,99 @@ def test_transaction_strictly_publishes_and_removes_reservation(
     )
     assert json.loads(destination.read_bytes()) == report
     assert not destination.with_name(f".{destination.name}.reservation").exists()
+
+
+def test_transaction_handles_short_marker_and_output_writes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    destination = tmp_path / "report.json"
+    original_write = lane.os.write
+
+    def short_write(descriptor: int, value: object) -> int:
+        view = memoryview(cast(Any, value))
+        return original_write(descriptor, view[: max(1, min(3, len(view)))])
+
+    monkeypatch.setattr(lane, "OUTPUT_PATH", destination)
+    monkeypatch.setattr(lane, "load_mnist_train", lambda _home: _data())
+    monkeypatch.setattr(lane, "run_screening_config", _fake_run)
+    monkeypatch.setattr(lane.os, "write", short_write)
+    report = lane._run_and_publish(
+        tmp_path,
+        destination,
+        SMALL,
+        lane.TEST_ONLY_SEEDS,
+        lane._TEST_EXECUTION_CAPABILITY,
+    )
+    assert json.loads(destination.read_bytes()) == report
+    assert not destination.with_name(f".{destination.name}.reservation").exists()
+
+
+def test_publication_rejects_replaced_visible_parent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    parent = tmp_path / "visible"
+    parent.mkdir()
+    destination = parent / "report.json"
+    monkeypatch.setattr(lane, "OUTPUT_PATH", destination)
+    monkeypatch.setattr(lane, "run_screening_config", _fake_run)
+    report = _run_for_test(monkeypatch)
+    reservation = lane._reserve(destination)
+    moved = tmp_path / "moved"
+    parent.rename(moved)
+    parent.mkdir()
+    try:
+        with pytest.raises(RuntimeError, match="output parent changed"):
+            lane._publish(
+                reservation,
+                report,
+                *_data(),
+                SMALL,
+                lane.TEST_ONLY_SEEDS,
+                lane._TEST_EXECUTION_CAPABILITY,
+            )
+        assert not destination.exists()
+    finally:
+        lane._finish_reservation(reservation, consumed=False)
+
+
+def test_publication_rejects_same_byte_foreign_link_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    destination = tmp_path / "report.json"
+    monkeypatch.setattr(lane, "OUTPUT_PATH", destination)
+    monkeypatch.setattr(lane, "run_screening_config", _fake_run)
+    report = _run_for_test(monkeypatch)
+    encoded = lane._canonical(report) + b"\n"
+    reservation = lane._reserve(destination)
+    original_open = lane.os.open
+    replaced = False
+
+    def replace_before_read(
+        path: object,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal replaced
+        if path == destination.name and not replaced:
+            replaced = True
+            destination.unlink()
+            destination.write_bytes(encoded)
+            destination.chmod(0o400)
+        return original_open(cast(Any, path), flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(lane.os, "open", replace_before_read)
+    try:
+        with pytest.raises(ValueError, match="changed during bounded reread"):
+            lane._publish(
+                reservation,
+                report,
+                *_data(),
+                SMALL,
+                lane.TEST_ONLY_SEEDS,
+                lane._TEST_EXECUTION_CAPABILITY,
+            )
+        assert destination.read_bytes() == encoded
+    finally:
+        lane._finish_reservation(reservation, consumed=False)
