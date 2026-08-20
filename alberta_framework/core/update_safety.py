@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import operator
-from typing import SupportsIndex, cast
+from typing import Any, SupportsIndex, cast
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
 from jaxtyping import Bool, Int
+
+from alberta_framework._bounded_containers import require_bounded_container_tree
 
 _ACTUAL_INT_TYPES = frozenset(
     {
@@ -27,6 +29,8 @@ _ACTUAL_INT_TYPES = frozenset(
     }
 )
 _INT32_MAX = int(np.iinfo(np.int32).max)
+# Origin ``jax.tree.leaves`` still returns at depth 8000 and SystemErrors at 10_000.
+_MAX_PYTREE_NESTING_DEPTH = 4096
 
 
 def _require_exact_bool(name: str, value: object) -> bool:
@@ -121,11 +125,46 @@ def checked_integer_action_array(
     return safe, valid
 
 
+def _pytree_container_children(node: object) -> tuple[object, ...] | None:
+    node_type = type(node)
+    if node_type is dict:
+        return tuple(cast(dict[Any, Any], node).values())
+    if node_type is list:
+        return tuple(cast(list[Any], node))
+    if node_type is tuple:
+        return cast(tuple[object, ...], node)
+    if isinstance(node, tuple) and getattr(node_type, "_fields", None) is not None:
+        return tuple(node)
+    return None
+
+
+def _require_pytree_nesting(tree: object, *, name: str = "tree") -> None:
+    """Reject cycles and nesting that SystemError ``jax.tree.leaves``."""
+    require_bounded_container_tree(
+        tree,
+        children=_pytree_container_children,
+        max_depth=_MAX_PYTREE_NESTING_DEPTH,
+        max_nodes=None,
+        name=name,
+        kind="pytree",
+    )
+
+
+def _tree_leaves(tree: object) -> list[Any]:
+    _require_pytree_nesting(tree, name="tree")
+    try:
+        return jax.tree.leaves(tree)
+    except RecursionError as exc:
+        raise ValueError("tree exceeds the maximum pytree nesting depth") from exc
+    except SystemError as exc:
+        raise ValueError("tree exceeds the maximum pytree nesting depth") from exc
+
+
 def floating_tree_is_finite(tree: object) -> Bool[Array, ""]:
     """Return whether every floating or complex leaf in ``tree`` is finite."""
 
     valid = jnp.asarray(True, dtype=jnp.bool_)
-    for leaf in jax.tree.leaves(tree):
+    for leaf in _tree_leaves(tree):
         array = jnp.asarray(leaf)
         if jnp.issubdtype(array.dtype, jnp.inexact):
             valid = valid & jnp.all(jnp.isfinite(array))

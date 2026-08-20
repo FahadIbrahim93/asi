@@ -34,7 +34,7 @@ assert meta["epoch"] == 1
 """
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -42,6 +42,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
+
+from alberta_framework._bounded_containers import require_bounded_container_tree
 
 # Stamped into checkpoint metadata on save, but deliberately NOT validated on
 # load: compatibility is enforced structurally instead, by restoring into the
@@ -53,6 +55,10 @@ _FORMAT_VERSION = 2
 # Internal metadata key — stripped from user-facing metadata
 _VERSION_KEY = "_format_version"
 _EMPTY_ARRAYS_KEY = "_empty_array_leaves"
+# Same ceiling as security._JSON_MAX_DEPTH. Origin json.dumps RecursionErrors
+# on a 10_000-deep metadata nest and cannot reject it as ValueError.
+_JSON_MAX_DEPTH = 32
+_JSON_MAX_NODES = 4096
 
 
 def _is_empty_array(value: object) -> bool:
@@ -148,10 +154,33 @@ def _require_path(value: object, *, name: str = "checkpoint path") -> Path:
     raise ValueError(f"{name} must be an exact str or Path")
 
 
+def _json_children(value: object) -> Iterable[object] | None:
+    if type(value) is list:
+        return cast(list[object], value)
+    if type(value) is dict:
+        return cast(dict[object, object], value).values()
+    return None
+
+
 def _require_json_safe_metadata(metadata: dict[str, Any]) -> None:
     """Reject metadata that cannot round-trip as finite JSON."""
     try:
+        require_bounded_container_tree(
+            metadata,
+            children=_json_children,
+            max_depth=_JSON_MAX_DEPTH,
+            max_nodes=_JSON_MAX_NODES,
+            name="checkpoint metadata",
+            kind="JSON",
+        )
+    except ValueError as exc:
+        if "maximum JSON nesting depth" not in str(exc):
+            raise
+        raise ValueError("checkpoint metadata exceeds the JSON nesting limit") from exc
+    try:
         json.dumps(metadata, allow_nan=False)
+    except RecursionError as exc:
+        raise ValueError("checkpoint metadata exceeds the JSON nesting limit") from exc
     except (TypeError, ValueError) as exc:
         raise ValueError("checkpoint metadata must be JSON-safe and finite") from exc
 
