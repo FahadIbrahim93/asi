@@ -208,6 +208,36 @@ def test_report_rejects_missing_shard_arithmetic_and_promotion(
         lane.validate_report(promoting, require_current_source=True)
 
 
+def test_report_publication_is_no_replace_and_rejects_symlink_parent(
+    tmp_path: Path,
+    complete_records: tuple[list[dict[str, object]], list[dict[str, object]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lane, "_current_source", lambda: {"git_commit": "c" * 40})
+    monkeypatch.setattr(lane, "_current_runtime", lambda: {"backend": "cpu"})
+    report = lane.build_report(
+        *complete_records,
+        dataset_file_sha256=lane.DATASET_FILE_SHA256,
+        dataset_semantic_sha256=lane.DATASET_SEMANTIC_SHA256,
+        execution_source_commit="c" * 40,
+    )
+    destination = tmp_path / "new" / "report.json"
+    monkeypatch.setattr(lane, "OUTPUT_PATH", destination)
+    assert lane.publish_report(destination, report) == destination
+    with pytest.raises(FileExistsError):
+        lane.publish_report(destination, report)
+
+    target = tmp_path / "target"
+    target.mkdir()
+    linked = tmp_path / "linked"
+    linked.symlink_to(target, target_is_directory=True)
+    linked_destination = linked / "report.json"
+    monkeypatch.setattr(lane, "OUTPUT_PATH", linked_destination)
+    with pytest.raises(OSError):
+        lane.publish_report(linked_destination, report)
+    assert not (target / "report.json").exists()
+
+
 @pytest.mark.parametrize(
     ("horizon", "phase_length"),
     [(0, 1), (10_001, 1), (8, 0), (8, 9), (True, 1)],
