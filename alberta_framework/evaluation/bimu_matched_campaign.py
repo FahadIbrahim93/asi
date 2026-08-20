@@ -18,7 +18,7 @@ import os
 import secrets
 import stat
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path, PosixPath
 from typing import Any, Final, NoReturn, cast
 
@@ -92,9 +92,11 @@ _POLICY: Final = {
     "paper_comparable": False,
     "completed_outcomes_retained": True,
     "ordinary_exception_failure_receipts_enabled": True,
-    "failed_attempt_reservation_retained": False,
+    "post_dispatch_consumed_without_result_tombstone": True,
+    "pre_dispatch_reservation_released_on_failure": True,
     "failure_receipt_publication_guaranteed": False,
-    "base_exception_failure_retention_guaranteed": False,
+    "post_dispatch_base_exception_tombstone_retained": True,
+    "process_death_tombstone_retention_guaranteed": False,
     "seed_status": "frozen_exposed_consumed_for_promotion",
 }
 _TIMING_POLICY: Final = {
@@ -465,6 +467,7 @@ def run_bimu_shard(
     data_home: Path | None = None,
     plan_document: object | None = None,
     _loaded_arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None,
+    _on_first_dispatch: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     """Execute exactly one authorized arm/seed shard in this process."""
 
@@ -492,6 +495,8 @@ def run_bimu_shard(
         arrays = _validated_arrays(*_loaded_arrays, plan=FROZEN_BIMU_MATCHED_PLAN)
     started_wall = time.perf_counter()
     started_cpu = time.process_time()
+    if _on_first_dispatch is not None:
+        _on_first_dispatch()
     result = run_bimu_development(*arrays, config=config, seed=seed)
     wall_seconds = time.perf_counter() - started_wall
     cpu_seconds = time.process_time() - started_cpu
@@ -1261,6 +1266,41 @@ def _release_shard_reservation(reservation: ShardReservation) -> None:
         os.close(parent_descriptor)
 
 
+def _retain_consumed_without_result(reservation: ShardReservation) -> None:
+    """Turn the owned visible reservation into a durable no-retry tombstone."""
+
+    destination, parent_descriptor, reservation_descriptor, reservation_name = reservation
+    del destination
+    marker = b"asi-bimu-matched-campaign-consumed-without-result-v1\n"
+    try:
+        _require_live_parent(reservation[0], parent_descriptor)
+        owned = os.fstat(reservation_descriptor)
+        visible = os.stat(
+            reservation_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(owned.st_mode)
+            or owned.st_nlink != 1
+            or (owned.st_dev, owned.st_ino) != (visible.st_dev, visible.st_ino)
+        ):
+            raise RuntimeError("campaign reservation is not the owned visible inode")
+        os.ftruncate(reservation_descriptor, 0)
+        os.lseek(reservation_descriptor, 0, os.SEEK_SET)
+        written = 0
+        while written < len(marker):
+            count = os.write(reservation_descriptor, marker[written:])
+            if count <= 0:
+                raise OSError("campaign tombstone write made no progress")
+            written += count
+        os.fsync(reservation_descriptor)
+        os.fsync(parent_descriptor)
+    finally:
+        os.close(reservation_descriptor)
+        os.close(parent_descriptor)
+
+
 def publish_json(
     path: Path,
     value: object,
@@ -1549,6 +1589,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 2
         destination = campaign_path(root, "shard", arm=args.arm, seed=args.seed)
         reservation = _reserve_shard_destination(destination, root=root)
+        reservation_to_cleanup: ShardReservation | None = reservation
+        first_dispatch = False
+        durable_result_published = False
+
+        def mark_first_dispatch() -> None:
+            nonlocal first_dispatch
+            first_dispatch = True
+
         try:
             failed_attempt = False
             try:
@@ -1559,6 +1607,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     args.seed,
                     plan_document=plan,
                     _loaded_arrays=arrays,
+                    _on_first_dispatch=mark_first_dispatch,
                 )
             except Exception:
                 failed_attempt = True
@@ -1571,11 +1620,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                         _reservation=reservation,
                         _completed_replay_arrays=arrays,
                     )
+                    durable_result_published = True
                 except _CompletedShardAdmissionError:
                     failed_attempt = True
             if failed_attempt:
                 failed = build_failed_bimu_shard(args.arm, args.seed)
                 publish_json(destination, failed, root=root, _reservation=reservation)
+                durable_result_published = True
                 _print_json(
                     {
                         "status": "failed",
@@ -1585,8 +1636,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                     }
                 )
                 return 1
+        except BaseException:
+            if first_dispatch and not durable_result_published:
+                reservation_to_cleanup = None
+                _retain_consumed_without_result(reservation)
+            raise
         finally:
-            _release_shard_reservation(reservation)
+            if reservation_to_cleanup is not None:
+                _release_shard_reservation(reservation_to_cleanup)
         _print_json({"status": "complete", "shard": str(destination)})
         return 0
     if args.command == "summarize":

@@ -625,6 +625,7 @@ def test_cli_does_not_misreport_publication_failure_as_execution_receipt(
     destination = campaign.campaign_path(
         tmp_path, "shard", arm="memory_off", seed=157001
     )
+
     def fail_publication(*args: object) -> None:
         raise OSError("simulated publication failure")
 
@@ -642,7 +643,71 @@ def test_cli_does_not_misreport_publication_failure_as_execution_receipt(
             ]
         )
     assert not destination.exists()
-    assert not destination.with_name(f".{destination.name}.reservation").exists()
+    reservation = destination.with_name(f".{destination.name}.reservation")
+    assert reservation.read_bytes() == (
+        b"asi-bimu-matched-campaign-consumed-without-result-v1\n"
+    )
+    with pytest.raises(ValueError, match="unexpected entry"):
+        campaign.main(
+            [
+                "run-shard",
+                "--root",
+                str(tmp_path),
+                "--arm",
+                "memory_off",
+                "--seed",
+                "157001",
+            ]
+        )
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+@pytest.mark.parametrize("raised", [RuntimeError("late failure"), KeyboardInterrupt()])
+def test_cli_retains_tombstone_when_post_dispatch_failure_cannot_publish_receipt(
+    tmp_path: Path,
+    tiny_campaign: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    raised: BaseException,
+) -> None:
+    campaign.publish_json(
+        campaign.campaign_path(tmp_path, "plan"),
+        campaign.build_plan_document(),
+        root=tmp_path,
+    )
+    destination = campaign.campaign_path(
+        tmp_path, "shard", arm="memory_off", seed=157001
+    )
+
+    def fail_after_dispatch(*args: object, **kwargs: object) -> None:
+        raise raised
+
+    monkeypatch.setattr(campaign, "run_bimu_development", fail_after_dispatch)
+    if isinstance(raised, Exception):
+        monkeypatch.setattr(
+            campaign,
+            "_link_unnamed_file",
+            lambda *args: (_ for _ in ()).throw(OSError("receipt publication failure")),
+        )
+        expected: type[BaseException] = OSError
+    else:
+        expected = KeyboardInterrupt
+    with pytest.raises(expected):
+        campaign.main(
+            [
+                "run-shard",
+                "--root",
+                str(tmp_path),
+                "--arm",
+                "memory_off",
+                "--seed",
+                "157001",
+            ]
+        )
+    assert not destination.exists()
+    reservation = destination.with_name(f".{destination.name}.reservation")
+    assert reservation.read_bytes() == (
+        b"asi-bimu-matched-campaign-consumed-without-result-v1\n"
+    )
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")

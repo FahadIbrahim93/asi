@@ -79,7 +79,10 @@ publisher does not accept caller-asserted replay evidence. A successfully
 published receipt returns nonzero and retains no exception type, message, or
 representation,
 cannot enter aggregation, and forbids retry in this namespace. `BaseException`,
-process death, completed-result publication failures, and failure to build or
-publish the failure receipt remain outside this retention boundary. Source,
+completed-result publication failures, and failure to build or publish the
+failure receipt after the first learner dispatch retain the inode-owned
+reservation as a durable `consumed-without-result` tombstone, so the roster
+cannot be retried in this namespace. Pre-dispatch failures release the
+reservation. Process death remains outside this retention boundary. Source,
 runtime, dependency, process, dataset, resource, and telemetry digests are
 consistency bindings, not authenticated execution attestation.
