@@ -502,6 +502,7 @@ def test_public_builder_and_cli_fail_before_dataset_or_arm_execution(
     cheap_plan: dict[str, object],
     data: tuple[np.ndarray, np.ndarray],
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     calls = {"dataset": 0, "arm": 0}
 
@@ -515,6 +516,31 @@ def test_public_builder_and_cli_fail_before_dataset_or_arm_execution(
 
     monkeypatch.setattr(campaign, "load_mnist_train", forbidden_dataset)
     monkeypatch.setattr(campaign, "run_activation_feature_arm", forbidden_arm)
+    plan_output = tmp_path / "plan.json"
+    with pytest.raises(RuntimeError, match="not authorized"):
+        campaign.main(
+            [
+                "plan",
+                "--stage",
+                "cheap_screen",
+                "--output",
+                str(plan_output),
+            ]
+        )
+    assert not plan_output.exists()
+    aggregate_output = tmp_path / "aggregate.json"
+    with pytest.raises(RuntimeError, match="not authorized"):
+        campaign.main(
+            [
+                "summarize",
+                "--stage",
+                "cheap_screen",
+                "--output",
+                str(aggregate_output),
+                str(tmp_path / "missing-shard.json"),
+            ]
+        )
+    assert not aggregate_output.exists()
     with pytest.raises(RuntimeError, match="not authorized"):
         campaign.build_shard(
             cheap_plan,
