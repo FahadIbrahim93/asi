@@ -34,7 +34,7 @@ assert meta["epoch"] == 1
 """
 
 import json
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -42,6 +42,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
+
+from alberta_framework._bounded_containers import require_bounded_container_tree
 
 # Stamped into checkpoint metadata on save, but deliberately NOT validated on
 # load: compatibility is enforced structurally instead, by restoring into the
@@ -152,37 +154,28 @@ def _require_path(value: object, *, name: str = "checkpoint path") -> Path:
     raise ValueError(f"{name} must be an exact str or Path")
 
 
-def _require_json_nest(
-    value: object, *, name: str, depth: int, budget: list[int]
-) -> None:
-    """Reject unbounded metadata nests before ``json.dumps`` RecursionError."""
-    budget[0] -= 1
-    if budget[0] < 0:
-        raise ValueError(f"{name} exceeds the JSON value resource limit")
-    if depth > _JSON_MAX_DEPTH:
-        raise ValueError(f"{name} exceeds the JSON nesting limit")
-    value_type = type(value)
-    if value is None or value_type is bool or value_type is int or value_type is str:
-        return
-    if value_type is float:
-        return
-    if value_type is list:
-        for item in cast(list[object], value):
-            _require_json_nest(item, name=name, depth=depth + 1, budget=budget)
-        return
-    if value_type is dict:
-        for item in cast(dict[object, object], value).values():
-            _require_json_nest(item, name=name, depth=depth + 1, budget=budget)
-        return
+def _json_children(value: object) -> Iterable[object] | None:
+    if type(value) is list:
+        return cast(list[object], value)
+    if type(value) is dict:
+        return cast(dict[object, object], value).values()
+    return None
 
 
 def _require_json_safe_metadata(metadata: dict[str, Any]) -> None:
     """Reject metadata that cannot round-trip as finite JSON."""
     try:
-        _require_json_nest(
-            metadata, name="checkpoint metadata", depth=0, budget=[_JSON_MAX_NODES]
+        require_bounded_container_tree(
+            metadata,
+            children=_json_children,
+            max_depth=_JSON_MAX_DEPTH,
+            max_nodes=_JSON_MAX_NODES,
+            name="checkpoint metadata",
+            kind="JSON",
         )
-    except RecursionError as exc:
+    except ValueError as exc:
+        if "maximum JSON nesting depth" not in str(exc):
+            raise
         raise ValueError("checkpoint metadata exceeds the JSON nesting limit") from exc
     try:
         json.dumps(metadata, allow_nan=False)

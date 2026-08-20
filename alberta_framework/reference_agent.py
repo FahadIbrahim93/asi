@@ -21,6 +21,8 @@ from typing import Any
 
 import numpy as np
 
+from alberta_framework._bounded_containers import require_json_text_nesting
+
 
 def _require_exact_str(name: object, value: object) -> str:
     if type(name) is not str:
@@ -91,29 +93,18 @@ def _require_json_text_nesting(raw: str, *, name: str) -> None:
     encoded_len = len(raw.encode("utf-8"))
     if encoded_len > _MAX_CONFIG_BYTES:
         raise ValueError(f"{name} exceeds {_MAX_CONFIG_BYTES} bytes")
-    depth = 0
-    in_string = False
-    escape = False
-    for character in raw:
-        if in_string:
-            if escape:
-                escape = False
-            elif character == "\\":
-                escape = True
-            elif character == '"':
-                in_string = False
-            continue
-        if character == '"':
-            in_string = True
-            continue
-        if character in "{[":
-            depth += 1
-            if depth > _MAX_JSON_NESTING_DEPTH:
-                raise ValueError(
-                    f"{name} exceeds the maximum canonical JSON nesting depth"
-                )
-        elif character in "}]":
-            depth -= 1
+    try:
+        require_json_text_nesting(
+            raw,
+            max_depth=_MAX_JSON_NESTING_DEPTH,
+            name=name,
+        )
+    except ValueError as exc:
+        if "nesting limit" not in str(exc):
+            raise
+        raise ValueError(
+            f"{name} exceeds the maximum canonical JSON nesting depth"
+        ) from exc
 
 
 def _load_manifest_config_json(raw: str) -> Any:

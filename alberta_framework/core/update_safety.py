@@ -11,6 +11,8 @@ import numpy as np
 from jax import Array
 from jaxtyping import Bool, Int
 
+from alberta_framework._bounded_containers import require_bounded_container_tree
+
 _ACTUAL_INT_TYPES = frozenset(
     {
         int,
@@ -138,34 +140,14 @@ def _pytree_container_children(node: object) -> tuple[object, ...] | None:
 
 def _require_pytree_nesting(tree: object, *, name: str = "tree") -> None:
     """Reject cycles and nesting that SystemError ``jax.tree.leaves``."""
-    children = _pytree_container_children(tree)
-    if children is None:
-        return
-    frames: list[tuple[object, tuple[object, ...], int, int]] = [
-        (tree, children, 1, 0)
-    ]
-    ancestors = {id(tree)}
-    while frames:
-        node, kids, depth, index = frames[-1]
-        if depth > _MAX_PYTREE_NESTING_DEPTH:
-            raise ValueError(f"{name} exceeds the maximum pytree nesting depth")
-        if index >= len(kids):
-            frames.pop()
-            ancestors.discard(id(node))
-            continue
-        child = kids[index]
-        frames[-1] = (node, kids, depth, index + 1)
-        child_kids = _pytree_container_children(child)
-        if child_kids is None:
-            continue
-        child_id = id(child)
-        if child_id in ancestors:
-            raise ValueError(f"{name} contains a cyclic pytree")
-        child_depth = depth + 1
-        if child_depth > _MAX_PYTREE_NESTING_DEPTH:
-            raise ValueError(f"{name} exceeds the maximum pytree nesting depth")
-        ancestors.add(child_id)
-        frames.append((child, child_kids, child_depth, 0))
+    require_bounded_container_tree(
+        tree,
+        children=_pytree_container_children,
+        max_depth=_MAX_PYTREE_NESTING_DEPTH,
+        max_nodes=None,
+        name=name,
+        kind="pytree",
+    )
 
 
 def _tree_leaves(tree: object) -> list[Any]:

@@ -32,6 +32,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from alberta_framework._bounded_containers import require_json_text_nesting
 from alberta_framework.core.checkpoints import load_checkpoint_metadata
 from alberta_framework.core.prototype_agent import (
     PROTOTYPE_CHECKPOINT_SCHEMA,
@@ -209,26 +210,7 @@ def _require_json_text_depth(raw: bytes, *, name: str) -> None:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError(f"{name} is not canonical JSON") from exc
-    depth = 0
-    in_string = False
-    escaped = False
-    for character in text:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif character == "\\":
-                escaped = True
-            elif character == '"':
-                in_string = False
-            continue
-        if character == '"':
-            in_string = True
-        elif character in "[{":
-            depth += 1
-            if depth > _MAX_TREE_DEPTH:
-                raise ValueError(f"{name} exceeds the JSON nesting limit")
-        elif character in "]}":
-            depth -= 1
+    require_json_text_nesting(text, max_depth=_MAX_TREE_DEPTH, name=name)
 
 
 def _load_canonical_json(path: Path) -> dict[str, Any]:
