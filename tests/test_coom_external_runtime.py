@@ -230,6 +230,44 @@ def test_coom_retained_receipt_loader_is_bounded_and_fail_closed(tmp_path: Path)
     with pytest.raises(ValueError, match="regular file"):
         smoke._load_receipt(receipt)
 
+
+def test_retained_receipt_loader_rejects_path_subclass_before_hooks(tmp_path: Path) -> None:
+    smoke = _smoke_module()
+
+    class HostilePath(type(Path())):
+        calls = 0
+
+        def __fspath__(self) -> str:
+            type(self).calls += 1
+            raise AssertionError("hostile path hook ran")
+
+    hostile = HostilePath(tmp_path / "receipt.json")
+    HostilePath.calls = 0
+    with pytest.raises(ValueError, match="exact concrete Path"):
+        smoke._load_receipt(hostile)
+    assert HostilePath.calls == 0
+
+
+def test_retained_receipt_loader_rejects_symlink_swap_at_open_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    smoke = _smoke_module()
+    receipt = tmp_path / "receipt.json"
+    target = tmp_path / "target.json"
+    receipt.write_text("{}", encoding="utf-8")
+    target.write_text('{"redirected":true}', encoding="utf-8")
+    real_open = smoke.os.open
+
+    def swap_then_open(path: str, flags: int) -> int:
+        receipt.unlink()
+        receipt.symlink_to(target)
+        return real_open(path, flags)
+
+    monkeypatch.setattr(smoke.os, "open", swap_then_open)
+    with pytest.raises(ValueError, match="opened safely"):
+        smoke._load_receipt(receipt)
+
+
 def test_exact_key_admission_rejects_hostile_key_without_dispatch() -> None:
     smoke = _smoke_module()
     hostile_key = _HookStr("schema")

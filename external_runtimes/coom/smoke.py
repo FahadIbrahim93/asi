@@ -50,6 +50,16 @@ _MAX_MANIFEST_BYTES = 8192
 _MAX_RECEIPT_BYTES = 1024 * 1024
 
 
+def _stat_fingerprint(value: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
 def _array_sha256(value: np.ndarray) -> str:
     if type(value) is not np.ndarray:
         raise ValueError("observation must be an exact NumPy array before hashing")
@@ -244,14 +254,51 @@ def _load_qualification_manifest() -> dict[str, object]:
 
 def _load_receipt(path: Path) -> dict[str, object]:
     """Load one bounded canonical receipt for strict offline validation."""
-    metadata = path.lstat()
-    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+    if type(path) is not type(Path()):
+        raise ValueError("receipt path must be an exact concrete Path")
+    raw_path = os.fspath(path)
+    before = os.lstat(raw_path)
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
         raise ValueError("receipt must be a uniquely linked regular file")
-    if metadata.st_size > _MAX_RECEIPT_BYTES:
+    if before.st_size > _MAX_RECEIPT_BYTES:
         raise ValueError("receipt exceeds its byte limit")
-    raw = path.read_bytes()
-    if len(raw) != metadata.st_size:
-        raise ValueError("receipt changed while it was being read")
+
+    try:
+        descriptor = os.open(
+            raw_path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+    except OSError as error:
+        raise ValueError("receipt could not be opened safely") from error
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or _stat_fingerprint(opened) != _stat_fingerprint(before)
+        ):
+            raise ValueError("receipt changed before its descriptor was admitted")
+        chunks: list[bytes] = []
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                raise ValueError("receipt changed while it was being read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ValueError("receipt exceeds its admitted byte length")
+        after = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(after.st_mode)
+            or after.st_nlink != 1
+            or _stat_fingerprint(after) != _stat_fingerprint(opened)
+        ):
+            raise ValueError("receipt changed while it was being read")
+        raw = b"".join(chunks)
+    finally:
+        os.close(descriptor)
 
     def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
         result: dict[str, object] = {}
