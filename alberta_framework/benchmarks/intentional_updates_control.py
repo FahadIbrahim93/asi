@@ -202,9 +202,7 @@ def frozen_plan() -> dict[str, object]:
             "RNG operations, optimizer solves, persistent bytes, and timing per shard"
         ),
         "output_path": "outputs/intentional_updates_matched_development/report.v1.json",
-        # These are historical properties of the plan at freeze time.  A later,
-        # independently reviewed code-only authorization must not mutate the plan
-        # that was reviewed before any retained execution.
+        # Runtime authorization is separate from this immutable plan identity.
         "execution_authorized": False,
         "reviewed_execution_transition": False,
         "execution_status": "blocked_pending_independent_plan_audit",

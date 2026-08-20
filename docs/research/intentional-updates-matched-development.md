@@ -26,8 +26,8 @@ root/index schedule: learned policies can choose different actions and therefore
 realized trajectories. Those policy-dependent trajectories are deliberately not described as a
 matched axis.
 
-The earlier draft roster was consumed by contract tests and is explicitly quarantined. Contract
-tests use a distinct test-only capability and roster. Execution and public publication are
+Seeds `31561001..31561004` are quarantined because contract tests consumed them. Contract tests
+use a distinct test-only capability and roster. Execution and public publication are
 deliberately disabled in the initial merge; both a literal reviewed-transition flag and a separate
 runtime authorization flag must become exact `true` before reservation, dataset loading, or a
 consumer call. Inspecting the catalog is read-only:
