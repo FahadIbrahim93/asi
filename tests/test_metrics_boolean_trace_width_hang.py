@@ -95,6 +95,29 @@ def test_dense_numeric_broadcast_view_rejects_before_materialization(
         compute_running_mean(view, window_size=2)
 
 
+def test_nested_dense_view_rejects_before_coercion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(metrics, "_NUMERIC_TRACE_MAX_VALUES", 8)
+    view = np.broadcast_to(np.asarray(1.0, dtype=np.float64), (9,))
+
+    def fail_asarray(*args: object, **kwargs: object) -> object:
+        raise AssertionError("coercion ran before the nested dense-value gate")
+
+    monkeypatch.setattr(metrics.np, "asarray", fail_asarray)
+    with pytest.raises(ValueError, match="dense numeric value limit"):
+        metrics._numeric_array([view], name="values")
+
+
+def test_shared_dense_views_use_one_aggregate_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(metrics, "_NUMERIC_TRACE_MAX_VALUES", 8)
+    view = np.broadcast_to(np.asarray(1.0, dtype=np.float64), (5,))
+    with pytest.raises(ValueError, match="dense numeric value limit"):
+        metrics._reject_boolean_numeric_trace([view, view], name="values")
+
+
 def test_numeric_trace_rejects_hostile_metaclass_without_hash_or_equality() -> None:
     class HostileMeta(type):
         calls = 0

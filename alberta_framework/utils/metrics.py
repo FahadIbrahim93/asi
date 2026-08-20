@@ -114,9 +114,12 @@ def _reject_boolean_numeric_trace(
     name: str,
     depth: int = 0,
     _remaining_nodes: list[int] | None = None,
+    _remaining_dense_values: list[int] | None = None,
 ) -> None:
     if _remaining_nodes is None:
         _remaining_nodes = [_BOOLEAN_TRACE_MAX_NODES]
+    if _remaining_dense_values is None:
+        _remaining_dense_values = [_NUMERIC_TRACE_MAX_VALUES]
     _remaining_nodes[0] -= 1
     if _remaining_nodes[0] < 0:
         raise ValueError(f"{name} exceeds the boolean-trace value limit")
@@ -137,6 +140,7 @@ def _reject_boolean_numeric_trace(
                 name=f"{name}[{index}]",
                 depth=depth + 1,
                 _remaining_nodes=_remaining_nodes,
+                _remaining_dense_values=_remaining_dense_values,
             )
         return
     if actual_type is np.ndarray:
@@ -152,17 +156,20 @@ def _reject_boolean_numeric_trace(
                     name=f"{name}[{index}]",
                     depth=depth + 1,
                     _remaining_nodes=_remaining_nodes,
+                    _remaining_dense_values=_remaining_dense_values,
                 )
         elif array.dtype.kind not in "iuf":
             raise ValueError(f"{name} must contain real numeric values")
+        else:
+            if array.size > _remaining_dense_values[0]:
+                raise ValueError(f"{name} exceeds the dense numeric value limit")
+            _remaining_dense_values[0] -= int(array.size)
         return
     raise ValueError(f"{name} must contain exact real numeric values")
 
 
 def _numeric_array(values: object, *, name: str) -> NDArray[np.float64]:
     _reject_boolean_numeric_trace(values, name=name)
-    if type(values) is np.ndarray and values.size > _NUMERIC_TRACE_MAX_VALUES:
-        raise ValueError(f"{name} exceeds the dense numeric value limit")
     try:
         return np.asarray(values, dtype=np.float64)
     except (OverflowError, TypeError, ValueError) as exc:
