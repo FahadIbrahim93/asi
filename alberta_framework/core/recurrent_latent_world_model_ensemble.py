@@ -526,10 +526,20 @@ class RecurrentLatentStartCache:
 
 @chex.dataclass(frozen=True)
 class RecurrentLatentDecisionCache:
-    """Exact predict-before-update decision record consumed by ``update``."""
+    """Exact predict-before-update decision record consumed by ``update``.
+
+    ``owner_event_count``/``owner_hidden_states`` bind this cache to a
+    state's identity, but neither changes if ``member_parameters`` is
+    replaced out of band (e.g. an ensemble-member substitution) without
+    also advancing ``event_count`` or ``member_hidden_states``. Binding
+    ``owner_parameters`` too closes that gap: ``update`` re-checks it
+    against the state's live ``member_parameters`` via ``_tree_equal``,
+    the same exact-equality idiom already used for ``prediction``.
+    """
 
     owner_event_count: Int[Array, ""]
     owner_hidden_states: Float[Array, "ensemble_size latent_dim"]
+    owner_parameters: tuple[RecurrentLatentMemberParameters, ...]
     observation: Float[Array, " observation_dim"]
     action: Int[Array, ""]
     prediction: RecurrentLatentWorldModelPrediction
@@ -732,7 +742,11 @@ class RecurrentLatentWorldModelResourceBudget:
         start_f32 = ensemble * latent + observation
         start_scalars = start_f32 + 2
         start_bytes = 4 * (start_f32 + 1) + 1
-        decision_f32 = start_f32 + prediction_f32
+        # + ensemble * trainable: the owner_parameters ownership fingerprint,
+        # one full RecurrentLatentMemberParameters copy per ensemble member
+        # (same per-member float32 footprint already charged for
+        # member_parameters in persistent_f32 above).
+        decision_f32 = start_f32 + prediction_f32 + ensemble * trainable
         decision_i32 = 2
         decision_bool = prediction_bool + 1
         decision_scalars = decision_f32 + decision_i32 + decision_bool
@@ -1044,6 +1058,11 @@ class RecurrentLatentWorldModelEnsemble:
             owner_hidden_states=jnp.zeros(
                 (self._config.ensemble_size, self._config.latent_dim), dtype=jnp.float32
             ),
+            # Structurally-correct placeholder parameters -- values are
+            # irrelevant since valid=False gates every consumer, but the
+            # pytree shape/dtype must match a real member_parameters tuple
+            # for jax.lax.cond's branch-structure requirement.
+            owner_parameters=self._initial_state(jr.key(0)).member_parameters,
             observation=jnp.zeros((self._config.observation_dim,), dtype=jnp.float32),
             action=jnp.asarray(0, dtype=jnp.int32),
             prediction=self._zero_prediction(),
@@ -1208,6 +1227,7 @@ class RecurrentLatentWorldModelEnsemble:
             return RecurrentLatentDecisionCache(
                 owner_event_count=state.event_count,
                 owner_hidden_states=state.member_hidden_states,
+                owner_parameters=state.member_parameters,
                 observation=start_cache.observation,
                 action=act,
                 prediction=prediction,
@@ -1423,6 +1443,7 @@ class RecurrentLatentWorldModelEnsemble:
         ownership_valid = (
             (decision_cache.owner_event_count == state.event_count)
             & jnp.array_equal(decision_cache.owner_hidden_states, state.member_hidden_states)
+            & _tree_equal(decision_cache.owner_parameters, state.member_parameters)
             & jnp.array_equal(observation, decision_cache.observation)
             & (action == decision_cache.action)
         )
