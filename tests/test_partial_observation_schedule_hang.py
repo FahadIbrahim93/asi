@@ -59,6 +59,28 @@ def test_periodic_schedule_accepts_public_last_fit() -> None:
     assert wrapper.mode is MaskMode.PERIODIC
 
 
+def test_periodic_schedule_maximum_uses_one_array_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    row = np.array([True, False], dtype=bool)
+    original_asarray = partial_observation.jnp.asarray
+    calls = 0
+
+    def counted_asarray(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original_asarray(*args, **kwargs)
+
+    monkeypatch.setattr(partial_observation.jnp, "asarray", counted_asarray)
+    wrapper = PartialObservationWrapper(
+        _inner(),
+        mode=MaskMode.PERIODIC,
+        schedule=(row,) * _MAX_PERIODIC_SCHEDULE_LENGTH,
+    )
+    assert wrapper.mode is MaskMode.PERIODIC
+    assert calls == 1
+
+
 def test_periodic_schedule_rejects_large_rows_before_array_conversion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -92,6 +114,44 @@ def test_periodic_schedule_rejects_hostile_container_before_len() -> None:
             _inner(), mode=MaskMode.PERIODIC, schedule=HostileSchedule()
         )
     assert HostileSchedule.calls == 0
+
+
+def test_periodic_schedule_rejects_hostile_feature_dim_before_arithmetic() -> None:
+    class HostileInt(int):
+        calls = 0
+
+        def __mul__(self, other: object) -> int:
+            type(self).calls += 1
+            raise AssertionError("untrusted multiplication hook executed")
+
+        def __le__(self, other: object) -> bool:
+            type(self).calls += 1
+            raise AssertionError("untrusted comparison hook executed")
+
+    inner = _inner()
+    object.__setattr__(inner, "_feature_dim", HostileInt(2))
+    with pytest.raises(ValueError, match="inner.feature_dim"):
+        PartialObservationWrapper(
+            inner,
+            mode=MaskMode.PERIODIC,
+            schedule=(np.array([True, False], dtype=bool),),
+        )
+    assert HostileInt.calls == 0
+
+
+def test_periodic_schedule_rejects_numeric_dtype_without_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_asarray(*args: object, **kwargs: object) -> object:
+        raise AssertionError("conversion ran before dtype validation")
+
+    monkeypatch.setattr(partial_observation.jnp, "asarray", fail_asarray)
+    with pytest.raises(ValueError, match="dtype bool"):
+        PartialObservationWrapper(
+            _inner(),
+            mode=MaskMode.PERIODIC,
+            schedule=(np.asarray([1, 0], dtype=np.int32),),
+        )
 
 
 def test_periodic_schedule_rejects_hostile_row_before_array_hooks() -> None:

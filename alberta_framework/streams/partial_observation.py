@@ -74,7 +74,7 @@ def _trusted_boolean_mask(name: str, value: object, feature_dim: int) -> Array:
         raise ValueError(
             f"{name} must have shape (feature_dim={feature_dim},) and dtype bool"
         )
-    return jnp.asarray(trusted)
+    return trusted
 
 
 def _require_unit_interval_probability(name: str, value: object) -> float:
@@ -92,6 +92,13 @@ def _require_mode(mode: object) -> MaskMode:
     if type(mode) is not MaskMode:
         raise ValueError("mode must be an exact MaskMode")
     return mode
+
+
+def _require_feature_dim(value: object) -> int:
+    """Reject non-builtin protocol dimensions before resource arithmetic."""
+    if type(value) is not int or not 1 <= value <= 2**31 - 1:
+        raise ValueError("inner.feature_dim must be an integer in [1, 2147483647]")
+    return value
 
 
 # =============================================================================
@@ -168,12 +175,14 @@ class PartialObservationWrapper[InnerStateT]:
         self._mask_prob = mask_prob
         self._sentinel = validated_float32_scalar("sentinel", sentinel)
 
-        feature_dim = inner.feature_dim
+        feature_dim = _require_feature_dim(inner.feature_dim)
 
         if mode == MaskMode.FIXED:
             if fixed_mask is None:
                 raise ValueError("MaskMode.FIXED requires fixed_mask.")
-            mask = _trusted_boolean_mask("fixed_mask shape", fixed_mask, feature_dim)
+            mask = jnp.asarray(
+                _trusted_boolean_mask("fixed_mask shape", fixed_mask, feature_dim)
+            )
             self._fixed_mask: Array | None = mask
         else:
             self._fixed_mask = None
@@ -196,11 +205,14 @@ class PartialObservationWrapper[InnerStateT]:
                     "periodic schedule working set exceeds the bounded "
                     f"{_MAX_PERIODIC_SCHEDULE_VALUES}-value payload"
                 )
-            masks = [
+            for row in schedule:
                 _trusted_boolean_mask("schedule masks", row, feature_dim)
-                for row in schedule
-            ]
-            sched = jnp.stack(masks, axis=0)
+            # Convert the complete trusted tuple once.  Per-row conversion plus
+            # stacking turns the admitted 4,096-row boundary into thousands of
+            # independent JAX dispatches even for pointer-repeated rows.
+            sched = jnp.asarray(schedule)
+            assert sched.shape == (len(schedule), feature_dim)
+            assert sched.dtype == jnp.dtype(jnp.bool_)
             self._schedule: Array | None = sched
         else:
             self._schedule = None
