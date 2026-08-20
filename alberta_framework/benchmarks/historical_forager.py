@@ -106,6 +106,11 @@ _REWARD_DTYPE = np.dtype("<f8")
 _MAX_STEPS = 100_000_000
 _MAX_SEED = 2**32 - 1
 _MAX_JSON_BYTES = 4 * 1024 * 1024
+# Same ceiling as security._JSON_MAX_DEPTH and reference_life_checkpoint's
+# _MAX_TREE_DEPTH. A deeply nested result.json well under _MAX_JSON_BYTES
+# (e.g. 10_000 nested arrays, ~20KB) still RecursionErrors CPython's json
+# decoder before the byte-size gate can reject it.
+_MAX_JSON_DEPTH = 32
 _MAX_KERNEL_METADATA_BYTES = 1024 * 1024
 _HASH_CHUNK_BYTES = 1024 * 1024
 _VALIDATION_CHUNK_VALUES = 65_536
@@ -1040,6 +1045,42 @@ def run_historical_forager[KernelStateT](
     )
 
 
+def _require_json_text_depth(raw: bytes, *, name: str) -> None:
+    """Reject JSON nests deeper than ``_MAX_JSON_DEPTH`` before RecursionError.
+
+    A small, byte-bounded artifact can still nest thousands of arrays or
+    objects; CPython's ``json`` decoder recurses per level and RecursionErrors
+    well before ``_MAX_JSON_BYTES`` would reject it. Scan the raw text for
+    bracket depth (skipping string contents) so the artifact fails closed with
+    ``HistoricalForagerArtifactError`` instead of an uncaught interpreter
+    error.
+    """
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HistoricalForagerArtifactError(f"{name} is not valid UTF-8 JSON") from exc
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+            continue
+        if character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > _MAX_JSON_DEPTH:
+                raise HistoricalForagerArtifactError(f"{name} exceeds the JSON nesting limit")
+        elif character in "]}":
+            depth -= 1
+
+
 def _strict_json_object(path: Path) -> tuple[dict[str, Any], bytes]:
     try:
         metadata = path.lstat()
@@ -1053,6 +1094,7 @@ def _strict_json_object(path: Path) -> tuple[dict[str, Any], bytes]:
     ):
         raise HistoricalForagerArtifactError(f"artifact file {path.name!r} is not canonical")
     payload = path.read_bytes()
+    _require_json_text_depth(payload, name=path.name)
 
     def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -1084,6 +1126,8 @@ def _strict_json_object(path: Path) -> tuple[dict[str, Any], bytes]:
             parse_constant=invalid_constant,
             parse_float=parse_float,
         )
+    except RecursionError as exc:
+        raise HistoricalForagerArtifactError("result.json exceeds the JSON nesting limit") from exc
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise HistoricalForagerArtifactError("result.json is not valid UTF-8 JSON") from exc
     if not isinstance(parsed, dict):
