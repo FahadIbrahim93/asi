@@ -1,10 +1,9 @@
-# mypy: disable-error-code="call-arg"
 """End-to-end coverage for :class:`ModelReplayRehearsal`.
 
 Every other ``model_replay_rehearsal`` test file only constructs and
-validates :class:`ModelReplayRehearsalConfig` objects; none of them ever call
-:meth:`ModelReplayRehearsal.init` or :meth:`ModelReplayRehearsal.step`. That
-left the entire runtime pipeline -- ``_step_jit``, ``_rehearse_batch``,
+validates the configuration, construction, or initialization boundary; none
+of them ever call :meth:`ModelReplayRehearsal.step`. That left the runtime
+transaction -- ``_step_jit``, ``_rehearse_batch``,
 ``encode_action``, and ``decode_action`` -- including both branches of the
 documented ``action_encoding`` dispatch (``"scalar_index"`` and
 ``"one_hot"``), without a single execution in the suite.
@@ -19,6 +18,7 @@ from __future__ import annotations
 import jax.numpy as jnp
 import jax.random as jr
 import pytest
+from jax import tree_util
 
 from alberta_framework.core.dual_replay import DualReplayConfig
 from alberta_framework.core.learning_signals import LearningSignalEstimatorConfig
@@ -26,6 +26,7 @@ from alberta_framework.core.model_replay_rehearsal import (
     ModelReplayRehearsal,
     ModelReplayRehearsalConfig,
     RealModelReplayEvent,
+    ReplayActionEncoding,
 )
 from alberta_framework.core.world_model import ActionConditionedWorldModelConfig
 from alberta_framework.core.world_model_ensemble import WorldModelEnsembleConfig
@@ -79,12 +80,12 @@ def _replay_config(*, action_dim: int, total_capacity: int = 8) -> DualReplayCon
     )
 
 
-def _rehearsal(encoding: str) -> ModelReplayRehearsal:
+def _rehearsal(encoding: ReplayActionEncoding) -> ModelReplayRehearsal:
     action_dim = 1 if encoding == "scalar_index" else _N_ACTIONS
     config = ModelReplayRehearsalConfig(
         ensemble=_ensemble_config(),
         replay=_replay_config(action_dim=action_dim),
-        action_encoding=encoding,  # type: ignore[arg-type]
+        action_encoding=encoding,
     )
     return ModelReplayRehearsal(config)
 
@@ -92,7 +93,7 @@ def _rehearsal(encoding: str) -> ModelReplayRehearsal:
 def _event(
     *, observation: jnp.ndarray, action: int, next_observation: jnp.ndarray
 ) -> RealModelReplayEvent:
-    return RealModelReplayEvent(
+    return RealModelReplayEvent(  # type: ignore[call-arg]
         observation=observation,
         action=jnp.asarray(action, dtype=jnp.int32),
         reward=jnp.asarray(0.5, dtype=jnp.float32),
@@ -110,7 +111,7 @@ def _event(
 
 
 @pytest.mark.parametrize("encoding", ["scalar_index", "one_hot"])
-def test_encode_decode_round_trips_every_action(encoding: str) -> None:
+def test_encode_decode_round_trips_every_action(encoding: ReplayActionEncoding) -> None:
     """``encode_action``/``decode_action`` recover every legal action exactly."""
     rehearsal = _rehearsal(encoding)
     for action in range(_N_ACTIONS):
@@ -121,11 +122,11 @@ def test_encode_decode_round_trips_every_action(encoding: str) -> None:
 
 
 @pytest.mark.parametrize("encoding", ["scalar_index", "one_hot"])
-def test_step_runs_the_full_transaction_end_to_end(encoding: str) -> None:
+def test_step_runs_the_full_transaction_end_to_end(encoding: ReplayActionEncoding) -> None:
     """The real update/record/rehearsal transaction commits every step.
 
-    This is the first test in the suite that ever calls
-    :meth:`ModelReplayRehearsal.init`/``step`` -- for either encoding.
+    This is the first test in the suite that calls ``step`` -- for either
+    encoding.
     """
     rehearsal = _rehearsal(encoding)
     state = rehearsal.init(jr.key(0))
@@ -189,6 +190,14 @@ def test_scalar_index_and_one_hot_agree_on_the_same_action_stream() -> None:
         )
         assert float(scalar_result.real_observed_loss) == pytest.approx(
             float(one_hot_result.real_observed_loss)
+        )
+        assert all(
+            bool(jnp.array_equal(scalar_leaf, one_hot_leaf))
+            for scalar_leaf, one_hot_leaf in zip(
+                tree_util.tree_leaves(scalar_state.ensemble_state),
+                tree_util.tree_leaves(one_hot_state.ensemble_state),
+                strict=True,
+            )
         )
 
     scalar_rehearsal.validate_state(scalar_state)
