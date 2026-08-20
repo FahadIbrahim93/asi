@@ -121,46 +121,113 @@ def _load_manifest_config_json(raw: str) -> Any:
         raise ValueError("manifest config must be canonical JSON") from exc
 
 
+def _charge_json_bytes(encoded_bytes: list[int], amount: int) -> None:
+    if amount > _MAX_CONFIG_BYTES - encoded_bytes[0]:
+        raise ValueError(f"canonical config exceeds {_MAX_CONFIG_BYTES} bytes")
+    encoded_bytes[0] += amount
+
+
+def _charge_json_string(encoded_bytes: list[int], text: str) -> None:
+    remaining = _MAX_CONFIG_BYTES - encoded_bytes[0]
+    if len(text) > remaining - 2:
+        raise ValueError(f"canonical config exceeds {_MAX_CONFIG_BYTES} bytes")
+    size = 2
+    for character in text:
+        codepoint = ord(character)
+        if character in {'"', "\\"} or codepoint in {8, 9, 10, 12, 13}:
+            size += 2
+        elif codepoint < 32:
+            size += 6
+        elif codepoint < 128:
+            size += 1
+        elif codepoint <= 0xFFFF:
+            size += 6
+        else:
+            size += 12
+        if size > remaining:
+            raise ValueError(f"canonical config exceeds {_MAX_CONFIG_BYTES} bytes")
+    _charge_json_bytes(encoded_bytes, size)
+
+
 def _validate_json_value(
-    value: Any, *, path: str, depth: int = 0, nodes: int = 0
+    value: Any,
+    *,
+    path: str,
+    depth: int = 0,
+    nodes: int = 0,
+    _encoded_bytes: list[int] | None = None,
 ) -> int:
+    if _encoded_bytes is None:
+        _encoded_bytes = [0]
+
     nodes += 1
     if nodes > _MAX_JSON_VALUES:
         raise ValueError(f"{path} exceeds the canonical JSON value resource limit")
     if depth > _MAX_JSON_NESTING_DEPTH:
         raise ValueError(f"{path} exceeds the maximum canonical JSON nesting depth")
     value_type = type(value)
-    if value is None or value_type is str or value_type is bool or value_type is int:
+    if value is None:
+        _charge_json_bytes(_encoded_bytes, 4)
+        return nodes
+    if value_type is str:
+        _charge_json_string(_encoded_bytes, value)
+        return nodes
+    if value_type is bool:
+        _charge_json_bytes(_encoded_bytes, 4 if value else 5)
+        return nodes
+    if value_type is int:
+        try:
+            _charge_json_bytes(_encoded_bytes, len(str(value)))
+        except ValueError as exc:
+            raise ValueError(f"{path} must have a finite canonical JSON encoding") from exc
         return nodes
     if value_type is float:
         if not math.isfinite(value):
             raise ValueError(f"{path} must contain only finite JSON numbers")
+        _charge_json_bytes(_encoded_bytes, len(repr(value)))
         return nodes
-    if isinstance(value, list):
+    if value_type is list:
         extra = len(value)
         if nodes + extra > _MAX_JSON_VALUES:
             raise ValueError(f"{path} exceeds the canonical JSON value resource limit")
+        structural_bytes = 2 + max(0, extra - 1)
+        if structural_bytes + extra > _MAX_CONFIG_BYTES - _encoded_bytes[0]:
+            raise ValueError(f"canonical config exceeds {_MAX_CONFIG_BYTES} bytes")
+        _charge_json_bytes(_encoded_bytes, structural_bytes)
         for index, item in enumerate(value):
             nodes = _validate_json_value(
-                item, path=f"{path}[{index}]", depth=depth + 1, nodes=nodes
+                item,
+                path=f"{path}[{index}]",
+                depth=depth + 1,
+                nodes=nodes,
+                _encoded_bytes=_encoded_bytes,
             )
         return nodes
-    if isinstance(value, Mapping):
+    if value_type is dict:
         extra = len(value)
         if nodes + extra > _MAX_JSON_VALUES:
             raise ValueError(f"{path} exceeds the canonical JSON value resource limit")
+        structural_bytes = 2 + max(0, extra - 1) + extra
+        if structural_bytes + extra > _MAX_CONFIG_BYTES - _encoded_bytes[0]:
+            raise ValueError(f"canonical config exceeds {_MAX_CONFIG_BYTES} bytes")
+        _charge_json_bytes(_encoded_bytes, structural_bytes)
         for key, item in value.items():
             if type(key) is not str:
                 raise ValueError(f"{path} JSON object keys must be strings")
+            _charge_json_string(_encoded_bytes, key)
             nodes = _validate_json_value(
-                item, path=f"{path}.{key}", depth=depth + 1, nodes=nodes
+                item,
+                path=f"{path}.{key}",
+                depth=depth + 1,
+                nodes=nodes,
+                _encoded_bytes=_encoded_bytes,
             )
         return nodes
     raise ValueError(f"{path} is not a canonical JSON value")
 
 
 def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
-    if not isinstance(value, Mapping):
+    if type(value) is not dict:
         raise ValueError("config must be a JSON mapping")
     _validate_json_value(value, path="config")
     try:
