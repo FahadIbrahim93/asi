@@ -64,6 +64,27 @@ PACKAGE_VERSIONS = {
     "urllib3": "2.2.3",
 }
 
+FUTURE_INVOCATION_REQUIREMENTS = [
+    "digest-pinned built image",
+    "network disabled",
+    "read-only root filesystem",
+    "bounded tmpfs",
+    "separately approved exact MNIST archive",
+    "NEW create-only output path",
+]
+
+BLOCKERS = [
+    "reviewed prospective plan authorization",
+    "exact MNIST archive, split, license, and transformed tensor identities",
+    "official configuration and source-tip-to-paper trace parity",
+    "deterministic seed and cumulative permutation schedule binding",
+    "mechanism-off exact reduction",
+    "persistent bytes, data steps, model queries, and timing receipt",
+    "create-only durable success and failure receipts",
+    "matched controls and budget approval",
+    "untouched scientific seeds and separate promotion protocol",
+]
+
 
 def _reject_constant(token: str) -> NoReturn:
     raise ValueError(f"non-finite JSON token {token}")
@@ -244,6 +265,8 @@ def _validate_plan(plan: dict[str, JsonValue]) -> None:
         "MNIST-only runtime omits upstream ImageNet, plotting, and RL-only dependencies",
     ]:
         raise ValueError("runtime compatibility deviations differ")
+    if runtime["future_invocation_requirements"] != FUTURE_INVOCATION_REQUIREMENTS:
+        raise ValueError("future invocation requirements differ")
     diagnostic = _exact_keys(
         plan["prospective_diagnostic"],
         ("family", "input_permutation_is_cumulative", "labels_permuted", "tasks_per_run",
@@ -290,10 +313,7 @@ def _validate_plan(plan: dict[str, JsonValue]) -> None:
         "external_execution_authorized": False,
     }:
         raise ValueError("plan claims exceed a prospective nonparity runtime")
-    blockers = plan["blockers"]
-    if type(blockers) is not list or len(blockers) != 9 or any(
-        type(item) is not str for item in blockers
-    ):
+    if plan["blockers"] != BLOCKERS:
         raise ValueError("plan must retain all nine exact blockers")
 
 

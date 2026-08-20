@@ -7,6 +7,7 @@ import importlib.util
 import json
 from pathlib import Path
 from types import ModuleType
+from typing import cast
 
 import pytest
 
@@ -119,6 +120,23 @@ def test_verifier_accepts_exact_plan_and_rejects_claim_or_source_drift(
     forged["authority"]["source_archive_sha256"] = "0" * 64  # type: ignore[index]
     with pytest.raises(ValueError, match="source authority"):
         verifier._validate_plan(forged)
+
+    weakened_invocation = copy.deepcopy(plan)
+    weakened_invocation["runtime"]["future_invocation_requirements"][1] = (  # type: ignore[index]
+        "network preferred"
+    )
+    with pytest.raises(ValueError, match="future invocation requirements"):
+        verifier._validate_plan(weakened_invocation)
+
+    removed_blocker = copy.deepcopy(plan)
+    cast("list[object]", removed_blocker["blockers"]).pop()
+    with pytest.raises(ValueError, match="all nine exact blockers"):
+        verifier._validate_plan(removed_blocker)
+
+    rewritten_blocker = copy.deepcopy(plan)
+    rewritten_blocker["blockers"][0] = "authorization implied"  # type: ignore[index]
+    with pytest.raises(ValueError, match="all nine exact blockers"):
+        verifier._validate_plan(rewritten_blocker)
 
 
 def test_verifier_rejects_hostile_or_unbounded_plan_before_hooks() -> None:
