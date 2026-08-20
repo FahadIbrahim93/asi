@@ -72,8 +72,12 @@ reserved before validation, data loading, or strict replay; reservation cleanup
 compares held and live inode identities. Keep supported, rejected, and
 inconclusive aggregates. The runner attempts to publish one generic
 failed-attempt receipt when plan admission, shard execution, or prepublication
-strict validation raises an ordinary `Exception`. A successfully published
-receipt returns nonzero, retains no exception type, message, or representation,
+strict dataset-bound reexecution raises an ordinary `Exception`. The dataset is
+loaded once, and the same validated arrays feed the initial execution and
+strict reexecution immediately before completed-shard publication. The
+publisher does not accept caller-asserted replay evidence. A successfully
+published receipt returns nonzero and retains no exception type, message, or
+representation,
 cannot enter aggregation, and forbids retry in this namespace. `BaseException`,
 process death, completed-result publication failures, and failure to build or
 publish the failure receipt remain outside this retention boundary. Source,
