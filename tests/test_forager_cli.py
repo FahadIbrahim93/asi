@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -107,6 +108,16 @@ def test_json_safe_rejects_nonfinite_protocol_identities() -> None:
     for bad in (float("nan"), float("inf"), float("-inf"), np.float64("nan")):
         with pytest.raises(ValueError, match="forager CLI payload is not finite JSON"):
             forager_cli._json_safe({"scale": bad})
+
+
+def test_reference_manifest_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    manifest = tmp_path / "duplicate.json"
+    manifest.write_text('{"schema":"first","schema":"second"}', encoding="utf-8")
+
+    with pytest.raises(SystemExit) as error:
+        forager_cli.main(("--reference-manifest", str(manifest)))
+
+    assert error.value.code == 2
 
 
 def test_protocol_and_baseline_dumps_refuse_nonfinite_json() -> None:
