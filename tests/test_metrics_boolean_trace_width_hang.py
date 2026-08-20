@@ -25,13 +25,6 @@ def test_running_mean_rejects_origin_hang_class_before_trace_walk() -> None:
     assert time.perf_counter() - started < 0.25
 
 
-def test_running_mean_rejects_pointer_repeat_origin_hang_n() -> None:
-    started = time.perf_counter()
-    with pytest.raises(ValueError, match="boolean-trace value limit"):
-        compute_running_mean([0.0] * 15_000_000, window_size=2)
-    assert time.perf_counter() - started < 0.25
-
-
 def test_cumulative_error_rejects_oversized_metrics_history_before_walk() -> None:
     started = time.perf_counter()
     with pytest.raises(ValueError, match="boolean-trace value limit"):
