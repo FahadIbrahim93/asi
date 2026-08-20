@@ -46,8 +46,6 @@ _MAX_CONFIG_BYTES = 1 << 20
 _MAX_JSON_NESTING_DEPTH = 64
 # Frozen manifests are tiny. Cap nodes before walking toward the 1 MiB encoding cap.
 _MAX_JSON_VALUES = 1_000_000
-_MIN_JSON_INTEGER = -(1 << 63)
-_MAX_JSON_INTEGER = (1 << 63) - 1
 _MAX_ARRAY_RANK = 8
 _MAX_ARRAY_ELEMENTS = 1 << 20
 _SUPPORTED_DTYPES = frozenset(
@@ -179,9 +177,17 @@ def _validate_json_value(
         return nodes
     if value_type is int:
         integer = cast(int, value)
-        if not _MIN_JSON_INTEGER <= integer <= _MAX_JSON_INTEGER:
-            raise ValueError(f"{path} integer must fit signed 64-bit bounds")
-        _charge_json_bytes(_encoded_bytes, len(str(integer)))
+        # Preserve the public canonical-JSON domain, including unsigned-64
+        # protocol values, while rejecting integers that cannot possibly fit
+        # the 1 MiB encoded-byte budget before decimal conversion.  Since
+        # 2**10 > 10**3, an integer beyond this bit bound necessarily needs
+        # more than _MAX_CONFIG_BYTES decimal digits.
+        if integer.bit_length() > (_MAX_CONFIG_BYTES * 10) // 3 + 1:
+            raise ValueError(f"canonical config exceeds {_MAX_CONFIG_BYTES} bytes")
+        try:
+            _charge_json_bytes(_encoded_bytes, len(str(integer)))
+        except ValueError as exc:
+            raise ValueError(f"{path} must have a finite canonical JSON encoding") from exc
         return nodes
     if value_type is float:
         if not math.isfinite(value):

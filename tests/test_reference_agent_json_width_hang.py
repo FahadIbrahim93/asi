@@ -11,9 +11,8 @@ import pytest
 import alberta_framework.reference_agent as reference_agent
 from alberta_framework.reference_agent import (
     _MAX_CONFIG_BYTES,
-    _MAX_JSON_INTEGER,
     _MAX_JSON_VALUES,
-    _MIN_JSON_INTEGER,
+    MAX_DECISION_INDEX,
     _validate_json_value,
     canonical_config_sha256,
 )
@@ -81,20 +80,20 @@ def test_canonical_config_counts_del_escape_before_encoding(
         canonical_config_sha256({"k": "\x7f" * count})
 
 
-@pytest.mark.parametrize("integer", [_MIN_JSON_INTEGER, _MAX_JSON_INTEGER])
-def test_canonical_config_accepts_signed_64_bit_boundaries(integer: int) -> None:
+@pytest.mark.parametrize("integer", [1 << 63, MAX_DECISION_INDEX, MAX_DECISION_INDEX + 1])
+def test_canonical_config_preserves_large_protocol_integer_domain(integer: int) -> None:
     assert len(canonical_config_sha256({"k": integer})) == 64
 
 
-@pytest.mark.parametrize("integer", [_MIN_JSON_INTEGER - 1, _MAX_JSON_INTEGER + 1])
-def test_canonical_config_rejects_first_integer_overflow_before_decimal_conversion(
-    integer: int, monkeypatch: pytest.MonkeyPatch
+def test_canonical_config_rejects_huge_integer_before_decimal_conversion(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def decimal_conversion_must_not_run(_value: object) -> str:
-        raise AssertionError("out-of-range integer reached decimal conversion")
+        raise AssertionError("oversized integer reached decimal conversion")
 
     monkeypatch.setattr(reference_agent, "str", decimal_conversion_must_not_run, raising=False)
-    with pytest.raises(ValueError, match="signed 64-bit"):
+    integer = 1 << (((_MAX_CONFIG_BYTES * 10) // 3) + 2)
+    with pytest.raises(ValueError, match="canonical config exceeds"):
         _validate_json_value(integer, path="config.k")
 
 
