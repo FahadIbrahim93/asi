@@ -888,3 +888,83 @@ class TestCollectTrajectoryValueMode:
         )
 
         assert jnp.allclose(plain, with_estimator)
+
+
+class TestCollectTrajectoryNextStateMode:
+    """collect_trajectory NEXT_STATE targets.
+
+    The only PredictionMode this function's own dispatch (as opposed to
+    ``GymnasiumStream``'s separate dispatch) was never exercised end to
+    end anywhere in this suite.
+    """
+
+    def test_target_dim_matches_observation_dim(self) -> None:
+        """target_dim is observation_dim for NEXT_STATE.
+
+        Independent of include_action_in_features (which only changes
+        the feature width).
+        """
+        env = gymnasium.make("CartPole-v1")
+        observations, targets = collect_trajectory(
+            env,
+            None,
+            num_steps=15,
+            mode=PredictionMode.NEXT_STATE,
+            include_action_in_features=True,
+            seed=1,
+        )
+        assert observations.shape == (15, 5)  # obs(4) + action(1)
+        assert targets.shape == (15, 4)  # observation_dim, not feature_dim
+
+    def test_target_equals_next_observation_within_episode(self) -> None:
+        """Within an episode (no reset), target[i] equals features[i + 1].
+
+        Compared over the shared 4-dim observation half of the feature row.
+        """
+        env = gymnasium.make("CartPole-v1")
+        observations, targets = collect_trajectory(
+            env,
+            None,
+            num_steps=100,
+            mode=PredictionMode.NEXT_STATE,
+            include_action_in_features=True,
+            seed=42,
+        )
+        matches = jnp.all(jnp.isclose(observations[1:, :4], targets[:-1]), axis=1)
+        # CartPole-v1 caps episodes at 500 steps but seed=42 terminates
+        # early; some rows must match (no reset) and some must not
+        # (reset overwrote current_obs after a terminal target was recorded).
+        assert bool(jnp.any(matches))
+        assert bool(jnp.any(~matches))
+
+    def test_target_is_true_terminal_observation_not_the_reset(self) -> None:
+        """At a terminal step, target[i] is the real post-step observation.
+
+        It is the observation the episode ended on (satisfying CartPole's
+        own termination bounds), not clobbered by the reset that seeds the
+        following row's features.
+        """
+        env = gymnasium.make("CartPole-v1")
+        observations, targets = collect_trajectory(
+            env,
+            None,
+            num_steps=200,
+            mode=PredictionMode.NEXT_STATE,
+            include_action_in_features=False,
+            seed=42,
+        )
+        mismatches = [
+            i
+            for i in range(len(observations) - 1)
+            if not jnp.allclose(observations[i + 1], targets[i])
+        ]
+        assert mismatches  # seed=42 must terminate at least once inside 200 steps
+
+        x_threshold = 2.4
+        theta_threshold = 12 * 2 * jnp.pi / 360
+        for i in mismatches:
+            x, _x_dot, theta, _theta_dot = (float(v) for v in targets[i])
+            assert abs(x) > x_threshold or abs(theta) > theta_threshold, (
+                f"row {i}: target is neither continuous with the next row "
+                "nor a genuine CartPole termination state"
+            )
