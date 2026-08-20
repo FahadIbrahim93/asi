@@ -112,6 +112,14 @@ def test_runtime_identity_binds_dependencies_jax_devices_config_and_environment(
     )
 
 
+def test_current_runtime_rejects_oversized_environment_before_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("XLA_FLAGS", "x" * 16_385)
+    with pytest.raises(ValueError, match="bounded exact JSON string"):
+        lane._current_runtime()
+
+
 @pytest.mark.parametrize(
     ("fixed", "off"),
     [

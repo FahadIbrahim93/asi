@@ -749,7 +749,10 @@ def _current_source() -> dict[str, object]:
 
 
 def _current_runtime() -> dict[str, object]:
-    return _runtime_identity()
+    runtime = _bounded_json(_runtime_identity(), context="runtime identity")
+    if type(runtime) is not dict:  # pragma: no cover - construction is a dict
+        raise RuntimeError("runtime identity must be one exact object")
+    return cast(dict[str, object], runtime)
 
 
 def _digest(value: object, *, length: int, context: str) -> str:
