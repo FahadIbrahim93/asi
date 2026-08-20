@@ -13,6 +13,11 @@ import numpy as np
 import pytest
 
 from alberta_framework.cli import step1_smoke_main, step2_smoke_main
+from alberta_framework.core.normalizers import (
+    EMANormalizer,
+    StreamingBatchNormalizer,
+    WelfordNormalizer,
+)
 from alberta_framework.steps import (
     Step1KernelConfig,
     Step2HybridConfig,
@@ -21,6 +26,7 @@ from alberta_framework.steps import (
     Step2StrictDigitReadoutConfig,
     Step2TemporalContextConfig,
     make_step1_learner,
+    make_step1_normalizer,
     make_step1_optimizer,
     make_step1_stream,
     make_step2_hybrid_learner,
@@ -84,10 +90,18 @@ def test_step1_kernel_all_public_optimizers_smoke(optimizer: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "normalizer",
-    ["none", "ema", "welford", "streaming_batch"],
+    ("normalizer", "expected_type"),
+    [
+        ("none", None),
+        ("ema", EMANormalizer),
+        ("welford", WelfordNormalizer),
+        ("streaming_batch", StreamingBatchNormalizer),
+    ],
 )
-def test_step1_kernel_all_public_normalizers_smoke(normalizer: str) -> None:
+def test_step1_kernel_all_public_normalizers_smoke(
+    normalizer: str,
+    expected_type: type[Any] | None,
+) -> None:
     """Every documented Step1NormalizerName must actually run end to end.
 
     Before this test, ``run_step1_smoke``/``make_step1_normalizer`` were only
@@ -103,6 +117,11 @@ def test_step1_kernel_all_public_normalizers_smoke(normalizer: str) -> None:
         num_relevant=3,
         noise_std=0.1,
     )
+    implementation = make_step1_normalizer(config)
+    if expected_type is None:
+        assert implementation is None
+    else:
+        assert type(implementation) is expected_type
     result = run_step1_smoke(config, steps=12, final_window=3)
     assert result.finite
     expected_columns = 3 if normalizer == "none" else 4
@@ -137,6 +156,9 @@ def test_step1_normalizer_boundary_hyperparameters_stay_finite_when_selected(
         num_relevant=2,
         **{field: value},
     )
+    implementation = make_step1_normalizer(config)
+    assert implementation is not None
+    assert implementation.to_config()["decay" if field == "ema_decay" else "momentum"] == value
     result = run_step1_smoke(config, steps=10, final_window=3)
     assert result.finite
 
