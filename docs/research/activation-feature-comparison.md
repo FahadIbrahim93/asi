@@ -102,12 +102,13 @@ with 4 degrees of freedom uses Bonferroni alpha `0.05 / 8` (critical value
 `5.261057575065803`). A simultaneous interval wholly above zero is
 `supported`, wholly below zero is `rejected`, and every other result is
 `inconclusive`. These are permanently nonpromoting development outcomes. The
-aggregate retains every completed shard, decision, resource count, and completed negative
-outcome. Ordinary exceptions, `BaseException`, process death, and publication failures
-produce no campaign failure receipt. The temporary reservation marker is cooperative
-concurrency state, not failure evidence; the external scheduler must retain its log before
-any separately authorized retry.
-timing is telemetry only and consistency hashes are not execution attestation.
+aggregate retains every completed shard, decision, resource count, and
+completed negative outcome. Ordinary exceptions, `BaseException`, process
+death, and publication failures produce no campaign failure receipt. The
+temporary reservation marker is cooperative concurrency state, not failure
+evidence; the external scheduler must retain its log before any separately
+authorized retry.
+Timing is telemetry only, and consistency hashes are not execution attestation.
 
 Canonical append-only namespaces are:
 
