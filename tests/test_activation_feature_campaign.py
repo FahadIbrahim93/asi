@@ -58,6 +58,13 @@ def cheap_plan(data: tuple[np.ndarray, np.ndarray]) -> dict[str, object]:
     return campaign.build_plan("cheap_screen", *data)
 
 
+@pytest.fixture
+def authorized(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercise post-authorization mechanics without changing frozen source."""
+
+    monkeypatch.setattr(campaign, "_EXECUTION_AUTHORIZED", True)
+
+
 def _metric(arm: str, seed: int) -> float:
     seed_index = next(seeds.index(seed) for seeds in campaign._SEEDS.values() if seed in seeds)
     base = 0.50 + seed_index / 1_000.0
@@ -270,6 +277,8 @@ def test_plan_binds_exact_source_runtime_dataset_resources_and_paper_limits(
     assert "external scheduler must retain its log" in policy["execution_failure_note"]
     per_shard = cast(dict[str, Any], resources["per_shard"])
     assert per_shard["retained_schedule_numeric_bytes"] == 4 * 2 * (784 + 5_000)
+    assert resources["retained_schedule_numeric_bytes_limit_per_shard"] == 256 * 1024**2
+    assert "schedule_working_bytes_limit_per_shard" not in resources
 
 
 def test_plan_rejects_noncanonical_dataset_metadata_before_hashing(
@@ -454,6 +463,7 @@ def test_execution_failure_is_not_misrepresented_as_a_retained_result_shard(
     cheap_plan: dict[str, object],
     data: tuple[np.ndarray, np.ndarray],
     monkeypatch: pytest.MonkeyPatch,
+    authorized: None,
 ) -> None:
     def failed_execution(*args: object, **kwargs: object) -> object:
         raise RuntimeError("simulated execution failure")
@@ -477,6 +487,7 @@ def test_private_executor_rechecks_full_source_identity_after_runner_return(
     cheap_plan: dict[str, object],
     data: tuple[np.ndarray, np.ndarray],
     monkeypatch: pytest.MonkeyPatch,
+    authorized: None,
 ) -> None:
     original_source = campaign._source_identity()
     seed = campaign._SEEDS["cheap_screen"][0]
@@ -549,6 +560,20 @@ def test_public_builder_and_cli_fail_before_dataset_or_arm_execution(
             seed=campaign._SEEDS["cheap_screen"][0],
         )
     with pytest.raises(RuntimeError, match="not authorized"):
+        campaign._build_shard_authorized(
+            cheap_plan,
+            *data,
+            arm="aid",
+            seed=campaign._SEEDS["cheap_screen"][0],
+            _capability=campaign._EXECUTION_CAPABILITY,
+        )
+    direct_output = tmp_path / "direct.json"
+    with pytest.raises(RuntimeError, match="not authorized"):
+        campaign.write_new_json(direct_output, cheap_plan)
+    assert not direct_output.exists()
+    with pytest.raises(RuntimeError, match="not authorized"):
+        campaign._publish_reserved_json((direct_output, -1, "unused"), cheap_plan)
+    with pytest.raises(RuntimeError, match="not authorized"):
         campaign.main(
             [
                 "run-shard",
@@ -585,7 +610,7 @@ def test_aggregate_rejects_missing_duplicate_and_self_consistent_statistic_forge
     reason="strict loader/publication requires Linux descriptor support",
 )
 def test_strict_file_admission_and_append_only_writer(
-    cheap_plan: dict[str, object], tmp_path: Path
+    cheap_plan: dict[str, object], tmp_path: Path, authorized: None
 ) -> None:
     destination = tmp_path / "plan.json"
     campaign.write_new_json(destination, cheap_plan)
@@ -666,7 +691,7 @@ def test_summarizer_uses_metadata_from_the_descriptor_that_supplied_bytes(
     reason="descriptor-pinned publication requires Linux",
 )
 def test_reserved_publication_resists_parent_swap_and_occupied_race(
-    cheap_plan: dict[str, object], tmp_path: Path
+    cheap_plan: dict[str, object], tmp_path: Path, authorized: None
 ) -> None:
     requested_parent = tmp_path / "requested"
     requested_parent.mkdir()
@@ -692,7 +717,10 @@ def test_reserved_publication_resists_parent_swap_and_occupied_race(
     reason="descriptor-pinned publication requires Linux",
 )
 def test_reservation_is_exclusive_before_work_and_publication_strictly_rereads(
-    cheap_plan: dict[str, object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    cheap_plan: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authorized: None,
 ) -> None:
     destination = tmp_path / "plan.json"
     with campaign._reserved_new_output(destination) as target:
@@ -721,7 +749,10 @@ def test_reservation_is_exclusive_before_work_and_publication_strictly_rereads(
     reason="descriptor-pinned publication requires Linux",
 )
 def test_publication_rejects_zero_write_and_nonregular_reread_swap(
-    cheap_plan: dict[str, object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    cheap_plan: dict[str, object],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authorized: None,
 ) -> None:
     short_output = tmp_path / "short.json"
     with campaign._reserved_new_output(short_output) as target:
@@ -729,6 +760,7 @@ def test_publication_rejects_zero_write_and_nonregular_reread_swap(
         with pytest.raises(OSError, match="short write"):
             campaign._publish_reserved_json(target, cheap_plan)
     monkeypatch.undo()
+    monkeypatch.setattr(campaign, "_EXECUTION_AUTHORIZED", True)
 
     swapped_output = tmp_path / "swapped.json"
     with campaign._reserved_new_output(swapped_output) as target:

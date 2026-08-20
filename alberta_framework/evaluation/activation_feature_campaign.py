@@ -630,7 +630,7 @@ def _resource_plan(stage: str, n_train: int) -> dict[str, object]:
             "model_queries": shards * 2 * steps,
         },
         "dataset_numeric_bytes_limit": 256 * 1024 * 1024,
-        "schedule_working_bytes_limit_per_shard": 256 * 1024 * 1024,
+        "retained_schedule_numeric_bytes_limit_per_shard": 256 * 1024 * 1024,
         "shard_json_bytes_limit": _MAX_SHARD_BYTES,
         "aggregate_input_bytes_limit": _MAX_AGGREGATE_BYTES,
     }
@@ -950,6 +950,7 @@ def _build_shard_authorized(
     _capability: object,
 ) -> dict[str, object]:
     """Private executor reachable only behind the reviewed public gate."""
+    _require_execution_authorized()
     if _capability is not _EXECUTION_CAPABILITY:
         raise RuntimeError("private campaign execution capability is invalid")
     checked_plan = validate_plan(plan, data_x=data_x, data_y=data_y)
@@ -1416,6 +1417,7 @@ def _open_output_parent(path: Path, *, create: bool) -> tuple[Path, int]:
 @contextmanager
 def _reserved_new_output(path: Path) -> Iterator[tuple[Path, int, str]]:
     """Pin and exclusively reserve one output before any expensive work."""
+    _require_execution_authorized()
     destination, parent_fd = _open_output_parent(path, create=True)
     reservation_name = f".{destination.name}.reservation"
     reservation_fd: int | None = None
@@ -1558,6 +1560,7 @@ def _publish_reserved_json(
     validator: Callable[[object], dict[str, object]] | None = None,
     max_bytes: int | None = None,
 ) -> Path:
+    _require_execution_authorized()
     destination, parent_fd, _reservation_name = target
     _json_preflight(value)
     checked_value = cast(dict[str, object], value)
