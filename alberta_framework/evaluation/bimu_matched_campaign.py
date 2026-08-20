@@ -87,7 +87,9 @@ _POLICY: Final = {
     "scientific_promotion_allowed": False,
     "sota_claim_allowed": False,
     "paper_comparable": False,
-    "negative_results_retained": True,
+    "completed_outcomes_retained": True,
+    "execution_failure_receipts_retained": False,
+    "failed_attempt_reservation_retained": True,
 }
 _TIMING_POLICY: Final = {
     "qualified": False,
@@ -1079,10 +1081,16 @@ def publish_json(
     root: Path,
     _reservation: tuple[Path, int, int] | None = None,
 ) -> None:
-    """Publish one validated canonical campaign file without replacement."""
+    """Publish one validated canonical file and verify its held inode.
+
+    Plans and aggregates link a complete anonymous inode atomically. A shard's
+    final name is reserved before execution; failure intentionally leaves that
+    zero-byte non-result reservation occupied.
+    """
 
     if type(path) is not type(Path()) or type(root) is not type(Path()):
         raise TypeError("path and root must be exact Paths")
+    _require_registered_root(root)
     if not _allowed_path(path, root):
         _fail("destination is outside the fixed campaign namespace")
 
@@ -1302,6 +1310,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     root = cast(Path, args.root)
+    _require_registered_root(root)
     if args.command == "plan":
         document = build_plan_document()
         publish_json(campaign_path(root, "plan"), document, root=root)

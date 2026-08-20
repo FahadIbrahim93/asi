@@ -480,6 +480,17 @@ def test_cli_reserves_exact_shard_before_execution(
     assert destination.stat().st_size == 0
 
 
+def test_cli_rejects_relocated_root_before_namespace_access(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    registered = tmp_path / "registered"
+    relocated = tmp_path / "relocated"
+    monkeypatch.setattr(campaign, "REGISTERED_OUTPUT_ROOT", registered)
+    with pytest.raises(ValueError, match="registered repository root"):
+        campaign.main(["validate", "--root", str(relocated)])
+    assert not relocated.exists()
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
 def test_cli_completes_and_revalidates_reserved_shard(
     tmp_path: Path, tiny_campaign: Any
