@@ -117,6 +117,9 @@ def test_prediction_and_control_information_and_rng_are_explicit() -> None:
     assert prediction["resources"]["rng_fold_ins"] == 0
     assert control["resources"]["action_queries"] == 16
     assert control["resources"]["rng_fold_ins"] == 16
+    assert control["resources"]["rng_splits"] == 16
+    assert control["resources"]["rng_uniform_draws"] == 16
+    assert 0 <= control["resources"]["rng_integer_draws"] <= 16
     assert control["identity"]["agent_rng_impl"] == "threefry2x32"
     assert prediction["information"]["boundary_information"] == []
     assert prediction["information"]["task_information"] == []
@@ -381,6 +384,98 @@ def test_reservation_is_exclusive_and_parent_swap_stays_descriptor_pinned(
         lane._release(reservation)
     assert (moved / "report.json").is_file()
     assert not destination.exists()
+
+
+def test_post_link_validation_failure_removes_only_the_published_inode(
+    tmp_path: Path,
+    complete_records: tuple[list[dict[str, object]], list[dict[str, object]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lane, "_current_source", lambda: {"git_commit": "c" * 40})
+    monkeypatch.setattr(lane, "_current_runtime", lambda: {"backend": "cpu"})
+    report = lane.build_report(
+        *complete_records,
+        dataset_provenance=lane.frozen_plan()["dataset"],
+        execution_source_commit="c" * 40,
+    )
+    destination = tmp_path / "failed" / "report.json"
+    monkeypatch.setattr(lane, "OUTPUT_PATH", destination)
+    reservation = lane._reserve(destination)
+    original = lane.validate_report
+    calls = 0
+
+    def fail_after_publish(value: object, *, require_current_source: bool = True) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ValueError("injected post-link validation failure")
+        return original(value, require_current_source=require_current_source)
+
+    monkeypatch.setattr(lane, "validate_report", fail_after_publish)
+    try:
+        with pytest.raises(ValueError, match="injected post-link"):
+            lane._publish_reserved(reservation, report)
+    finally:
+        lane._release(reservation)
+    assert not destination.exists()
+
+
+def test_extra_hard_link_is_rejected_and_rolled_back(
+    tmp_path: Path,
+    complete_records: tuple[list[dict[str, object]], list[dict[str, object]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lane, "_current_source", lambda: {"git_commit": "c" * 40})
+    monkeypatch.setattr(lane, "_current_runtime", lambda: {"backend": "cpu"})
+    report = lane.build_report(
+        *complete_records,
+        dataset_provenance=lane.frozen_plan()["dataset"],
+        execution_source_commit="c" * 40,
+    )
+    destination = tmp_path / "links" / "report.json"
+    monkeypatch.setattr(lane, "OUTPUT_PATH", destination)
+    reservation = lane._reserve(destination)
+    original_unlink = lane.os.unlink
+    skipped = False
+
+    def leave_first_temporary_link(
+        path: str, *, dir_fd: int | None = None
+    ) -> None:
+        nonlocal skipped
+        if not skipped and path.startswith(".report.json.") and path.endswith(".tmp"):
+            skipped = True
+            return
+        original_unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(lane.os, "unlink", leave_first_temporary_link)
+    try:
+        with pytest.raises(ValueError, match="unique regular-file link"):
+            lane._publish_reserved(reservation, report)
+    finally:
+        lane._release(reservation)
+    assert not destination.exists()
+    assert not list(destination.parent.glob("*.tmp"))
+
+
+def test_strict_reread_converts_deep_json_recursion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "deep" / "report.json"
+    monkeypatch.setattr(lane, "OUTPUT_PATH", destination)
+    reservation = lane._reserve(destination)
+    raw = ("[" * 10_000 + "0" + "]" * 10_000).encode("ascii")
+    destination.write_bytes(raw)
+    metadata = destination.stat()
+    try:
+        with pytest.raises(ValueError, match="not strict JSON"):
+            lane._strict_reread(
+                reservation,
+                raw,
+                expected_identity=(metadata.st_dev, metadata.st_ino),
+            )
+    finally:
+        destination.unlink()
+        lane._release(reservation)
 
 
 @pytest.mark.parametrize(

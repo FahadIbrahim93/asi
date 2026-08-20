@@ -156,10 +156,11 @@ def frozen_plan() -> dict[str, object]:
         "matched_axes": [
             "seed",
             "initial_parameters",
-            "example_or_transition_schedule",
             "observations",
             "updates",
             "allowed_boundary_and_task_information",
+            "environment_definition",
+            "exogenous_exploration_rng",
         ],
         "boundary_information": [],
         "task_information": [],
@@ -294,12 +295,12 @@ def _transition(state: int, action: int, step: int, phase_length: int) -> tuple[
     return successor, 1.0 if successor == goal else 0.0
 
 
-def _select_action(values: np.ndarray, key: jax.Array) -> tuple[int, bool]:
+def _select_action(values: np.ndarray, key: jax.Array) -> tuple[int, bool, bool]:
     explore_key, action_key = jr.split(key)
     greedy = int(np.argmax(values))
     explore = float(jr.uniform(explore_key, (), dtype=np.float32)) < 0.1
     action = int(jr.randint(action_key, (), 0, 2)) if explore else greedy
-    return action, action != greedy
+    return action, explore, action != greedy
 
 
 def _intentional_update(
@@ -364,11 +365,15 @@ def _run(
     rewards: list[float] = []
     errors: list[float] = []
     step_sizes: list[float] = []
+    integer_draws = 0
     start_ns = time.perf_counter_ns()
     for index in range(horizon):
         if is_control:
             assert root is not None
-            action, non_greedy = _select_action(weights[state], jr.fold_in(root, index))
+            action, explored, non_greedy = _select_action(
+                weights[state], jr.fold_in(root, index)
+            )
+            integer_draws += int(explored)
         else:
             action = (index + seed) % 2
             non_greedy = False
@@ -415,7 +420,11 @@ def _run(
     timing_ns = time.perf_counter_ns() - start_ns
     numeric_bytes = int(weights.nbytes + trace.nbytes)
     if intentional:
-        numeric_bytes += int(second.nbytes + 3 * np.dtype(np.float32).itemsize)
+        numeric_bytes += int(
+            second.nbytes
+            + 3 * np.dtype(np.float32).itemsize
+            + np.dtype(np.int32).itemsize
+        )
     if root is not None:
         numeric_bytes += int(root.nbytes)
     trajectory = {
@@ -444,6 +453,8 @@ def _run(
         "action_queries": horizon if is_control else 0,
         "rng_splits": horizon if is_control else 0,
         "rng_fold_ins": horizon if is_control else 0,
+        "rng_uniform_draws": horizon if is_control else 0,
+        "rng_integer_draws": integer_draws if is_control else 0,
         "intentional_step_size_solves": horizon if intentional else 0,
         "persistent_numeric_bytes": numeric_bytes,
         "timing_telemetry_ns": timing_ns,
@@ -593,6 +604,7 @@ def validate_control_shard(value: object) -> dict[str, object]:
             {
                 "observations", "environment_steps", "data_steps", "reward_observations",
                 "updates", "model_queries", "action_queries", "rng_splits", "rng_fold_ins",
+                "rng_uniform_draws", "rng_integer_draws",
                 "intentional_step_size_solves", "persistent_numeric_bytes",
                 "timing_telemetry_ns", "timing_is_selection_metric",
             }
@@ -1049,7 +1061,12 @@ def _release(reservation: _Reservation) -> None:
         os.close(reservation.directory_fd)
 
 
-def _strict_reread(reservation: _Reservation, expected: bytes) -> object:
+def _strict_reread(
+    reservation: _Reservation,
+    expected: bytes,
+    *,
+    expected_identity: tuple[int, int],
+) -> object:
     descriptor = os.open(
         reservation.destination_name,
         os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
@@ -1057,7 +1074,12 @@ def _strict_reread(reservation: _Reservation, expected: bytes) -> object:
     )
     try:
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= _MAX_REPORT_BYTES:
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or (metadata.st_dev, metadata.st_ino) != expected_identity
+            or metadata.st_nlink != 1
+            or not 0 < metadata.st_size <= _MAX_REPORT_BYTES
+        ):
             raise ValueError("published report must be one bounded regular file")
         chunks: list[bytes] = []
         remaining = metadata.st_size
@@ -1071,7 +1093,10 @@ def _strict_reread(reservation: _Reservation, expected: bytes) -> object:
             raise ValueError("published report grew during strict reread")
         final = os.fstat(descriptor)
         stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
-        if any(getattr(metadata, field) != getattr(final, field) for field in stable):
+        if (
+            any(getattr(metadata, field) != getattr(final, field) for field in stable)
+            or final.st_nlink != 1
+        ):
             raise ValueError("published report changed during strict reread")
     finally:
         os.close(descriptor)
@@ -1103,6 +1128,7 @@ def _publish_reserved(reservation: _Reservation, report: dict[str, object]) -> N
         raise ValueError("validated report exceeds its publication bound")
     temporary_name = f".{reservation.destination_name}.{secrets.token_hex(16)}.tmp"
     descriptor = -1
+    published_identity: tuple[int, int] | None = None
     try:
         descriptor = os.open(
             temporary_name,
@@ -1117,6 +1143,10 @@ def _publish_reserved(reservation: _Reservation, report: dict[str, object]) -> N
                 raise OSError("immutable report write made no progress")
             view = view[written:]
         os.fsync(descriptor)
+        temporary = os.fstat(descriptor)
+        if not stat.S_ISREG(temporary.st_mode) or temporary.st_nlink != 1:
+            raise RuntimeError("temporary report must have one private regular-file link")
+        published_identity = (temporary.st_dev, temporary.st_ino)
         os.close(descriptor)
         descriptor = -1
         os.link(
@@ -1132,12 +1162,32 @@ def _publish_reserved(reservation: _Reservation, report: dict[str, object]) -> N
             dir_fd=reservation.directory_fd,
             follow_symlinks=False,
         )
-        if not stat.S_ISREG(linked.st_mode) or linked.st_nlink != 1:
+        if (
+            not stat.S_ISREG(linked.st_mode)
+            or (linked.st_dev, linked.st_ino) != published_identity
+            or linked.st_nlink != 1
+        ):
             raise ValueError("published report must have one unique regular-file link")
         os.fsync(reservation.directory_fd)
-        reread = _strict_reread(reservation, encoded)
+        reread = _strict_reread(
+            reservation, encoded, expected_identity=published_identity
+        )
         if validate_report(reread, require_current_source=True) != report:
             raise ValueError("published semantic payload differs from validated report")
+    except BaseException:
+        if published_identity is not None:
+            try:
+                destination = os.stat(
+                    reservation.destination_name,
+                    dir_fd=reservation.directory_fd,
+                    follow_symlinks=False,
+                )
+                if (destination.st_dev, destination.st_ino) == published_identity:
+                    os.unlink(reservation.destination_name, dir_fd=reservation.directory_fd)
+                    os.fsync(reservation.directory_fd)
+            except FileNotFoundError:
+                pass
+        raise
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -1230,6 +1280,8 @@ def run_campaign(dataset_path: Path, output_path: Path = OUTPUT_PATH) -> dict[st
             raise RuntimeError("source identity changed during matched execution")
         if runtime_before != _current_runtime():
             raise RuntimeError("runtime identity changed during matched execution")
+        if dataset_provenance != _screening_dataset_provenance(inputs, labels):
+            raise RuntimeError("dataset numeric payload changed during matched execution")
         report = build_report(
             supervised_records,
             control_records,
