@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
-from typing import Never
+from typing import Iterator, Never
 
 import numpy as np
 import pytest
@@ -20,6 +20,14 @@ from alberta_framework.benchmarks.ipmnist_screening import (
 pytestmark = pytest.mark.integration
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _test_only_seed_roster() -> Iterator[None]:
+    patch = pytest.MonkeyPatch()
+    patch.setattr(lane, "SEEDS", lane.TEST_ONLY_SEEDS)
+    yield
+    patch.undo()
+
+
 def _control(
     arm: str, *, seed: int, horizon: int = 512, phase_length: int = 64
 ) -> dict[str, object]:
@@ -28,14 +36,17 @@ def _control(
         seed=seed,
         horizon=horizon,
         phase_length=phase_length,
-        _capability=lane._EXECUTION_CAPABILITY,
+        _capability=lane._TEST_EXECUTION_CAPABILITY,
     )
 
 
 def test_plan_is_fresh_prospective_and_permanently_nonpromoting() -> None:
     plan = lane.frozen_plan()
-    assert plan["seeds"] == [31_561_001, 31_561_002, 31_561_003, 31_561_004]
+    assert plan["seeds"] == [41_562_001, 41_562_002, 41_562_003, 41_562_004]
+    assert lane.QUARANTINED_SEEDS == (31_561_001, 31_561_002, 31_561_003, 31_561_004)
+    assert set(lane.CAMPAIGN_SEEDS).isdisjoint(lane.TEST_ONLY_SEEDS)
     assert plan["execution_authorized"] is False
+    assert plan["reviewed_execution_transition"] is False
     assert plan["scientific_promotion_allowed"] is False
     assert plan["negative_outcomes_retained"] is True
     assert plan["confidence_critical"] == 5.391949071934058
@@ -152,6 +163,23 @@ def test_campaign_execution_is_closed_before_independent_review() -> None:
         lane.run_control_shard("fixed_td0", seed=lane.SEEDS[0])
     with pytest.raises(RuntimeError, match="not authorized"):
         lane.run_campaign(Path("unused.npz"), Path("unused.json"))
+
+
+def test_runtime_flag_alone_cannot_bypass_reviewed_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("reservation occurred without reviewed transition")
+
+    monkeypatch.setattr(lane, "_EXECUTION_AUTHORIZED", True)
+    monkeypatch.setattr(lane, "_reserve", forbidden)
+    with pytest.raises(RuntimeError, match="not authorized"):
+        lane.run_campaign(Path("unused.npz"), lane.OUTPUT_PATH)
+    assert calls == 0
 
 
 def test_execution_cli_fails_before_dataset_or_consumer(
@@ -285,9 +313,13 @@ def test_report_publication_is_no_replace_and_rejects_symlink_parent(
     )
     destination = tmp_path / "new" / "report.json"
     monkeypatch.setattr(lane, "OUTPUT_PATH", destination)
-    assert lane.publish_report(destination, report) == destination
+    assert lane._publish_report_authorized(
+        destination, report, _capability=lane._TEST_EXECUTION_CAPABILITY
+    ) == destination
     with pytest.raises(FileExistsError):
-        lane.publish_report(destination, report)
+        lane._publish_report_authorized(
+            destination, report, _capability=lane._TEST_EXECUTION_CAPABILITY
+        )
 
     target = tmp_path / "target"
     target.mkdir()
@@ -296,8 +328,29 @@ def test_report_publication_is_no_replace_and_rejects_symlink_parent(
     linked_destination = linked / "report.json"
     monkeypatch.setattr(lane, "OUTPUT_PATH", linked_destination)
     with pytest.raises(OSError):
-        lane.publish_report(linked_destination, report)
+        lane._publish_report_authorized(
+            linked_destination, report, _capability=lane._TEST_EXECUTION_CAPABILITY
+        )
     assert not (target / "report.json").exists()
+
+
+def test_public_publisher_is_closed_without_creating_output(
+    tmp_path: Path,
+    complete_records: tuple[list[dict[str, object]], list[dict[str, object]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lane, "_current_source", lambda: {"git_commit": "c" * 40})
+    monkeypatch.setattr(lane, "_current_runtime", lambda: {"backend": "cpu"})
+    report = lane.build_report(
+        *complete_records,
+        dataset_provenance=lane.frozen_plan()["dataset"],
+        execution_source_commit="c" * 40,
+    )
+    destination = tmp_path / "never" / "report.json"
+    monkeypatch.setattr(lane, "OUTPUT_PATH", destination)
+    with pytest.raises(RuntimeError, match="not authorized"):
+        lane.publish_report(destination, report)
+    assert not destination.parent.exists()
 
 
 def test_reservation_is_exclusive_and_parent_swap_stays_descriptor_pinned(
@@ -340,5 +393,5 @@ def test_control_bounds_fail_before_execution(horizon: int, phase_length: int) -
             seed=lane.SEEDS[0],
             horizon=horizon,
             phase_length=phase_length,
-            _capability=lane._EXECUTION_CAPABILITY,
+            _capability=lane._TEST_EXECUTION_CAPABILITY,
         )
