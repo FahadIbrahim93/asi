@@ -112,7 +112,7 @@ def _strict_json(path: Path) -> dict[str, Any]:
             ),
             parse_float=parse_float,
         )
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise ImageHelperError(f"{path} is not strict JSON") from exc
     if type(value) is not dict:
         raise ImageHelperError(f"{path} must contain a JSON object")
@@ -657,7 +657,7 @@ print(json.dumps(payload, allow_nan=False, separators=(",", ":"), sort_keys=True
         )
     except ImageHelperError:
         raise
-    except (json.JSONDecodeError, RecursionError) as exc:
+    except (json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise ImageHelperError("runtime package probe returned invalid JSON") from exc
     if type(value) is not dict:
         raise ImageHelperError("runtime package probe returned a non-object")

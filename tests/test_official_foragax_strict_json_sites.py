@@ -21,6 +21,7 @@ pytestmark = pytest.mark.unit
         '{"packages": [], "packages": []}',
         '{"packages": NaN}',
         '{"packages": 1e10000}',
+        '{"packages": ' + "1" * 5000 + "}",
     ],
 )
 def test_image_runtime_probe_rejects_non_strict_json(
@@ -85,15 +86,20 @@ def test_image_runtime_probe_bounds_packages_before_append_and_sort(
     assert "len(direct_url.encode(\"utf-8\")) > MAX_DIRECT_URL_BYTES" in script
 
 
-@pytest.mark.parametrize(
-    "direct_url",
-    [
-        '{"url":"https://example.invalid/a","url":"https://example.invalid/b"}',
-    ],
-)
-def test_package_freeze_sanitizer_redacts_non_strict_direct_url(direct_url: str) -> None:
+def test_package_freeze_sanitizer_rejects_duplicate_direct_url() -> None:
+    direct_url = '{"url":"https://example.invalid/a","url":"https://example.invalid/b"}'
+    with pytest.raises(
+        official_foragax.OfficialForagaxValidationError,
+        match="duplicate object key",
+    ):
+        official_foragax._sanitize_package_freeze_line(
+            "package==1 ; direct_url=" + direct_url
+        )
+
+
+def test_package_freeze_sanitizer_redacts_malformed_direct_url() -> None:
     assert official_foragax._sanitize_package_freeze_line(
-        "package==1 ; direct_url=" + direct_url
+        'package==1 ; direct_url={"url":'
     ) == "package==1 ; direct_url=<REDACTED>"
 
 
@@ -162,6 +168,9 @@ def test_package_freeze_rejects_oversized_package_roster(
     assert guard < script.index('read_text("direct_url.json")')
     assert guard < script.index("packages.append(") < script.index("sorted(set(packages))")
     assert script.index("type(direct_url) is not str") < script.index("if direct_url:")
+    assert "_strict_direct_url_loads(direct_url)" in script
+    assert "except (json.JSONDecodeError, _RedactedDirectUrl, RecursionError)" in script
+    assert "except (json.JSONDecodeError, ValueError" not in script
 
 
 def test_package_freeze_rejects_cumulative_text_before_sanitizing(
@@ -199,9 +208,33 @@ def test_generated_runtime_probe_contains_self_contained_strict_decoder(
         )
     script = raised.value.script
     compile(script, "<official-foragax-runtime-probe>", "exec")
-    assert "object_pairs_hook=strict_pairs" in script
-    assert "parse_float=strict_float" in script
+    assert "def _strict_direct_url_loads(value):" in script
+    assert "object_pairs_hook=_direct_url_pairs" in script
+    assert "parse_float=_direct_url_float" in script
+    assert "_strict_direct_url_loads(direct_url_text)" in script
     assert "_strict_json_loads" not in script
     assert "OfficialForagaxValidationError" not in script
     assert '"unparsed": "<REDACTED>"' in script
     assert str(official_foragax._MAX_DIRECT_URL_BYTES) in script
+    assert "except (json.JSONDecodeError, _RedactedDirectUrl, RecursionError)" in script
+    assert "except (json.JSONDecodeError, ValueError" not in script
+
+
+def test_generated_direct_url_decoder_rejects_strict_metadata_failures() -> None:
+    namespace: dict[str, object] = {"json": json, "math": __import__("math")}
+    exec(official_foragax._STRICT_DIRECT_URL_HELPER_SOURCE, namespace)
+    loads = namespace["_strict_direct_url_loads"]
+    assert callable(loads)
+    assert loads('{"url":"https://example.invalid"}') == {
+        "url": "https://example.invalid"
+    }
+    with pytest.raises(ValueError, match="duplicate key"):
+        loads('{"url":"a","url":"b"}')
+    with pytest.raises(ValueError, match="non-finite"):
+        loads('{"value":NaN}')
+    with pytest.raises(json.JSONDecodeError):
+        loads('{"url":')
+    with pytest.raises(ValueError, match="byte limit"):
+        loads(" " * (official_foragax._MAX_DIRECT_URL_BYTES + 1))
+    with pytest.raises(ValueError, match="deeply nested"):
+        loads("[" * 65 + "]" * 65)

@@ -1403,7 +1403,7 @@ def _strict_json_loads(
         )
     except OfficialForagaxValidationError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise OfficialForagaxValidationError(f"{label} is not strict JSON") from exc
 
 
@@ -3749,7 +3749,9 @@ def _sanitize_package_freeze_line(line: str) -> str:
         raise OfficialForagaxValidationError(
             "package freeze direct_url is not finite JSON"
         ) from exc
-    except OfficialForagaxValidationError:
+    except OfficialForagaxValidationError as exc:
+        if "duplicate object key" in str(exc):
+            raise
         return prefix + " ; direct_url=<REDACTED>"
     if isinstance(direct_url, dict):
         url = direct_url.get("url")
@@ -4144,6 +4146,71 @@ sys.stdout.write({_PROBE_PREFIX!r} + json.dumps(payload, sort_keys=True, allow_n
     return _extract_probe_payload(result.stdout)
 
 
+_STRICT_DIRECT_URL_HELPER_SOURCE = r'''\
+_MAX_DIRECT_URL_BYTES = 65536
+
+class _RedactedDirectUrl(ValueError):
+    pass
+
+class _DuplicateDirectUrlKey(ValueError):
+    pass
+
+def _direct_url_pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise _DuplicateDirectUrlKey("direct_url.json contains a duplicate key")
+        result[key] = value
+    return result
+
+def _direct_url_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("direct_url.json contains a non-finite number")
+    return parsed
+
+def _strict_direct_url_loads(value):
+    if type(value) is not str:
+        raise _RedactedDirectUrl("direct_url.json must be exact text")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise _RedactedDirectUrl("direct_url.json is not UTF-8") from exc
+    if len(encoded) > _MAX_DIRECT_URL_BYTES:
+        raise _RedactedDirectUrl("direct_url.json exceeds the byte limit")
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+        elif character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > 64:
+                raise _RedactedDirectUrl("direct_url.json is too deeply nested")
+        elif character in "]}":
+            depth -= 1
+    try:
+        return json.loads(
+            encoded,
+            object_pairs_hook=_direct_url_pairs,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError("direct_url.json contains a non-finite constant")
+            ),
+            parse_float=_direct_url_float,
+        )
+    except RecursionError as exc:
+        raise _RedactedDirectUrl("direct_url.json is too deeply nested") from exc
+'''
+
+
 def _probe_runtime(
     *,
     repository: Path,
@@ -4320,64 +4387,17 @@ from pathlib import Path
 import jax
 import numpy
 
+{_STRICT_DIRECT_URL_HELPER_SOURCE}
+
 distribution_name = "continual-foragax"
 distribution = importlib.metadata.distribution(distribution_name)
 direct_url_text = distribution.read_text("direct_url.json")
 direct_url = None
 if direct_url_text:
-    def strict_pairs(items):
-        result = {{}}
-        for key, item in items:
-            if key in result:
-                raise ValueError("distribution direct_url repeats a JSON key")
-            result[key] = item
-        return result
-
-    def strict_float(value):
-        parsed = float(value)
-        if not math.isfinite(parsed):
-            raise ValueError("distribution direct_url contains a non-finite JSON number")
-        return parsed
-
-    def require_bounded_depth(value):
-        depth = 0
-        in_string = False
-        escaped = False
-        for character in value:
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif character == "\\\\":
-                    escaped = True
-                elif character == '"':
-                    in_string = False
-            elif character == '"':
-                in_string = True
-            elif character in "[{{":
-                depth += 1
-                if depth > {_MAX_STRICT_JSON_DEPTH}:
-                    raise ValueError("distribution direct_url exceeds its nesting ceiling")
-            elif character in "]}}":
-                depth -= 1
-
-    if (
-        type(direct_url_text) is not str
-        or len(direct_url_text.encode("utf-8")) > {_MAX_DIRECT_URL_BYTES}
-    ):
+    try:
+        direct_url = _strict_direct_url_loads(direct_url_text)
+    except (json.JSONDecodeError, _RedactedDirectUrl, RecursionError):
         direct_url = {{"unparsed": "<REDACTED>"}}
-    else:
-        try:
-            require_bounded_depth(direct_url_text)
-            direct_url = json.loads(
-                direct_url_text,
-                object_pairs_hook=strict_pairs,
-                parse_constant=lambda _: (_ for _ in ()).throw(
-                    ValueError("distribution direct_url contains a non-finite JSON constant")
-                ),
-                parse_float=strict_float,
-            )
-        except (json.JSONDecodeError, ValueError, RecursionError):
-            direct_url = {{"unparsed": "<REDACTED>"}}
 
 spec = importlib.util.find_spec("foragax")
 locations = spec.submodule_search_locations if spec is not None else None
@@ -5375,40 +5395,7 @@ import math
 import sys
 from importlib.metadata import distributions
 
-def strict_pairs(items):
-    result = {{}}
-    for key, item in items:
-        if key in result:
-            raise ValueError("direct_url.json repeats a key")
-        result[key] = item
-    return result
-
-def strict_float(value):
-    parsed = float(value)
-    if not math.isfinite(parsed):
-        raise ValueError("direct_url.json contains a non-finite number")
-    return parsed
-
-def require_bounded_depth(value):
-    depth = 0
-    in_string = False
-    escaped = False
-    for character in value:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif character == "\\\\":
-                escaped = True
-            elif character == '"':
-                in_string = False
-        elif character == '"':
-            in_string = True
-        elif character in "[{{":
-            depth += 1
-            if depth > {_MAX_STRICT_JSON_DEPTH}:
-                raise ValueError("direct_url.json exceeds its nesting ceiling")
-        elif character in "]}}":
-            depth -= 1
+{_STRICT_DIRECT_URL_HELPER_SOURCE}
 
 packages = []
 package_text_bytes = 0
@@ -5426,26 +5413,15 @@ for distribution in distributions():
     if direct_url is not None and type(direct_url) is not str:
         raise RuntimeError("direct_url.json must be an exact string")
     if direct_url:
-        if len(direct_url.encode("utf-8")) > {_MAX_DIRECT_URL_BYTES}:
+        try:
+            direct_url = json.dumps(
+                _strict_direct_url_loads(direct_url),
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (json.JSONDecodeError, _RedactedDirectUrl, RecursionError):
             direct_url = "<REDACTED>"
-        else:
-            try:
-                require_bounded_depth(direct_url)
-                direct_url = json.dumps(
-                    json.loads(
-                        direct_url,
-                        object_pairs_hook=strict_pairs,
-                        parse_constant=lambda _: (_ for _ in ()).throw(
-                            ValueError("direct_url.json contains a non-finite constant")
-                        ),
-                        parse_float=strict_float,
-                    ),
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    allow_nan=False,
-                )
-            except (json.JSONDecodeError, RecursionError, TypeError, ValueError):
-                direct_url = "<REDACTED>"
         line += f" ; direct_url={{direct_url}}"
     package_text_bytes += len(line.encode("utf-8"))
     if package_text_bytes > {_MAX_PACKAGE_FREEZE_TEXT_BYTES}:
