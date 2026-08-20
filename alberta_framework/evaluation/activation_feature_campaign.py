@@ -1250,8 +1250,8 @@ def _load_json_strict_with_metadata(
             os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
         )
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode):
-            raise ValueError("campaign input must be a regular file")
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise ValueError("campaign input must be a uniquely linked regular file")
         if not 0 < opened.st_size <= max_bytes:
             raise ValueError("campaign input exceeds its byte bound")
         chunks: list[bytes] = []
@@ -1267,8 +1267,10 @@ def _load_json_strict_with_metadata(
             raise ValueError("campaign input exceeds its byte bound")
         final = os.fstat(descriptor)
         stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
-        if len(encoded) != opened.st_size or any(
-            getattr(opened, name) != getattr(final, name) for name in stable_fields
+        if (
+            final.st_nlink != 1
+            or len(encoded) != opened.st_size
+            or any(getattr(opened, name) != getattr(final, name) for name in stable_fields)
         ):
             raise ValueError("campaign input changed during admission")
         try:
@@ -1418,8 +1420,12 @@ def _load_json_strict_at(
     )
     try:
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or not 0 < opened.st_size <= max_bytes:
-            raise ValueError("published campaign output is not a bounded regular file")
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or not 0 < opened.st_size <= max_bytes
+        ):
+            raise ValueError("published campaign output is not a bounded unique regular file")
         chunks: list[bytes] = []
         remaining = max_bytes + 1
         while remaining > 0:
@@ -1432,7 +1438,8 @@ def _load_json_strict_at(
         final = os.fstat(descriptor)
         stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
         if (
-            len(encoded) != opened.st_size
+            final.st_nlink != 1
+            or len(encoded) != opened.st_size
             or len(encoded) > max_bytes
             or any(getattr(opened, field) != getattr(final, field) for field in stable_fields)
         ):

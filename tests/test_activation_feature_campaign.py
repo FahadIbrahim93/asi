@@ -513,6 +513,11 @@ def test_strict_file_admission_and_append_only_writer(
     with pytest.raises(ValueError, match="JSON|regular"):
         campaign.load_json_strict(symlink, max_bytes=campaign._MAX_SHARD_BYTES)
 
+    hardlink = tmp_path / "hardlink.json"
+    os.link(destination, hardlink)
+    with pytest.raises(ValueError, match="uniquely linked"):
+        campaign.load_json_strict(destination, max_bytes=campaign._MAX_SHARD_BYTES)
+
 
 @pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="strict loader requires O_NOFOLLOW")
 def test_summarizer_rejects_two_paths_to_one_inode(
@@ -527,7 +532,7 @@ def test_summarizer_rejects_two_paths_to_one_inode(
     alias = tmp_path / "alias.json"
     os.link(paths[0], alias)
     paths[-1] = alias
-    with pytest.raises(ValueError, match="unique regular files"):
+    with pytest.raises(ValueError, match="uniquely linked|unique regular files"):
         campaign.summarize_shard_files(cheap_plan, paths)
 
 
@@ -561,7 +566,7 @@ def test_summarizer_uses_metadata_from_the_descriptor_that_supplied_bytes(
         return real_open(path, flags, *args, **kwargs)
 
     monkeypatch.setattr(os, "open", swapping_open)
-    with pytest.raises(ValueError, match="unique regular files"):
+    with pytest.raises(ValueError, match="uniquely linked|unique regular files"):
         campaign.summarize_shard_files(cheap_plan, paths)
     assert swapped is True
 
