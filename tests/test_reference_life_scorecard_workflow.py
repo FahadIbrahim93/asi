@@ -40,7 +40,9 @@ def test_reference_life_scorecard_fails_closed_on_source_and_runtime() -> None:
     assert text.count('test "$GITHUB_REF" = "refs/heads/main"') == 2
     assert text.count('test "$GITHUB_SHA" = "$LAUNCH_SHA"') == 2
     assert text.count('test "$WORKFLOW_SHA" = "$LAUNCH_SHA"') == 2
-    assert text.count('test "$(git rev-parse HEAD)" = "$LAUNCH_SHA"') == 2
+    assert text.count('test "$GITHUB_RUN_ATTEMPT" = "1"') == 2
+    assert text.count('test "$(git rev-parse HEAD)" = "$LAUNCH_SHA"') == 4
+    assert text.count("Reverify exact authorized source after setup") == 2
     assert text.count('python-version: "3.12.12"') == 2
     assert text.count('test "$uv_version" = "0.9.24"') == 2
     assert text.count('python_path="$GITHUB_WORKSPACE/.venv/bin/python"') == 2
@@ -49,6 +51,15 @@ def test_reference_life_scorecard_fails_closed_on_source_and_runtime() -> None:
     assert "import alberta_framework, jax" in text
     assert "retention-days: 90" in text
     assert "retention-days: 30" not in text
+
+
+def test_reference_life_scorecard_retains_valid_failed_shards() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+
+    assert "shard_status=$?" in text
+    assert "shard_status != 0 && shard_status != 1" in text
+    assert "run-shard returned unexpected status" in text
+    assert "validate \"$output\"" in text
 
 
 def test_reference_life_scorecard_artifacts_and_receipt_bind_the_run() -> None:
