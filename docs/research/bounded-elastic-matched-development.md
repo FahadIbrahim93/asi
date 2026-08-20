@@ -15,6 +15,13 @@ bytes, peak budget, active final size, structural events, and telemetry-only tim
 256 MiB numeric envelope covers retained dataset, schedule, and peak persistent bytes and is
 checked before dataset copying, schedule construction, parameter initialization, or execution.
 
+The preregistered primary comparison is paired whole-stream mean online accuracy for
+`bounded_growth` and `bounded_elastic` against `bounded_fixed_cbp`. A candidate is supported only
+when all five paired deltas are strictly positive, rejected only when all five are nonpositive,
+and otherwise inconclusive. The campaign is supported when either candidate is supported,
+rejected when both are rejected, and otherwise inconclusive. This conservative sign rule is a
+development-selection outcome only; it is not a significance test or scientific evidence.
+
 Execution, strict reexecution, and publication are hard-disabled until both a separately reviewed
 source transition and runtime authorization become exact `true`. The future output path is NEW.
 Before any dataset load or runner dispatch, the campaign publisher must reserve that path through

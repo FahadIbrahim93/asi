@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import importlib.metadata
 import json
 import math
 import os
 import platform
-import secrets
 import stat
 import sys
 from pathlib import Path
@@ -101,6 +102,16 @@ def frozen_plan() -> dict[str, object]:
         ),
         "matched_axes": ["seed", "observations", "updates", "example_schedule",
                          "allowed_boundary_information", "allowed_task_information"],
+        "decision_rule": {
+            "metric": "mean_online_accuracy",
+            "baseline": "bounded_fixed_cbp",
+            "candidates": ["bounded_growth", "bounded_elastic"],
+            "candidate_supported": "all five paired deltas are strictly positive",
+            "candidate_rejected": "all five paired deltas are nonpositive",
+            "campaign_supported": "at least one candidate is supported",
+            "campaign_rejected": "both candidates are rejected",
+            "otherwise": "inconclusive",
+        },
         "reviewed_execution_transition": _REVIEWED_EXECUTION_TRANSITION,
         "execution_authorized": _EXECUTION_AUTHORIZED,
         "development_only": True,
@@ -385,7 +396,51 @@ def _aggregate(rows: list[dict[str, object]]) -> dict[str, object]:
             "mean_plasticity": math.fsum(item["mean_plasticity"] for item in metrics)
             / len(metrics),
         }
-    return {"arms": arms, "row_count": len(rows)}
+    comparisons: list[dict[str, object]] = []
+    for candidate in ("bounded_growth", "bounded_elastic"):
+        deltas: list[float] = []
+        for seed in sorted({cast(int, row["seed"]) for row in rows}):
+            by_arm = {
+                cast(str, row["arm"]): cast(
+                    dict[str, float], cast(dict[str, object], row["result"])["metrics"]
+                )
+                for row in rows
+                if row["seed"] == seed
+            }
+            deltas.append(
+                by_arm[candidate]["mean_online_accuracy"]
+                - by_arm["bounded_fixed_cbp"]["mean_online_accuracy"]
+            )
+        outcome = (
+            "supported"
+            if all(delta > 0.0 for delta in deltas)
+            else "rejected"
+            if all(delta <= 0.0 for delta in deltas)
+            else "inconclusive"
+        )
+        comparisons.append(
+            {
+                "candidate": candidate,
+                "baseline": "bounded_fixed_cbp",
+                "paired_accuracy_deltas": deltas,
+                "mean_accuracy_delta": math.fsum(deltas) / len(deltas),
+                "outcome": outcome,
+            }
+        )
+    outcomes = [cast(str, comparison["outcome"]) for comparison in comparisons]
+    campaign_outcome = (
+        "supported"
+        if "supported" in outcomes
+        else "rejected"
+        if all(outcome == "rejected" for outcome in outcomes)
+        else "inconclusive"
+    )
+    return {
+        "arms": arms,
+        "primary_comparisons": comparisons,
+        "outcome": campaign_outcome,
+        "row_count": len(rows),
+    }
 
 
 def run_bounded_elastic_matched(
@@ -412,8 +467,14 @@ def _run_bounded_elastic_matched_authorized(
     )
     if expected_seeds is None or type(seeds) is not tuple or seeds != expected_seeds:
         raise RuntimeError("private bounded-elastic execution capability or seeds are invalid")
+    if _capability is _EXECUTION_CAPABILITY and (
+        _REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True
+    ):
+        raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
     checked_config = _checked_config(config)
     x, y = _validated_arrays(data_x, data_y, checked_config)
+    execution_source = _source_identity()
+    execution_runtime = _runtime_identity()
     if _capability is _EXECUTION_CAPABILITY:
         if checked_config != CAMPAIGN_CONFIG:
             raise ValueError("campaign config differs from the frozen reviewed plan")
@@ -425,6 +486,8 @@ def _run_bounded_elastic_matched_authorized(
         for arm in ARMS:
             spec = screening_spec(arm)
             arm_result = run_screening_config(x, y, spec, seed, checked_config)
+            if _source_identity() != execution_source or _runtime_identity() != execution_runtime:
+                raise RuntimeError("source or runtime changed during matched execution")
             rows.append(
                 {
                     "seed": seed,
@@ -443,8 +506,8 @@ def _run_bounded_elastic_matched_authorized(
         "arms": list(ARMS),
         "identity": {
             "dataset_sha256": _dataset_sha256(x, y),
-            "source_sha256": _source_identity(),
-            "runtime": _runtime_identity(),
+            "source_sha256": execution_source,
+            "runtime": execution_runtime,
             "consistency_not_attestation": True,
         },
         "policy": dict(_POLICY),
@@ -481,6 +544,10 @@ def _validate_bounded_elastic_matched_authorized(
     )
     if expected_seeds is None or type(seeds) is not tuple or seeds != expected_seeds:
         raise RuntimeError("private bounded-elastic validation capability or seeds are invalid")
+    if _capability is _EXECUTION_CAPABILITY and (
+        _REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True
+    ):
+        raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
     _validate_bounded_elastic_matched(
         value, data_x, data_y, config=config, seeds=seeds, reexecute=True
     )
@@ -574,6 +641,8 @@ def _validate_bounded_elastic_matched(
     if type(claimed) is not str or claimed != hashlib.sha256(_canonical(unsigned)).hexdigest():
         raise ValueError("matched result digest drifted")
     if reexecute:
+        replay_source = _source_identity()
+        replay_runtime = _runtime_identity()
         for row in rows:
             claimed_payload = cast(dict[str, object], row["result"])
             replay = run_screening_config(
@@ -583,6 +652,8 @@ def _validate_bounded_elastic_matched(
                 cast(int, row["seed"]),
                 checked_config,
             )
+            if _source_identity() != replay_source or _runtime_identity() != replay_runtime:
+                raise RuntimeError("source or runtime changed during strict reexecution")
             expected_payload = bounded_elastic_development_result_payload(
                 replay, outcome="inconclusive"
             )
@@ -635,9 +706,14 @@ def _open_output_parent(path: Path) -> int:
         raise
 
 
-def _reserve_output(path: Path) -> tuple[int, str, str, int, int]:
+OutputReservation = tuple[int, str, str, int, int, int]
+
+
+def _reserve_output(path: Path) -> OutputReservation:
     if type(path) is not type(Path()):
         raise TypeError("destination must be an exact Path")
+    if not all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_TMPFILE")):
+        raise OSError("immutable output publication requires Linux descriptor support")
     if path.absolute() != OUTPUT_PATH.absolute() or path.name in {"", ".", ".."}:
         raise ValueError(f"output must be the exact reserved NEW path {OUTPUT_PATH}")
     directory_fd = _open_output_parent(path)
@@ -669,10 +745,15 @@ def _reserve_output(path: Path) -> tuple[int, str, str, int, int]:
         os.fsync(marker_fd)
         metadata = os.fstat(marker_fd)
         marker_identity = (metadata.st_dev, metadata.st_ino)
-        os.close(marker_fd)
-        marker_fd = -1
         os.fsync(directory_fd)
-        return directory_fd, path.name, reservation_name, metadata.st_dev, metadata.st_ino
+        return (
+            directory_fd,
+            path.name,
+            reservation_name,
+            marker_fd,
+            metadata.st_dev,
+            metadata.st_ino,
+        )
     except BaseException:
         if marker_fd >= 0:
             os.close(marker_fd)
@@ -690,8 +771,21 @@ def _reserve_output(path: Path) -> tuple[int, str, str, int, int]:
         raise
 
 
-def _release_output(reservation: tuple[int, str, str, int, int]) -> None:
-    directory_fd, _name, marker_name, device, inode = reservation
+def _require_owned_reservation(reservation: OutputReservation) -> None:
+    directory_fd, _name, marker_name, marker_fd, device, inode = reservation
+    held = os.fstat(marker_fd)
+    visible = os.stat(marker_name, dir_fd=directory_fd, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(held.st_mode)
+        or held.st_nlink != 1
+        or (held.st_dev, held.st_ino) != (device, inode)
+        or (visible.st_dev, visible.st_ino) != (device, inode)
+    ):
+        raise ValueError("output reservation is not the owned visible regular marker")
+
+
+def _release_output(reservation: OutputReservation) -> None:
+    directory_fd, _name, marker_name, marker_fd, device, inode = reservation
     try:
         metadata = os.stat(marker_name, dir_fd=directory_fd, follow_symlinks=False)
         if (metadata.st_dev, metadata.st_ino) == (device, inode):
@@ -700,7 +794,19 @@ def _release_output(reservation: tuple[int, str, str, int, int]) -> None:
     except FileNotFoundError:
         pass
     finally:
+        os.close(marker_fd)
         os.close(directory_fd)
+
+
+def _link_unnamed_file(file_fd: int, directory_fd: int, name: str) -> None:
+    linkat = ctypes.CDLL(None, use_errno=True).linkat
+    linkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    linkat.restype = ctypes.c_int
+    if linkat(file_fd, b"", directory_fd, os.fsencode(name), 0x1000) != 0:
+        error_number = ctypes.get_errno()
+        if error_number == errno.EEXIST:
+            raise FileExistsError(error_number, os.strerror(error_number), name)
+        raise OSError(error_number, os.strerror(error_number), name)
 
 
 def _write_bounded_elastic_matched_authorized(
@@ -714,19 +820,24 @@ def _write_bounded_elastic_matched_authorized(
     )
     if expected_seeds is None or seeds != expected_seeds:
         raise RuntimeError("private bounded-elastic publication capability is invalid")
+    if _capability is _EXECUTION_CAPABILITY and (
+        _REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True
+    ):
+        raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
     reservation = _reserve_output(destination)
-    directory_fd, destination_name, _marker, _device, _inode = reservation
-    temporary_name = f".{destination_name}.{secrets.token_hex(16)}.tmp"
+    directory_fd, destination_name, _marker, _marker_fd, _device, _inode = reservation
     descriptor = -1
     try:
+        _require_owned_reservation(reservation)
         _validate_bounded_elastic_matched(
             value, data_x, data_y, config=config, seeds=seeds, reexecute=True
         )
+        _require_owned_reservation(reservation)
         encoded = _canonical(value) + b"\n"
         descriptor = os.open(
-            temporary_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o400,
+            ".",
+            os.O_WRONLY | os.O_TMPFILE | os.O_CLOEXEC,
+            0o600,
             dir_fd=directory_fd,
         )
         view = memoryview(encoded)
@@ -736,11 +847,15 @@ def _write_bounded_elastic_matched_authorized(
                 raise OSError("immutable output write made no progress")
             view = view[written:]
         os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
-        os.link(temporary_name, destination_name, src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd, follow_symlinks=False)
-        os.unlink(temporary_name, dir_fd=directory_fd)
+        os.fchmod(descriptor, 0o400)
+        os.fsync(descriptor)
+        _require_owned_reservation(reservation)
+        try:
+            _link_unnamed_file(descriptor, directory_fd, destination_name)
+        except FileExistsError as error:
+            raise FileExistsError(
+                "refusing to replace immutable bounded-elastic output"
+            ) from error
         os.fsync(directory_fd)
         read_fd = os.open(destination_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
                           dir_fd=directory_fd)
@@ -776,10 +891,6 @@ def _write_bounded_elastic_matched_authorized(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        try:
-            os.unlink(temporary_name, dir_fd=directory_fd)
-        except FileNotFoundError:
-            pass
         _release_output(reservation)
 
 

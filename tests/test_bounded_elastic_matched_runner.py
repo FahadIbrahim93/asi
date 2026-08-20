@@ -48,6 +48,21 @@ def test_plan_is_prospective_and_public_execution_is_hard_disabled(
     monkeypatch.setattr(runner, "run_screening_config", forbidden)
     with pytest.raises(RuntimeError, match="not authorized"):
         runner.run_bounded_elastic_matched(*_data(), config=SMALL)
+    with pytest.raises(RuntimeError, match="not authorized"):
+        runner._run_bounded_elastic_matched_authorized(
+            *_data(),
+            config=SMALL,
+            seeds=runner.CAMPAIGN_SEEDS,
+            _capability=runner._EXECUTION_CAPABILITY,
+        )
+    with pytest.raises(RuntimeError, match="not authorized"):
+        runner._validate_bounded_elastic_matched_authorized(
+            {},
+            *_data(),
+            config=SMALL,
+            seeds=runner.CAMPAIGN_SEEDS,
+            _capability=runner._EXECUTION_CAPABILITY,
+        )
     assert calls == 0
 
 
@@ -99,10 +114,37 @@ def test_campaign_runs_all_four_arms_across_frozen_seeds(monkeypatch: pytest.Mon
         (seed, arm) for seed in runner.TEST_ONLY_SEEDS for arm in runner.ARMS
     ]
     assert all(row["result"]["outcome_retained"] is True for row in result["rows"])
+    assert result["aggregate"]["outcome"] == "rejected"
+    comparisons = result["aggregate"]["primary_comparisons"]
+    assert [comparison["candidate"] for comparison in comparisons] == [
+        "bounded_growth",
+        "bounded_elastic",
+    ]
+    assert all(comparison["baseline"] == "bounded_fixed_cbp" for comparison in comparisons)
     for seed in runner.TEST_ONLY_SEEDS:
         rows = [row for row in result["rows"] if row["seed"] == seed]
         assert len({row["execution_identity"]["schedule_sha256"] for row in rows}) == 1
         assert len({row["execution_identity"]["initial_parameters_sha256"] for row in rows}) == 1
+
+
+def test_campaign_rejects_source_drift_during_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_source = runner._source_identity()
+    calls = 0
+
+    def drift_after_first_run(*args: object, **kwargs: object) -> ScreeningRunResult:
+        nonlocal calls
+        calls += 1
+        drifted = dict(original_source)
+        drifted["alberta_framework/benchmarks/ipmnist_screening.py"] = "0" * 64
+        monkeypatch.setattr(runner, "_source_identity", lambda: drifted)
+        return _fake_run(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "run_screening_config", drift_after_first_run)
+    with pytest.raises(RuntimeError, match="changed during matched execution"):
+        _run_for_test(*_data(), config=SMALL)
+    assert calls == 1
 
 
 def test_validator_rejects_identity_resource_and_roster_forgery(
@@ -195,11 +237,52 @@ def test_writer_is_create_only_and_retains_negative_outcomes(
         )
 
 
+def test_writer_rejects_replaced_visible_reservation_before_publication(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(runner, "run_screening_config", _fake_run)
+    result = _run_for_test(*_data(), config=SMALL)
+    destination = tmp_path / "bounded-elastic.json"
+    monkeypatch.setattr(runner, "OUTPUT_PATH", destination)
+    original_validate = runner._validate_bounded_elastic_matched
+
+    def replace_marker(*args: object, **kwargs: object) -> None:
+        original_validate(*args, **kwargs)
+        marker = destination.with_name(f".{destination.name}.reservation")
+        marker.unlink()
+        marker.write_text("replacement", encoding="ascii")
+
+    monkeypatch.setattr(runner, "_validate_bounded_elastic_matched", replace_marker)
+    with pytest.raises(ValueError, match="owned visible regular marker"):
+        runner._write_bounded_elastic_matched_authorized(
+            destination,
+            result,
+            *_data(),
+            config=SMALL,
+            seeds=runner.TEST_ONLY_SEEDS,
+            _capability=runner._TEST_EXECUTION_CAPABILITY,
+        )
+    assert not destination.exists()
+    marker = destination.with_name(f".{destination.name}.reservation")
+    assert marker.read_text(encoding="ascii") == "replacement"
+    marker.unlink()
+
+
 def test_public_writer_is_closed_before_creating_output(tmp_path: Path) -> None:
     destination = tmp_path / "never" / "report.json"
     with pytest.raises(RuntimeError, match="not authorized"):
         runner.write_bounded_elastic_matched(
             destination, {}, *_data(), config=SMALL
+        )
+    assert not destination.parent.exists()
+    with pytest.raises(RuntimeError, match="not authorized"):
+        runner._write_bounded_elastic_matched_authorized(
+            destination,
+            {},
+            *_data(),
+            config=SMALL,
+            seeds=runner.CAMPAIGN_SEEDS,
+            _capability=runner._EXECUTION_CAPABILITY,
         )
     assert not destination.parent.exists()
 
