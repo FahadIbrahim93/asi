@@ -124,6 +124,7 @@ def test_step1_kernel_all_public_normalizers_and_selected_endpoints_smoke(
     else:
         assert type(implementation) is expected_type
         if expected_field is not None:
+            assert implementation is not None
             assert implementation.to_config()[expected_field] == endpoint
     result = run_step1_smoke(config, steps=12, final_window=3)
     assert result.finite
