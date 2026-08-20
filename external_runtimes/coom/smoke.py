@@ -198,7 +198,8 @@ def _trusted_reward(value: object) -> float:
     # COOM's pitfall wrapper returns one exact np.float64 scalar on the fixed
     # trace; admit only that concrete provider type and Python float. Avoid
     # isinstance/coercion of arbitrary objects, which could dispatch hooks.
-    if type(value) not in (float, np.float64):
+    actual_type = type(value)
+    if actual_type is not float and actual_type is not np.float64:
         raise ValueError("COOM reward must be an exact float scalar")
     reward = float(cast(float | np.float64, value))
     if not math.isfinite(reward):
@@ -289,10 +290,18 @@ def load_receipt(path: Path) -> dict[str, object]:
             remaining -= len(chunk)
         raw = b"".join(chunks)
         after = os.fstat(descriptor)
-        stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        stable = (
+            "st_dev",
+            "st_ino",
+            "st_size",
+            "st_mtime_ns",
+            "st_ctime_ns",
+            "st_nlink",
+        )
         if (
             len(raw) != before.st_size
             or len(raw) > _MAX_RECEIPT_BYTES
+            or after.st_nlink != 1
             or any(getattr(before, field) != getattr(after, field) for field in stable)
         ):
             raise ValueError("receipt input changed while being read")
@@ -313,6 +322,8 @@ def load_receipt(path: Path) -> dict[str, object]:
 
 
 def _open_output_parent(path: Path) -> tuple[Path, int]:
+    if type(path) is not type(Path()):
+        raise ValueError("output path must be an exact concrete Path")
     destination = Path(os.path.abspath(os.fspath(path)))
     descriptor = os.open(os.path.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:

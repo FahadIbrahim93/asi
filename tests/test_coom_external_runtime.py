@@ -34,6 +34,14 @@ class _ArrayHook:
         raise AssertionError("hostile array hook ran")
 
 
+class _TypeEqualityHook(type):
+    calls = 0
+
+    def __eq__(cls, other: object) -> bool:
+        type(cls).calls += 1
+        raise AssertionError("hostile metaclass equality ran")
+
+
 def _smoke_module() -> ModuleType:
     spec = importlib.util.spec_from_file_location("coom_external_smoke_test", ROOT / "smoke.py")
     assert spec is not None and spec.loader is not None
@@ -302,6 +310,29 @@ def test_retained_receipt_loader_rejects_symlink_swap_at_open_boundary(
         smoke.load_receipt(receipt)
 
 
+def test_retained_receipt_loader_rejects_link_count_change_during_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    smoke = _smoke_module()
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text("{}", encoding="utf-8")
+    alias = tmp_path / "receipt-alias.json"
+    real_read = smoke.os.read
+    linked = False
+
+    def link_then_read(descriptor: int, count: int) -> bytes:
+        nonlocal linked
+        if not linked:
+            alias.hardlink_to(receipt)
+            linked = True
+        return real_read(descriptor, count)
+
+    monkeypatch.setattr(smoke.os, "read", link_then_read)
+    with pytest.raises(ValueError, match="changed while being read"):
+        smoke.load_receipt(receipt)
+    assert linked is True
+
+
 def test_exact_key_admission_rejects_hostile_key_without_dispatch() -> None:
     smoke = _smoke_module()
     hostile_key = _HookStr("schema")
@@ -321,6 +352,31 @@ def test_reward_admission_matches_real_coom_scalar_without_coercion() -> None:
     with pytest.raises(ValueError, match="exact float scalar"):
         smoke._trusted_reward(_ArrayHook())
     assert _ArrayHook.calls == 0
+
+    class HostileReward(metaclass=_TypeEqualityHook):
+        pass
+
+    _TypeEqualityHook.calls = 0
+    with pytest.raises(ValueError, match="exact float scalar"):
+        smoke._trusted_reward(HostileReward())
+    assert _TypeEqualityHook.calls == 0
+
+
+def test_output_path_rejects_subclass_before_filesystem_hook(tmp_path: Path) -> None:
+    smoke = _smoke_module()
+
+    class HostilePath(type(Path())):
+        calls = 0
+
+        def __fspath__(self) -> str:
+            type(self).calls += 1
+            raise AssertionError("hostile output path hook ran")
+
+    hostile = HostilePath(tmp_path / "receipt.json")
+    HostilePath.calls = 0
+    with pytest.raises(ValueError, match="exact concrete Path"):
+        smoke.preflight_new_output(hostile)
+    assert HostilePath.calls == 0
 
 
 def test_provider_observation_is_rejected_before_array_hook(
