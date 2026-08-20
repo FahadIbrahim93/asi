@@ -6,8 +6,6 @@ A cheap pointer-repeat still walks the validator; public last-fit is 4096.
 
 from __future__ import annotations
 
-import time
-
 import pytest
 
 from alberta_framework.core.history_features import (
@@ -43,24 +41,38 @@ def test_last_fit_channel_count_is_accepted() -> None:
     assert len(extractor.channels) == _MAX_HISTORY_CHANNELS
 
 
-@pytest.mark.parametrize("count", [4097, 400_000])
-def test_rejects_oversized_decay_rates_before_per_rate_walk(count: int) -> None:
-    started = time.perf_counter()
+def test_rejects_oversized_decay_rates_before_per_rate_walk() -> None:
+    calls = 0
+
+    class HostileFloat:
+        def __float__(self) -> float:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("oversized decay tuple walked an element")
+
+    hostile = HostileFloat()
     with pytest.raises(ValueError, match="at most 4096"):
-        HistoryFeatureExtractor(raw_dim=1, decay_rates=(0.5,) * count)
-    assert time.perf_counter() - started < 0.5
+        HistoryFeatureExtractor(raw_dim=1, decay_rates=(hostile,) * 4097)
+    assert calls == 0
 
 
-@pytest.mark.parametrize("count", [4097, 400_000])
-def test_rejects_oversized_channels_before_per_index_walk(count: int) -> None:
-    started = time.perf_counter()
+def test_rejects_oversized_channels_before_per_index_walk() -> None:
+    calls = 0
+
+    class HostileIndex:
+        def __index__(self) -> int:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("oversized channel tuple walked an element")
+
+    hostile = HostileIndex()
     with pytest.raises(ValueError, match="at most 4096"):
         HistoryFeatureExtractor(
             raw_dim=1,
             decay_rates=(0.5,),
-            channels=(0,) * count,
+            channels=(hostile,) * 4097,
         )
-    assert time.perf_counter() - started < 0.5
+    assert calls == 0
 
 
 @pytest.mark.parametrize(
