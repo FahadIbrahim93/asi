@@ -20,15 +20,33 @@ from alberta_framework.benchmarks.ipmnist_screening import (
 pytestmark = pytest.mark.integration
 
 
+def _control(
+    arm: str, *, seed: int, horizon: int = 512, phase_length: int = 64
+) -> dict[str, object]:
+    return lane._run_control_shard_authorized(
+        arm,
+        seed=seed,
+        horizon=horizon,
+        phase_length=phase_length,
+        _capability=lane._EXECUTION_CAPABILITY,
+    )
+
+
 def test_plan_is_fresh_prospective_and_permanently_nonpromoting() -> None:
     plan = lane.frozen_plan()
-    assert plan["seeds"] == [25610, 25611, 25612, 25613]
+    assert plan["seeds"] == [31_561_001, 31_561_002, 31_561_003, 31_561_004]
     assert plan["execution_authorized"] is False
     assert plan["scientific_promotion_allowed"] is False
     assert plan["negative_outcomes_retained"] is True
     assert plan["confidence_critical"] == 5.391949071934058
     assert plan["confidence_critical"].hex() == "0x1.5915b18f69e09p+2"
     assert plan["protocol_families"] == ["supervised_ipmnist", "td_control"]
+    assert plan["dataset"]["x"]["sha256"] == (
+        "b8078cd833f53d89828a5e28d728517be9add34076f13fe973399f1f16381313"
+    )
+    assert plan["dataset"]["y"]["sha256"] == (
+        "4f1dd9551f104f8153409e0add59f0a71568f7bad5a5f8e2274480c186fe219a"
+    )
 
 
 def test_catalog_cli_is_read_only_and_execution_stays_closed(
@@ -49,8 +67,8 @@ def test_catalog_cli_is_read_only_and_execution_stays_closed(
 def test_mechanism_off_reduces_bit_exactly_to_fixed_consumer(
     fixed: str, off: str,
 ) -> None:
-    expected = lane.run_control_shard(fixed, seed=25610, horizon=48, phase_length=12)
-    actual = lane.run_control_shard(off, seed=25610, horizon=48, phase_length=12)
+    expected = _control(fixed, seed=lane.SEEDS[0], horizon=48, phase_length=12)
+    actual = _control(off, seed=lane.SEEDS[0], horizon=48, phase_length=12)
     assert actual["arm"] == off
     assert actual["execution_arm"] == fixed
     for key in ("trajectory", "final_state", "metrics"):
@@ -64,7 +82,7 @@ def test_mechanism_off_reduces_bit_exactly_to_fixed_consumer(
 
 @pytest.mark.parametrize("arm", lane.CONTROL_ARMS)
 def test_each_control_arm_runs_end_to_end_with_exact_resources(arm: str) -> None:
-    record = lane.run_control_shard(arm, seed=25611, horizon=48, phase_length=12)
+    record = _control(arm, seed=lane.SEEDS[1], horizon=48, phase_length=12)
     assert lane.validate_control_shard(record) == record
     assert len(record["trajectory"]["rewards"]) == 48
     assert record["resources"]["environment_steps"] == 48
@@ -77,11 +95,11 @@ def test_each_control_arm_runs_end_to_end_with_exact_resources(arm: str) -> None
 
 
 def test_prediction_and_control_information_and_rng_are_explicit() -> None:
-    prediction = lane.run_control_shard(
-        "intentional_trace", seed=25612, horizon=16, phase_length=4
+    prediction = _control(
+        "intentional_trace", seed=lane.SEEDS[2], horizon=16, phase_length=4
     )
-    control = lane.run_control_shard(
-        "intentional_q_lambda", seed=25612, horizon=16, phase_length=4
+    control = _control(
+        "intentional_q_lambda", seed=lane.SEEDS[2], horizon=16, phase_length=4
     )
     assert prediction["resources"]["action_queries"] == 0
     assert prediction["resources"]["rng_fold_ins"] == 0
@@ -93,8 +111,8 @@ def test_prediction_and_control_information_and_rng_are_explicit() -> None:
 
 
 def test_validator_rejects_nested_subclasses_without_hooks() -> None:
-    record = lane.run_control_shard(
-        "intentional_trace", seed=25613, horizon=16, phase_length=4
+    record = _control(
+        "intentional_trace", seed=lane.SEEDS[3], horizon=16, phase_length=4
     )
 
     class HostileDict(dict[object, object]):
@@ -116,7 +134,7 @@ def test_validator_rejects_nested_subclasses_without_hooks() -> None:
 
 
 def test_validator_rejects_resource_result_identity_and_policy_forgery() -> None:
-    record = lane.run_control_shard("intentional_td0", seed=25610, horizon=16, phase_length=4)
+    record = _control("intentional_td0", seed=lane.SEEDS[0], horizon=16, phase_length=4)
     for path, replacement in (
         (("resources", "updates"), 15),
         (("trajectory", "rewards"), [99.0] * 16),
@@ -131,7 +149,26 @@ def test_validator_rejects_resource_result_identity_and_policy_forgery() -> None
 
 def test_campaign_execution_is_closed_before_independent_review() -> None:
     with pytest.raises(RuntimeError, match="not authorized"):
+        lane.run_control_shard("fixed_td0", seed=lane.SEEDS[0])
+    with pytest.raises(RuntimeError, match="not authorized"):
         lane.run_campaign(Path("unused.npz"), Path("unused.json"))
+
+
+def test_validator_bounds_config_before_reexecution(monkeypatch: pytest.MonkeyPatch) -> None:
+    record = _control("fixed_td0", seed=lane.SEEDS[0], horizon=16, phase_length=4)
+    hostile = copy.deepcopy(record)
+    hostile["config"]["horizon"] = 1 << 40
+    calls = 0
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("validator reexecuted before exact bounds")
+
+    monkeypatch.setattr(lane, "_run", forbidden)
+    with pytest.raises(ValueError, match="horizon"):
+        lane.validate_control_shard(hostile)
+    assert calls == 0
 
 
 def _synthetic_supervised_records() -> list[dict[str, object]]:
@@ -161,7 +198,7 @@ def _synthetic_supervised_records() -> list[dict[str, object]]:
 def complete_records() -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     supervised = _synthetic_supervised_records()
     control = [
-        lane.run_control_shard(arm, seed=seed)
+        _control(arm, seed=seed)
         for seed in lane.SEEDS
         for arm in lane.CONTROL_ARMS
     ]
@@ -252,6 +289,10 @@ def test_report_publication_is_no_replace_and_rejects_symlink_parent(
 )
 def test_control_bounds_fail_before_execution(horizon: int, phase_length: int) -> None:
     with pytest.raises(ValueError):
-        lane.run_control_shard(
-            "fixed_td0", seed=25610, horizon=horizon, phase_length=phase_length
+        lane._run_control_shard_authorized(
+            "fixed_td0",
+            seed=lane.SEEDS[0],
+            horizon=horizon,
+            phase_length=phase_length,
+            _capability=lane._EXECUTION_CAPABILITY,
         )
