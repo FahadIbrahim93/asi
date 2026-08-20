@@ -76,13 +76,15 @@ strict dataset-bound reexecution raises an ordinary `Exception`. The dataset is
 loaded once, and the same validated arrays feed the initial execution and
 strict reexecution immediately before completed-shard publication. The
 publisher does not accept caller-asserted replay evidence. A successfully
-published receipt returns nonzero and retains no exception type, message, or
-representation,
-cannot enter aggregation, and forbids retry in this namespace. `BaseException`,
-completed-result publication failures, and failure to build or publish the
-failure receipt after the first learner dispatch retain the inode-owned
-reservation as a durable `consumed-without-result` tombstone, so the roster
-cannot be retried in this namespace. Pre-dispatch failures release the
-reservation. Process death remains outside this retention boundary. Source,
+published receipt returns nonzero, retains no exception type, message, or
+representation, cannot enter aggregation, and forbids retry in this namespace.
+After the first learner dispatch, the runner attempts to convert its inode-owned
+reservation into a `consumed-without-result` tombstone when a `BaseException`,
+completed-result publication failure, or failure-receipt publication failure
+escapes. A retained tombstone prevents retry in this namespace. Tombstone I/O
+failure, another asynchronous interruption during that conversion, and process
+death remain outside this retention boundary. A pre-dispatch failure that
+escapes without a published failed-attempt receipt releases the reservation.
+Source,
 runtime, dependency, process, dataset, resource, and telemetry digests are
 consistency bindings, not authenticated execution attestation.

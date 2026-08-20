@@ -92,10 +92,10 @@ _POLICY: Final = {
     "paper_comparable": False,
     "completed_outcomes_retained": True,
     "ordinary_exception_failure_receipts_enabled": True,
-    "post_dispatch_consumed_without_result_tombstone": True,
-    "pre_dispatch_reservation_released_on_failure": True,
+    "post_dispatch_consumed_without_result_tombstone_enabled": True,
+    "pre_dispatch_escaped_failure_reservation_released": True,
     "failure_receipt_publication_guaranteed": False,
-    "post_dispatch_base_exception_tombstone_retained": True,
+    "post_dispatch_tombstone_retention_guaranteed": False,
     "process_death_tombstone_retention_guaranteed": False,
     "seed_status": "frozen_exposed_consumed_for_promotion",
 }
