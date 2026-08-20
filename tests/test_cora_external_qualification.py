@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 import alberta_framework.benchmarks.cora_external_qualification as cora_external_module
+import alberta_framework.benchmarks.qualification_provenance as provenance_module
 from alberta_framework.benchmarks.cora_external_qualification import (
     CORA_COMMIT,
     PROCGEN_TASKS,
@@ -23,12 +24,44 @@ from alberta_framework.benchmarks.cora_external_qualification import (
     qualification_blocker_manifest,
     validate_smoke_payload,
 )
+from alberta_framework.benchmarks.qualification_provenance import (
+    identity_from_payload,
+    preflight_qualification_tree,
+)
 
 pytestmark = pytest.mark.unit
 
 
 def _sha(character: str) -> str:
     return character * 64
+
+
+class _HookStr(str):
+    calls = 0
+
+    def __hash__(self) -> int:
+        type(self).calls += 1
+        return super().__hash__()
+
+    def __eq__(self, other: object) -> bool:
+        type(self).calls += 1
+        return super().__eq__(other)
+
+
+class _HookMapping(dict[object, object]):
+    calls = 0
+
+    def __iter__(self):  # type: ignore[no-untyped-def]
+        type(self).calls += 1
+        raise AssertionError("hostile mapping iteration ran")
+
+    def items(self):  # type: ignore[no-untyped-def]
+        type(self).calls += 1
+        raise AssertionError("hostile mapping items ran")
+
+    def keys(self):  # type: ignore[no-untyped-def]
+        type(self).calls += 1
+        raise AssertionError("hostile mapping keys ran")
 
 
 @pytest.fixture
@@ -322,7 +355,7 @@ def test_payload_preflight_rejects_aliases_and_oversize_before_reconstruction(
     shared: list[object] = []
     payload["aliased"] = shared
     payload["also_aliased"] = shared
-    with pytest.raises(ValueError, match="fields differ|aliases"):
+    with pytest.raises(ValueError, match="fields differ|alias"):
         validate_smoke_payload(payload)
 
     oversized = receipt.payload()
@@ -331,6 +364,51 @@ def test_payload_preflight_rejects_aliases_and_oversize_before_reconstruction(
     runtime_identity.append(["x", "y" * (1 << 20)])
     with pytest.raises(ValueError, match="limit|ceiling"):
         validate_smoke_payload(oversized)
+
+
+def test_provenance_preflight_rejects_mapping_subclass_before_hooks() -> None:
+    hostile = _HookMapping({"value": 1})
+    _HookMapping.calls = 0
+    with pytest.raises(ValueError, match="exact primitive"):
+        provenance_module._registry_sha256(hostile)
+    assert _HookMapping.calls == 0
+
+
+def test_identity_and_receipt_keys_reject_str_subclass_before_hooks(
+    plan: CORAProcgenSmokePlan,
+) -> None:
+    receipt = _trace(plan)
+    identity = receipt.identity.to_payload()
+    lane_hash = identity.pop("lane_source_sha256")
+    hostile_identity = {_HookStr("lane_source_sha256"): lane_hash, **identity}
+    _HookStr.calls = 0
+    with pytest.raises(ValueError, match="keys must be exact strings"):
+        identity_from_payload(hostile_identity)
+    assert _HookStr.calls == 0
+
+    payload = receipt.payload()
+    schema = payload.pop("schema")
+    hostile_receipt = {_HookStr("schema"): schema, **payload}
+    _HookStr.calls = 0
+    with pytest.raises(ValueError, match="keys must be exact strings"):
+        validate_smoke_payload(hostile_receipt)
+    assert _HookStr.calls == 0
+
+
+def test_provenance_preflight_bounds_deep_wide_text_integer_and_finite_values() -> None:
+    deep: object = 0
+    for _ in range(66):
+        deep = [deep]
+    with pytest.raises(ValueError, match="depth"):
+        preflight_qualification_tree(deep)
+    with pytest.raises(ValueError, match="item limit"):
+        preflight_qualification_tree([0] * 10_001)
+    with pytest.raises(ValueError, match="UTF-8"):
+        preflight_qualification_tree("x" * ((1 << 20) + 1))
+    with pytest.raises(ValueError, match="signed 64-bit"):
+        preflight_qualification_tree(1 << 64)
+    with pytest.raises(ValueError, match="non-finite"):
+        preflight_qualification_tree(float("inf"))
 
 
 @pytest.mark.parametrize(

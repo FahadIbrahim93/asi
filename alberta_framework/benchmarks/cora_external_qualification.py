@@ -23,7 +23,9 @@ import alberta_framework.benchmarks.external_qualification as external_qualifica
 from alberta_framework.benchmarks.qualification_provenance import (
     QualificationIdentity,
     collect_qualification_identity,
+    exact_qualification_object,
     identity_from_payload,
+    preflight_qualification_tree,
     require_current_identity,
 )
 
@@ -285,60 +287,7 @@ def _git_object(value: object, *, name: str) -> str:
 
 
 def _preflight_json_tree(value: object) -> None:
-    stack: list[tuple[object, int]] = [(value, 0)]
-    seen_containers: set[int] = set()
-    nodes = 0
-    conservative_bytes = 0
-    while stack:
-        item, depth = stack.pop()
-        nodes += 1
-        if nodes > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
-            raise ValueError("payload exceeds its JSON node or depth limit")
-        if item is None or type(item) is bool:
-            conservative_bytes += 5
-        elif type(item) is int:
-            if not -(1 << 63) <= item <= (1 << 63) - 1:
-                raise ValueError("payload integers must be signed 64-bit values")
-            conservative_bytes += 21
-        elif type(item) is float:
-            if not math.isfinite(item):
-                raise ValueError("payload must contain only finite floats")
-            conservative_bytes += 32
-        elif type(item) is str:
-            encoded = len(item.encode("utf-8"))
-            if len(item) > _MAX_JSON_STRING_BYTES or encoded > _MAX_JSON_STRING_BYTES:
-                raise ValueError("payload string exceeds its limit")
-            conservative_bytes += 2 + 12 * len(item)
-        elif type(item) is list:
-            identity = id(item)
-            if identity in seen_containers:
-                raise ValueError("payload cannot contain cycles or aliases")
-            seen_containers.add(identity)
-            if len(item) > _MAX_JSON_CONTAINER_ITEMS:
-                raise ValueError("payload list exceeds its item limit")
-            conservative_bytes += len(item) + 2
-            stack.extend((child, depth + 1) for child in item)
-        elif type(item) is dict:
-            identity = id(item)
-            if identity in seen_containers:
-                raise ValueError("payload cannot contain cycles or aliases")
-            seen_containers.add(identity)
-            if len(item) > _MAX_JSON_CONTAINER_ITEMS:
-                raise ValueError("payload object exceeds its item limit")
-            conservative_bytes += len(item) + 2
-            for key, child in item.items():
-                if type(key) is not str:
-                    raise ValueError("payload object keys must be exact strings")
-                encoded = len(key.encode("utf-8"))
-                if len(key) > _MAX_JSON_STRING_BYTES or encoded > _MAX_JSON_STRING_BYTES:
-                    raise ValueError("payload object key exceeds its limit")
-                nodes += 1
-                conservative_bytes += 3 + 12 * len(key)
-                stack.append((child, depth + 1))
-        else:
-            raise ValueError("payload must use exact primitive JSON values")
-        if conservative_bytes > _MAX_JSON_BYTES:
-            raise ValueError("payload exceeds the one-MiB receipt ceiling")
+    preflight_qualification_tree(value)
 
 
 def _canonical(value: object) -> bytes:
@@ -781,10 +730,8 @@ def build_smoke_receipt(
 
 
 def _source_from_payload(value: object) -> SourceIdentity:
-    expected = {field.name for field in dataclasses.fields(SourceIdentity)}
-    if type(value) is not dict or set(value) != expected:
-        raise ValueError("source identity fields differ from the schema")
-    raw = dict(value)
+    expected = tuple(field.name for field in dataclasses.fields(SourceIdentity))
+    raw = dict(exact_qualification_object(value, expected, name="source identity"))
     entries = raw["required_file_sha256"]
     if type(entries) is not list or any(
         type(item) is not list
@@ -795,11 +742,11 @@ def _source_from_payload(value: object) -> SourceIdentity:
     ):
         raise ValueError("required file manifest payload must contain exact string pairs")
     raw["required_file_sha256"] = tuple((item[0], item[1]) for item in entries)
-    return SourceIdentity(**raw)
+    return SourceIdentity(**cast(dict[str, Any], raw))
 
 
 def _plan_from_payload(value: object) -> CORAProcgenSmokePlan:
-    expected = {
+    expected = (
         "qualification_issue",
         "qualification_lane_id",
         "paper_revision",
@@ -830,10 +777,8 @@ def _plan_from_payload(value: object) -> CORAProcgenSmokePlan:
         "development_only",
         "scientific_promotion_allowed",
         "cora_parity_claimed",
-    }
-    if type(value) is not dict or set(value) != expected:
-        raise ValueError("plan payload fields differ from the schema")
-    raw = dict(value)
+    )
+    raw = dict(exact_qualification_object(value, expected, name="plan payload"))
     plan = CORAProcgenSmokePlan(
         source=_source_from_payload(raw["source"]),
         runtime=_runtime_from_payload(raw["runtime"]),
@@ -846,29 +791,25 @@ def _plan_from_payload(value: object) -> CORAProcgenSmokePlan:
 
 
 def _runtime_from_payload(value: object) -> IsolatedRuntimeIdentity:
-    expected = {field.name for field in dataclasses.fields(IsolatedRuntimeIdentity)}
-    if type(value) is not dict or set(value) != expected:
-        raise ValueError("runtime identity fields differ from the schema")
-    return IsolatedRuntimeIdentity(**cast(dict[str, Any], value))
+    expected = tuple(field.name for field in dataclasses.fields(IsolatedRuntimeIdentity))
+    admitted = exact_qualification_object(value, expected, name="runtime identity")
+    return IsolatedRuntimeIdentity(**cast(dict[str, Any], admitted))
 
 
 def _assets_from_payload(value: object) -> AssetIdentity:
-    expected = {field.name for field in dataclasses.fields(AssetIdentity)}
-    if type(value) is not dict or set(value) != expected:
-        raise ValueError("assets identity fields differ from the schema")
-    return AssetIdentity(**cast(dict[str, Any], value))
+    expected = tuple(field.name for field in dataclasses.fields(AssetIdentity))
+    admitted = exact_qualification_object(value, expected, name="assets identity")
+    return AssetIdentity(**cast(dict[str, Any], admitted))
 
 
 def validate_smoke_payload(value: object) -> CORAProcgenSmokeReceipt:
     """Strictly reconstruct a primitive receipt and bind it to the current tree."""
     _preflight_json_tree(value)
-    expected = {field.name for field in dataclasses.fields(CORAProcgenSmokeReceipt)}
-    if type(value) is not dict or set(value) != expected:
-        raise ValueError("CORA Procgen receipt fields differ from the schema")
-    raw = dict(value)
+    expected = tuple(field.name for field in dataclasses.fields(CORAProcgenSmokeReceipt))
+    raw = dict(exact_qualification_object(value, expected, name="CORA Procgen receipt"))
     raw["plan"] = _plan_from_payload(raw["plan"])
     raw["identity"] = identity_from_payload(raw["identity"])
-    receipt = CORAProcgenSmokeReceipt(**raw)
+    receipt = CORAProcgenSmokeReceipt(**cast(dict[str, Any], raw))
     receipt.__post_init__()
     return receipt
 

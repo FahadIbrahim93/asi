@@ -6,34 +6,121 @@ import dataclasses
 import hashlib
 import inspect
 import json
+import math
 import platform
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from pathlib import Path
 from types import ModuleType
-from typing import cast
+from typing import Any, cast
 
 import jax
 import numpy as np
+
+_MAX_TREE_DEPTH = 64
+_MAX_TREE_NODES = 50_000
+_MAX_CONTAINER_ITEMS = 10_000
+_MAX_CUMULATIVE_UTF8_BYTES = 1 << 20
+_MIN_INTEGER = -(1 << 63)
+_MAX_INTEGER = (1 << 63) - 1
 
 
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def _canonical(value: object) -> object:
-    if isinstance(value, Mapping):
-        return {key: _canonical(item) for key, item in sorted(value.items())}
+def preflight_qualification_tree(value: object) -> None:
+    """Admit one bounded exact primitive tree without dispatching subclass hooks."""
+
+    stack: list[tuple[object, int]] = [(value, 0)]
+    seen_containers: set[int] = set()
+    nodes = 0
+    utf8_bytes = 0
+    while stack:
+        item, depth = stack.pop()
+        nodes += 1
+        if nodes > _MAX_TREE_NODES or depth > _MAX_TREE_DEPTH:
+            raise ValueError("qualification tree exceeds its node or depth limit")
+        actual_type = type(item)
+        if item is None or actual_type is bool:
+            continue
+        if actual_type is int:
+            if not _MIN_INTEGER <= cast(int, item) <= _MAX_INTEGER:
+                raise ValueError("qualification tree integer lies outside signed 64-bit bounds")
+            continue
+        if actual_type is float:
+            if not math.isfinite(cast(float, item)):
+                raise ValueError("qualification tree contains a non-finite float")
+            continue
+        if actual_type is str:
+            utf8_bytes += len(cast(str, item).encode("utf-8", errors="strict"))
+        elif actual_type is dict:
+            identity = id(item)
+            if identity in seen_containers:
+                raise ValueError("qualification tree contains a cycle or container alias")
+            seen_containers.add(identity)
+            mapping = cast(dict[object, object], item)
+            keys = tuple(mapping.keys())
+            if len(keys) > _MAX_CONTAINER_ITEMS:
+                raise ValueError("qualification object exceeds its item limit")
+            if any(type(key) is not str for key in keys):
+                raise ValueError("qualification object keys must be exact strings")
+            nodes += len(keys)
+            if nodes > _MAX_TREE_NODES:
+                raise ValueError("qualification tree exceeds its node or depth limit")
+            for key in cast(tuple[str, ...], keys):
+                utf8_bytes += len(key.encode("utf-8", errors="strict"))
+                stack.append((mapping[key], depth + 1))
+        elif actual_type is list or actual_type is tuple:
+            if actual_type is list:
+                identity = id(item)
+                if identity in seen_containers:
+                    raise ValueError("qualification tree contains a cycle or container alias")
+                seen_containers.add(identity)
+            sequence = cast(Sequence[object], item)
+            if len(sequence) > _MAX_CONTAINER_ITEMS:
+                raise ValueError("qualification sequence exceeds its item limit")
+            stack.extend((child, depth + 1) for child in sequence)
+        else:
+            raise ValueError("qualification tree must use exact primitive containers and scalars")
+        if utf8_bytes > _MAX_CUMULATIVE_UTF8_BYTES:
+            raise ValueError("qualification tree exceeds its cumulative UTF-8 limit")
+
+
+def exact_qualification_object(
+    value: object, expected: Sequence[str], *, name: str
+) -> dict[str, object]:
+    """Require exact string keys before any hash-based schema comparison."""
+
+    if type(value) is not dict:
+        raise ValueError(f"{name} fields differ from the schema")
+    mapping = cast(dict[object, object], value)
+    keys = tuple(mapping.keys())
+    expected_keys = tuple(expected)
+    if any(type(key) is not str for key in keys) or any(
+        type(key) is not str for key in expected_keys
+    ):
+        raise ValueError(f"{name} keys must be exact strings")
+    if len(keys) != len(expected_keys) or frozenset(keys) != frozenset(expected_keys):
+        raise ValueError(f"{name} fields differ from the schema")
+    return cast(dict[str, object], value)
+
+
+def _canonical_admitted(value: object) -> object:
+    if type(value) is dict:
+        mapping = cast(dict[str, object], value)
+        return {key: _canonical_admitted(mapping[key]) for key in sorted(mapping)}
     if type(value) in (tuple, list):
-        return [_canonical(item) for item in cast(Sequence[object], value)]
+        return [_canonical_admitted(item) for item in cast(Sequence[object], value)]
     if type(value) in (str, int, float, bool) or value is None:
         return value
-    raise TypeError(f"unsupported registry value: {type(value).__name__}")
+    raise AssertionError("preflight admitted an unsupported qualification value")
 
 
 def _registry_sha256(value: object) -> str:
+    preflight_qualification_tree(value)
     raw = json.dumps(
-        _canonical(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        _canonical_admitted(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True
     ).encode("ascii")
     return _sha256_bytes(raw)
 
@@ -73,6 +160,7 @@ class QualificationIdentity:
             ("runtime_identity", self.runtime_identity, False),
             ("dependency_versions", self.dependency_versions, False),
         ):
+            preflight_qualification_tree(entries)
             if type(entries) is not tuple or not entries:
                 raise ValueError(f"{name} must be a nonempty exact tuple")
             keys: list[str] = []
@@ -138,10 +226,11 @@ def collect_qualification_identity(
 
 
 def identity_from_payload(value: object) -> QualificationIdentity:
-    expected = {field.name for field in dataclasses.fields(QualificationIdentity)}
-    if type(value) is not dict or set(value) != expected:
-        raise ValueError("identity payload differs from the schema")
-    raw = dict(value)
+    preflight_qualification_tree(value)
+    expected = tuple(field.name for field in dataclasses.fields(QualificationIdentity))
+    raw = cast(
+        dict[str, Any], dict(exact_qualification_object(value, expected, name="identity payload"))
+    )
     for name in ("dependency_source_sha256", "runtime_identity", "dependency_versions"):
         entries = raw[name]
         if type(entries) is not list or any(
@@ -166,6 +255,8 @@ def require_current_identity(
 __all__ = [
     "QualificationIdentity",
     "collect_qualification_identity",
+    "exact_qualification_object",
     "identity_from_payload",
+    "preflight_qualification_tree",
     "require_current_identity",
 ]
