@@ -772,16 +772,16 @@ def test_full_evaluation_finalizes_stage_specific_unresolved_content(
     # changes deterministically when the qualified helper bytes change.
     golden_final_sha256 = {
         "execution-receipt-index.json": (
-            "39642af77c69525d6f669c94648d15d57d54b51f17ef0145e0efad672ea781fd"
+            "b174f3098d9afa82946f2052b9a0440424b0f2b759af43f153feefbceafedade"
         ),
         "score-evidence.json": (
-            "41d0fbbdb00e63745d0dc1415529147f843b0dc04d81bf1e7ac956b3269613e3"
+            "189b6e407d9525b15f57f0b68eded6604a020f9cee159541847c0c8642b0e2b0"
         ),
         "verification-request.json": (
-            "b7c092fba2bb4b5cbb6b74440f8a6e31860ed649e12365437a912e18f14dae9c"
+            "182b70f579727c074e34e2068e5bd733cf627bce39cbccb428cade9c70cff984"
         ),
         "completion-summary.json": (
-            "a3e52dfcef4982579b44444ed71934257cff7f94adf1f17d7669bae69e87237f"
+            "db3bfa1971b69a6a8301ee8a304eaa313d54ec154be23bcfb81ead54a946aa48"
         ),
     }
     for name, expected_sha256 in golden_final_sha256.items():
