@@ -268,6 +268,38 @@ def test_writer_rejects_replaced_visible_reservation_before_publication(
     marker.unlink()
 
 
+def test_writer_parent_swap_does_not_publish_through_replacement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(runner, "run_screening_config", _fake_run)
+    result = _run_for_test(*_data(), config=SMALL)
+    requested = tmp_path / "requested"
+    destination = requested / "bounded-elastic.json"
+    retired = tmp_path / "retired"
+    competitor = b"replacement-directory"
+    monkeypatch.setattr(runner, "OUTPUT_PATH", destination)
+    original_link = runner._link_unnamed_file
+
+    def swap_parent(file_fd: int, directory_fd: int, name: str) -> None:
+        requested.rename(retired)
+        requested.mkdir()
+        destination.write_bytes(competitor)
+        original_link(file_fd, directory_fd, name)
+
+    monkeypatch.setattr(runner, "_link_unnamed_file", swap_parent)
+    with pytest.raises(RuntimeError, match="parent changed"):
+        runner._write_bounded_elastic_matched_authorized(
+            destination,
+            result,
+            *_data(),
+            config=SMALL,
+            seeds=runner.TEST_ONLY_SEEDS,
+            _capability=runner._TEST_EXECUTION_CAPABILITY,
+        )
+    assert destination.read_bytes() == competitor
+    assert not (retired / destination.name).exists()
+
+
 def test_public_writer_is_closed_before_creating_output(tmp_path: Path) -> None:
     destination = tmp_path / "never" / "report.json"
     with pytest.raises(RuntimeError, match="not authorized"):

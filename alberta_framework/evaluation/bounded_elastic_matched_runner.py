@@ -706,6 +706,17 @@ def _open_output_parent(path: Path) -> int:
         raise
 
 
+def _require_live_output_parent(path: Path, directory_fd: int) -> None:
+    held = os.fstat(directory_fd)
+    visible = os.stat(path.parent, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(held.st_mode)
+        or not stat.S_ISDIR(visible.st_mode)
+        or (held.st_dev, held.st_ino) != (visible.st_dev, visible.st_ino)
+    ):
+        raise RuntimeError("bounded-elastic output parent changed during publication")
+
+
 OutputReservation = tuple[int, str, str, int, int, int]
 
 
@@ -746,6 +757,7 @@ def _reserve_output(path: Path) -> OutputReservation:
         metadata = os.fstat(marker_fd)
         marker_identity = (metadata.st_dev, metadata.st_ino)
         os.fsync(directory_fd)
+        _require_live_output_parent(path, directory_fd)
         return (
             directory_fd,
             path.name,
@@ -827,7 +839,9 @@ def _write_bounded_elastic_matched_authorized(
     reservation = _reserve_output(destination)
     directory_fd, destination_name, _marker, _marker_fd, _device, _inode = reservation
     descriptor = -1
+    published_identity: tuple[int, int] | None = None
     try:
+        _require_live_output_parent(destination, directory_fd)
         _require_owned_reservation(reservation)
         _validate_bounded_elastic_matched(
             value, data_x, data_y, config=config, seeds=seeds, reexecute=True
@@ -849,6 +863,7 @@ def _write_bounded_elastic_matched_authorized(
         os.fsync(descriptor)
         os.fchmod(descriptor, 0o400)
         os.fsync(descriptor)
+        _require_live_output_parent(destination, directory_fd)
         _require_owned_reservation(reservation)
         try:
             _link_unnamed_file(descriptor, directory_fd, destination_name)
@@ -856,6 +871,8 @@ def _write_bounded_elastic_matched_authorized(
             raise FileExistsError(
                 "refusing to replace immutable bounded-elastic output"
             ) from error
+        prepared = os.fstat(descriptor)
+        published_identity = (prepared.st_dev, prepared.st_ino)
         os.fsync(directory_fd)
         read_fd = os.open(destination_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
                           dir_fd=directory_fd)
@@ -888,6 +905,21 @@ def _write_bounded_elastic_matched_authorized(
             )
         finally:
             os.close(read_fd)
+        _require_live_output_parent(destination, directory_fd)
+    except BaseException:
+        if published_identity is not None:
+            try:
+                visible = os.stat(
+                    destination_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if (visible.st_dev, visible.st_ino) == published_identity:
+                    os.unlink(destination_name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+            except FileNotFoundError:
+                pass
+        raise
     finally:
         if descriptor >= 0:
             os.close(descriptor)
