@@ -210,7 +210,7 @@ class TestStackedHordeScanBounds:
         with pytest.raises(TypeError, match="horde must be an exact StackedLinearHorde"):
             run_stacked_horde_scan("not_a_horde", state, features, sources)  # type: ignore[arg-type]
 
-        with pytest.raises(TypeError, match="state must be an actual StackedHordeState"):
+        with pytest.raises(TypeError, match="state must be an exact StackedHordeState"):
             run_stacked_horde_scan(horde, "not_a_state", features, sources)  # type: ignore[arg-type]
 
     def test_run_stacked_horde_scan_rejects_untrusted_arrays(self) -> None:

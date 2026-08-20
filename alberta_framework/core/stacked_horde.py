@@ -690,7 +690,7 @@ def run_stacked_horde_scan(
     if type(horde) is not StackedLinearHorde:
         raise TypeError("horde must be an exact StackedLinearHorde")
     if type(state) is not StackedHordeState:
-        raise TypeError("state must be an actual StackedHordeState")
+        raise TypeError("state must be an exact StackedHordeState")
 
     if not _has_trusted_array_type(features):
         raise TypeError("features must be a trusted array")
