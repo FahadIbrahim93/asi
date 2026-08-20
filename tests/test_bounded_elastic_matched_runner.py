@@ -38,8 +38,9 @@ def test_plan_is_prospective_and_public_execution_is_hard_disabled(
     assert plan["seeds"] == [51_562_001, 51_562_002, 51_562_003, 51_562_004, 51_562_005]
     assert plan["reviewed_execution_transition"] is False
     assert plan["execution_authorized"] is False
-    assert plan["atomic_execution_and_publication"] is True
-    assert plan["execution_failure_receipts_retained"] is True
+    assert plan["reservation_precedes_execution_and_publication"] is True
+    assert plan["pre_dispatch_failure_receipts_retained"] is False
+    assert plan["post_dispatch_failure_tombstone_retained"] is True
     assert plan["post_start_retry_prevention"] is True
     monkeypatch.setattr(runner, "_REVIEWED_EXECUTION_TRANSITION", True)
     monkeypatch.setattr(runner, "_EXECUTION_AUTHORIZED", True)
@@ -228,7 +229,6 @@ def test_writer_is_create_only_and_retains_negative_outcomes(
     monkeypatch.setattr(runner, "run_screening_config", _fake_run)
     result = _run_for_test(*_data(), config=SMALL)
     destination = tmp_path / "bounded-elastic.json"
-    monkeypatch.setattr(runner, "OUTPUT_PATH", destination)
     runner._write_bounded_elastic_matched_authorized(
         destination, result, *_data(), config=SMALL, seeds=runner.TEST_ONLY_SEEDS,
         _capability=runner._TEST_EXECUTION_CAPABILITY,
@@ -251,7 +251,6 @@ def test_writer_rejects_replaced_visible_reservation_before_publication(
     monkeypatch.setattr(runner, "run_screening_config", _fake_run)
     result = _run_for_test(*_data(), config=SMALL)
     destination = tmp_path / "bounded-elastic.json"
-    monkeypatch.setattr(runner, "OUTPUT_PATH", destination)
     original_validate = runner._validate_bounded_elastic_matched
 
     def replace_marker(*args: object, **kwargs: object) -> None:
@@ -285,7 +284,6 @@ def test_writer_parent_swap_does_not_publish_through_replacement(
     destination = requested / "bounded-elastic.json"
     retired = tmp_path / "retired"
     competitor = b"replacement-directory"
-    monkeypatch.setattr(runner, "OUTPUT_PATH", destination)
     original_link = runner._link_unnamed_file
 
     def swap_parent(file_fd: int, directory_fd: int, name: str) -> None:
@@ -316,6 +314,21 @@ def test_public_writer_is_closed_before_creating_output(tmp_path: Path) -> None:
         )
     with pytest.raises(RuntimeError, match="reservation-first transaction"):
         runner._write_bounded_elastic_matched_authorized(
+            destination,
+            {},
+            *_data(),
+            config=SMALL,
+            seeds=runner.CAMPAIGN_SEEDS,
+            _capability=runner._EXECUTION_CAPABILITY,
+        )
+    with pytest.raises(RuntimeError, match="not authorized"):
+        runner._reserve_output(
+            destination,
+            _capability=runner._EXECUTION_CAPABILITY,
+        )
+    with pytest.raises(RuntimeError, match="not authorized"):
+        runner._publish_bounded_elastic_matched_reserved(
+            (-1, "unused", "unused", -1, -1, -1),
             destination,
             {},
             *_data(),
@@ -363,7 +376,6 @@ def test_transaction_reserves_before_dataset_load_or_runner(
         calls += 1
         raise AssertionError("consumer work preceded reservation")
 
-    monkeypatch.setattr(runner, "OUTPUT_PATH", destination)
     monkeypatch.setattr(runner, "load_mnist_train", forbidden)
     monkeypatch.setattr(runner, "run_screening_config", forbidden)
     with pytest.raises(FileExistsError):
@@ -390,7 +402,6 @@ def test_transaction_retains_owned_tombstone_after_first_dispatch_failure(
         calls += 1
         raise RuntimeError("injected consumer failure")
 
-    monkeypatch.setattr(runner, "OUTPUT_PATH", destination)
     monkeypatch.setattr(runner, "load_mnist_train", lambda _home: (x, y))
     monkeypatch.setattr(runner, "run_screening_config", fail_after_dispatch)
     with pytest.raises(RuntimeError, match="injected consumer failure"):
@@ -427,7 +438,6 @@ def test_transaction_publishes_only_after_strict_reexecution(
         calls += 1
         return _fake_run(*args, **kwargs)
 
-    monkeypatch.setattr(runner, "OUTPUT_PATH", destination)
     monkeypatch.setattr(runner, "load_mnist_train", lambda _home: (x, y))
     monkeypatch.setattr(runner, "run_screening_config", counted_run)
     report = runner._run_and_publish_bounded_elastic_matched_authorized(

@@ -54,8 +54,9 @@ _POLICY: Final = {
     "scientific_promotion_allowed": False,
     "sota_claim_allowed": False,
     "completed_outcomes_retained_in_result": True,
-    "atomic_execution_and_publication": True,
-    "execution_failure_receipts_retained": True,
+    "reservation_precedes_execution_and_publication": True,
+    "pre_dispatch_failure_receipts_retained": False,
+    "post_dispatch_failure_tombstone_retained": True,
     "post_start_retry_prevention": True,
 }
 _MAX_STEPS: Final = 2_000_000
@@ -124,8 +125,9 @@ def frozen_plan() -> dict[str, object]:
         "development_only": True,
         "scientific_promotion_allowed": False,
         "completed_outcomes_retained_in_result": True,
-        "atomic_execution_and_publication": True,
-        "execution_failure_receipts_retained": True,
+        "reservation_precedes_execution_and_publication": True,
+        "pre_dispatch_failure_receipts_retained": False,
+        "post_dispatch_failure_tombstone_retained": True,
         "post_start_retry_prevention": True,
         "output_path": "outputs/bounded_elastic_matched_development/report.v1.json",
     }
@@ -727,12 +729,21 @@ def _require_live_output_parent(path: Path, directory_fd: int) -> None:
 OutputReservation = tuple[int, str, str, int, int, int]
 
 
-def _reserve_output(path: Path) -> OutputReservation:
+def _reserve_output(path: Path, *, _capability: object) -> OutputReservation:
+    if _capability is _EXECUTION_CAPABILITY:
+        if _REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True:
+            raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
+    elif _capability is not _TEST_EXECUTION_CAPABILITY:
+        raise RuntimeError("private bounded-elastic reservation capability is invalid")
     if type(path) is not type(Path()):
         raise TypeError("destination must be an exact Path")
     if not all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_TMPFILE")):
         raise OSError("immutable output publication requires Linux descriptor support")
-    if path.absolute() != OUTPUT_PATH.absolute() or path.name in {"", ".", ".."}:
+    if (
+        path.name in {"", ".", ".."}
+        or (_capability is _EXECUTION_CAPABILITY and path.absolute() != OUTPUT_PATH.absolute())
+        or (_capability is _TEST_EXECUTION_CAPABILITY and path.absolute() == OUTPUT_PATH.absolute())
+    ):
         raise ValueError(f"output must be the exact reserved NEW path {OUTPUT_PATH}")
     directory_fd = _open_output_parent(path)
     reservation_name = f".{path.name}.reservation"
@@ -861,7 +872,7 @@ def _write_bounded_elastic_matched_authorized(
         )
     if type(seeds) is not tuple or seeds != TEST_ONLY_SEEDS:
         raise RuntimeError("private bounded-elastic publication capability is invalid")
-    reservation = _reserve_output(destination)
+    reservation = _reserve_output(destination, _capability=_capability)
     try:
         _publish_bounded_elastic_matched_reserved(
             reservation,
@@ -871,6 +882,7 @@ def _write_bounded_elastic_matched_authorized(
             data_y,
             config=config,
             seeds=seeds,
+            _capability=_capability,
         )
     finally:
         _release_output(reservation)
@@ -885,15 +897,19 @@ def _publish_bounded_elastic_matched_reserved(
     *,
     config: IPMNISTConfig,
     seeds: tuple[int, ...],
+    _capability: object,
 ) -> None:
-    if type(seeds) is not tuple:
+    if _capability is _EXECUTION_CAPABILITY:
+        if _REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True:
+            raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
+    elif _capability is not _TEST_EXECUTION_CAPABILITY:
         raise RuntimeError("private bounded-elastic publication capability is invalid")
     expected_seeds = (
-        CAMPAIGN_SEEDS if seeds == CAMPAIGN_SEEDS
-        else TEST_ONLY_SEEDS if seeds == TEST_ONLY_SEEDS
+        CAMPAIGN_SEEDS if _capability is _EXECUTION_CAPABILITY
+        else TEST_ONLY_SEEDS if _capability is _TEST_EXECUTION_CAPABILITY
         else None
     )
-    if expected_seeds is None:
+    if expected_seeds is None or type(seeds) is not tuple or seeds != expected_seeds:
         raise RuntimeError("private bounded-elastic publication capability is invalid")
     directory_fd, destination_name, _marker, _marker_fd, _device, _inode = reservation
     descriptor = -1
@@ -1023,7 +1039,7 @@ def _run_and_publish_bounded_elastic_matched_authorized(
         _REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True
     ):
         raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
-    reservation = _reserve_output(destination)
+    reservation = _reserve_output(destination, _capability=_capability)
     consumer_started = False
     published = False
 
@@ -1052,6 +1068,7 @@ def _run_and_publish_bounded_elastic_matched_authorized(
             data_y,
             config=config,
             seeds=seeds,
+            _capability=_capability,
         )
         published = True
         return report
