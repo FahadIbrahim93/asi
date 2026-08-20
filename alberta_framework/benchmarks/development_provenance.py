@@ -6,44 +6,64 @@ import dataclasses
 import hashlib
 import inspect
 import json
+import math
 import platform
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
+from types import MappingProxyType, ModuleType
 from typing import cast
 
 import jax
 import numpy as np
 
 _MAX_REGISTRY_ITEMS = 4096
+_MAX_REGISTRY_DEPTH = 32
 _MAX_REGISTRY_STRING_BYTES = 4096
+_MAX_REGISTRY_INTEGER_BITS = 13_600
 _MAX_REGISTRY_BYTES = 1 << 20
+_MAPPING_PROXY_TYPE: type[object] = type(MappingProxyType({}))
 
 
 def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
-def _require_bounded_registry(value: object) -> None:
-    """Reject oversized host containers before canonical JSON encoding."""
-    if type(value) in (list, tuple):
+@dataclass(slots=True)
+class _RegistryBudget:
+    entries: int = 0
+
+    def consume(self, count: int) -> None:
+        if count > _MAX_REGISTRY_ITEMS - self.entries:
+            raise ValueError("registry exceeds the collection limit")
+        self.entries += count
+
+
+def _canonical(
+    value: object,
+    *,
+    budget: _RegistryBudget | None = None,
+    depth: int = 0,
+) -> object:
+    """Canonicalize one trusted JSON-shaped value within aggregate host limits."""
+    if budget is None:
+        budget = _RegistryBudget()
+    if depth > _MAX_REGISTRY_DEPTH:
+        raise ValueError("registry exceeds the nesting-depth limit")
+    if type(value) in (dict, _MAPPING_PROXY_TYPE):
+        mapping = cast(dict[object, object], value)
+        budget.consume(len(mapping))
+        if any(type(key) is not str for key in mapping):
+            raise TypeError("registry mapping keys must be exact strings")
+        return {
+            key: _canonical(item, budget=budget, depth=depth + 1)
+            for key, item in sorted(cast(dict[str, object], mapping).items())
+        }
+    if type(value) in (tuple, list):
         items = cast(Sequence[object], value)
-        if len(items) > _MAX_REGISTRY_ITEMS:
-            raise ValueError("registry exceeds the collection limit")
-        for item in items:
-            _require_bounded_registry(item)
-        return
-    if isinstance(value, Mapping):
-        mapping = cast(Mapping[object, object], value)
-        if len(mapping) > _MAX_REGISTRY_ITEMS:
-            raise ValueError("registry exceeds the collection limit")
-        for key, item in mapping.items():
-            if type(key) is not str:
-                raise TypeError("registry mapping keys must be exact strings")
-            _require_bounded_registry(key)
-            _require_bounded_registry(item)
-        return
+        budget.consume(len(items))
+        return [_canonical(item, budget=budget, depth=depth + 1) for item in items]
     if type(value) is str:
         try:
             encoded = value.encode("utf-8")
@@ -51,26 +71,27 @@ def _require_bounded_registry(value: object) -> None:
             raise ValueError("registry string must be valid UTF-8") from exc
         if len(encoded) > _MAX_REGISTRY_STRING_BYTES:
             raise ValueError("registry string exceeds the byte limit")
-        return
-    if type(value) in (int, float, bool) or value is None:
-        return
-    raise TypeError(f"unsupported registry value: {type(value).__name__}")
-
-
-def _canonical(value: object) -> object:
-    if isinstance(value, Mapping):
-        return {key: _canonical(item) for key, item in sorted(value.items())}
-    if type(value) in (tuple, list):
-        return [_canonical(item) for item in cast(Sequence[object], value)]
-    if type(value) in (str, int, float, bool) or value is None:
+        return value
+    if type(value) is int:
+        if value.bit_length() > _MAX_REGISTRY_INTEGER_BITS:
+            raise ValueError("registry integer exceeds the scalar limit")
+        return value
+    if type(value) is float:
+        if not math.isfinite(value):
+            raise ValueError("registry floats must be finite")
+        return value
+    if type(value) is bool or value is None:
         return value
     raise TypeError(f"unsupported registry value: {type(value).__name__}")
 
 
 def registry_sha256(value: object) -> str:
-    _require_bounded_registry(value)
     encoded = json.dumps(
-        _canonical(value), sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        _canonical(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
     ).encode("ascii")
     if len(encoded) > _MAX_REGISTRY_BYTES:
         raise ValueError("registry exceeds the canonical JSON byte limit")

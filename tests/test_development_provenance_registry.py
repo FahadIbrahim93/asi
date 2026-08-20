@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator, Mapping
 
 import pytest
 
 from alberta_framework.benchmarks import development_provenance as provenance
 
 pytestmark = pytest.mark.unit
+
+
+class _HostileMapping(Mapping[str, object]):
+    def __getitem__(self, key: str) -> object:
+        raise AssertionError("hostile mapping indexed")
+
+    def __iter__(self) -> Iterator[str]:
+        raise AssertionError("hostile mapping iterated")
+
+    def __len__(self) -> int:
+        raise AssertionError("hostile mapping measured")
 
 
 def test_registry_sha256_rejects_oversized_list_before_dump_hang() -> None:
@@ -25,6 +37,28 @@ def test_registry_sha256_accepts_bounded_list_and_mapping() -> None:
     assert listed == provenance.registry_sha256([1, 2, 3])
     assert mapped == provenance.registry_sha256({"max_items": 16, "seeds": (1, 2)})
     assert listed != mapped
+
+
+def test_registry_budget_is_aggregate_not_per_container() -> None:
+    payload = [[0] * 2048, [0] * 2048, [0]]
+    with pytest.raises(ValueError, match="collection limit"):
+        provenance.registry_sha256(payload)
+
+
+def test_registry_rejects_deep_or_hostile_values_before_hooks_or_dump() -> None:
+    nested: object = None
+    for _ in range(provenance._MAX_REGISTRY_DEPTH + 1):
+        nested = [nested]
+    with pytest.raises(ValueError, match="nesting-depth limit"):
+        provenance.registry_sha256(nested)
+    with pytest.raises(TypeError, match="unsupported registry value"):
+        provenance.registry_sha256(_HostileMapping())
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), 1 << 13_601])
+def test_registry_rejects_noncanonical_or_oversized_scalars(value: object) -> None:
+    with pytest.raises(ValueError):
+        provenance.registry_sha256(value)
 
 
 def test_collect_development_identity_hashes_bounded_registries() -> None:
