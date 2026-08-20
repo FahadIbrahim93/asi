@@ -39,6 +39,7 @@ def tiny_campaign(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     plan = _test_plan(input_dim=4, n_classes=2, examples=4)
     monkeypatch.setattr(plan_module, "FROZEN_BIMU_MATCHED_PLAN", plan)
     monkeypatch.setattr(plan_module, "EXECUTION_AUTHORIZED", True)
+    monkeypatch.setattr(plan_module, "AUTHORIZATION_TRANSITION_APPROVED", True)
     monkeypatch.setattr(
         plan_module,
         "FROZEN_PLAN_SHA256",
@@ -46,6 +47,7 @@ def tiny_campaign(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     )
     monkeypatch.setattr(campaign, "FROZEN_BIMU_MATCHED_PLAN", plan)
     monkeypatch.setattr(campaign, "EXECUTION_AUTHORIZED", True)
+    monkeypatch.setattr(campaign, "AUTHORIZATION_TRANSITION_APPROVED", True)
     monkeypatch.setattr(campaign, "REGISTERED_OUTPUT_ROOT", tmp_path)
     monkeypatch.setattr(campaign, "load_frozen_bimu_dataset", lambda _home=None: _slice_data())
     process_index = 0
@@ -82,9 +84,7 @@ def test_frozen_dataset_loader_uses_exact_canonical_60k_slice(
         dataset_sha256=_dataset_sha256(x[:4], y[:4], x[-4:], y[-4:]),
     )
 
-    train_x, train_y, test_x, test_y = campaign.load_frozen_bimu_dataset(
-        Path("/cache"), plan=plan
-    )
+    train_x, train_y, test_x, test_y = campaign.load_frozen_bimu_dataset(Path("/cache"), plan=plan)
 
     np.testing.assert_array_equal(train_x, x[:4])
     np.testing.assert_array_equal(train_y, y[:4])
@@ -107,7 +107,40 @@ def test_run_shard_refuses_before_loading_data_when_unauthorized(
     monkeypatch.setattr(campaign, "load_frozen_bimu_dataset", fail)
     with pytest.raises(PermissionError, match="not authorized"):
         campaign.run_bimu_shard("memory_off", 157001, data_home=tmp_path)
+    monkeypatch.setattr(campaign, "AUTHORIZATION_TRANSITION_APPROVED", True)
+    with pytest.raises(PermissionError, match="not authorized"):
+        campaign.run_bimu_shard("memory_off", 157001, data_home=tmp_path)
+    monkeypatch.setattr(campaign, "AUTHORIZATION_TRANSITION_APPROVED", False)
+    monkeypatch.setattr(campaign, "EXECUTION_AUTHORIZED", True)
+    with pytest.raises(PermissionError, match="not authorized"):
+        campaign.run_bimu_shard("memory_off", 157001, data_home=tmp_path)
     assert called is False
+
+
+def test_public_publisher_refuses_flag_mismatches_before_namespace_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(campaign, "REGISTERED_OUTPUT_ROOT", tmp_path)
+    path = campaign.campaign_path(tmp_path, "plan")
+    with pytest.raises(PermissionError, match="not authorized"):
+        campaign.publish_json(path, object(), root=tmp_path)
+    monkeypatch.setattr(campaign, "AUTHORIZATION_TRANSITION_APPROVED", True)
+    with pytest.raises(PermissionError, match="not authorized"):
+        campaign.publish_json(path, object(), root=tmp_path)
+    monkeypatch.setattr(campaign, "AUTHORIZATION_TRANSITION_APPROVED", False)
+    monkeypatch.setattr(campaign, "EXECUTION_AUTHORIZED", True)
+    with pytest.raises(PermissionError, match="not authorized"):
+        campaign.publish_json(path, object(), root=tmp_path)
+    assert not (tmp_path / "outputs").exists()
+
+
+def test_directory_chain_rejects_sequence_subclass_without_hooks(tmp_path: Path) -> None:
+    class Hostile(tuple[str, ...]):
+        def __iter__(self) -> Any:
+            raise AssertionError("subclass hooks must not run")
+
+    with pytest.raises(ValueError, match="exact safe sequence"):
+        campaign._open_directory_chain(tmp_path, Hostile(("outputs",)), create=True)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign execution requires Linux /proc")
@@ -123,11 +156,22 @@ def test_cli_run_shard_refuses_before_loading_data_when_unauthorized(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setattr(campaign, "REGISTERED_OUTPUT_ROOT", tmp_path)
+    monkeypatch.setattr(plan_module, "EXECUTION_AUTHORIZED", True)
+    monkeypatch.setattr(plan_module, "AUTHORIZATION_TRANSITION_APPROVED", True)
+    monkeypatch.setattr(
+        plan_module,
+        "FROZEN_PLAN_SHA256",
+        campaign._sha256(plan_module._plan_payload(plan_module.FROZEN_BIMU_MATCHED_PLAN)),
+    )
+    monkeypatch.setattr(campaign, "EXECUTION_AUTHORIZED", True)
+    monkeypatch.setattr(campaign, "AUTHORIZATION_TRANSITION_APPROVED", True)
     campaign.publish_json(
         campaign.campaign_path(tmp_path, "plan"),
         campaign.build_plan_document(),
         root=tmp_path,
     )
+    monkeypatch.setattr(campaign, "EXECUTION_AUTHORIZED", False)
+    monkeypatch.setattr(campaign, "AUTHORIZATION_TRANSITION_APPROVED", False)
     called = False
 
     def fail(_home: Path | None = None) -> Any:
@@ -136,17 +180,20 @@ def test_cli_run_shard_refuses_before_loading_data_when_unauthorized(
         raise AssertionError("dataset must not be loaded")
 
     monkeypatch.setattr(campaign, "load_frozen_bimu_dataset", fail)
-    assert campaign.main(
-        [
-            "run-shard",
-            "--root",
-            str(tmp_path),
-            "--arm",
-            "memory_off",
-            "--seed",
-            "157001",
-        ]
-    ) == 2
+    assert (
+        campaign.main(
+            [
+                "run-shard",
+                "--root",
+                str(tmp_path),
+                "--arm",
+                "memory_off",
+                "--seed",
+                "157001",
+            ]
+        )
+        == 2
+    )
     assert called is False
 
 
@@ -264,9 +311,7 @@ def test_aggregate_requires_six_unique_shards_and_recomputes_paired_rule(
         campaign.summarize_bimu_shards([*shards[:-1], shards[0]])
 
     same_process = copy.deepcopy(shards)
-    same_process[1]["identity"]["process"] = copy.deepcopy(
-        same_process[0]["identity"]["process"]
-    )
+    same_process[1]["identity"]["process"] = copy.deepcopy(same_process[0]["identity"]["process"])
     _resign(same_process[1])
     with pytest.raises(ValueError, match="process"):
         campaign.summarize_bimu_shards(same_process)
@@ -285,6 +330,23 @@ def test_aggregate_rejects_cross_pair_schedule_or_resource_drift(tiny_campaign: 
     _resign(forged[1])
     with pytest.raises(ValueError, match="resource|accounting"):
         campaign.summarize_bimu_shards(forged)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_summarize_reserves_aggregate_before_plan_or_replay(
+    tmp_path: Path, tiny_campaign: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "outputs/bimu_matched/development.v1/.aggregate.json.reservation"
+    monkeypatch.setattr(campaign, "_validate_namespace", lambda *args, **kwargs: None)
+
+    def stop_after_reservation(root: Path) -> dict[str, object]:
+        assert marker.is_file()
+        raise RuntimeError("stop before plan or replay")
+
+    monkeypatch.setattr(campaign, "_load_plan", stop_after_reservation)
+    with pytest.raises(RuntimeError, match="stop before plan or replay"):
+        campaign.main(["summarize", "--root", str(tmp_path)])
+    assert not marker.exists()
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
@@ -321,9 +383,7 @@ def test_cli_validate_cross_binds_aggregate_to_reexecuted_shard_files(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
-def test_fixed_namespace_publication_is_append_only(
-    tmp_path: Path, tiny_campaign: Any
-) -> None:
+def test_fixed_namespace_publication_is_append_only(tmp_path: Path, tiny_campaign: Any) -> None:
     plan_path = campaign.campaign_path(tmp_path, "plan")
     campaign.publish_json(plan_path, campaign.build_plan_document(), root=tmp_path)
     with pytest.raises(FileExistsError):
@@ -333,9 +393,7 @@ def test_fixed_namespace_publication_is_append_only(
     with pytest.raises(ValueError, match="namespace"):
         campaign.publish_json(outside, {}, root=tmp_path)
 
-    invalid_shard_path = campaign.campaign_path(
-        tmp_path, "shard", arm="memory_off", seed=157001
-    )
+    invalid_shard_path = campaign.campaign_path(tmp_path, "shard", arm="memory_off", seed=157001)
     with pytest.raises(ValueError, match="shard"):
         campaign.publish_json(invalid_shard_path, {}, root=tmp_path)
 
@@ -353,9 +411,7 @@ def test_incomplete_namespace_rejects_broken_expected_shard_symlink(
         campaign.build_plan_document(),
         root=tmp_path,
     )
-    shard_path = campaign.campaign_path(
-        tmp_path, "shard", arm="memory_off", seed=157001
-    )
+    shard_path = campaign.campaign_path(tmp_path, "shard", arm="memory_off", seed=157001)
     shard_path.symlink_to(tmp_path / "absent.json")
 
     with pytest.raises(ValueError, match="regular non-symlink"):
@@ -416,7 +472,7 @@ def test_publication_race_retains_concurrent_destination(
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
 def test_publication_revalidates_readback_without_unlinking_visible_inode(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_campaign: Any
 ) -> None:
     monkeypatch.setattr(campaign, "REGISTERED_OUTPUT_ROOT", tmp_path)
     plan_path = campaign.campaign_path(tmp_path, "plan")
@@ -427,6 +483,7 @@ def test_publication_revalidates_readback_without_unlinking_visible_inode(
     def fail_readback(value: object) -> dict[str, object]:
         nonlocal calls
         calls += 1
+        assert (plan_path.parent / ".plan.json.reservation").is_file()
         if calls == 2:
             raise ValueError("simulated readback rejection")
         return original(value)
@@ -447,9 +504,7 @@ def test_cli_reserves_exact_shard_before_execution(
         campaign.build_plan_document(),
         root=tmp_path,
     )
-    destination = campaign.campaign_path(
-        tmp_path, "shard", arm="memory_off", seed=157001
-    )
+    destination = campaign.campaign_path(tmp_path, "shard", arm="memory_off", seed=157001)
     original_load_plan = campaign._load_plan
 
     def load_plan_after_reservation(root: Path) -> dict[str, object]:
@@ -466,17 +521,20 @@ def test_cli_reserves_exact_shard_before_execution(
 
     monkeypatch.setattr(campaign, "_load_plan", load_plan_after_reservation)
     monkeypatch.setattr(campaign, "run_bimu_shard", fail_after_reservation)
-    assert campaign.main(
-        [
-            "run-shard",
-            "--root",
-            str(tmp_path),
-            "--arm",
-            "memory_off",
-            "--seed",
-            "157001",
-        ]
-    ) == 1
+    assert (
+        campaign.main(
+            [
+                "run-shard",
+                "--root",
+                str(tmp_path),
+                "--arm",
+                "memory_off",
+                "--seed",
+                "157001",
+            ]
+        )
+        == 1
+    )
     assert destination.is_file()
     assert destination.stat().st_mode & 0o777 == 0o444
     assert not destination.with_name(f".{destination.name}.reservation").exists()
@@ -490,25 +548,24 @@ def test_cli_reserves_exact_shard_before_execution(
     with pytest.raises(ValueError, match="fields|identity|status"):
         campaign.summarize_bimu_shards([failed] * 6)
 
-    invalid_destination = campaign.campaign_path(
-        tmp_path, "shard", arm="bimu", seed=157001
-    )
+    invalid_destination = campaign.campaign_path(tmp_path, "shard", arm="bimu", seed=157001)
     monkeypatch.setattr(campaign, "run_bimu_shard", lambda *args, **kwargs: {"invalid": True})
-    assert campaign.main(
-        [
-            "run-shard",
-            "--root",
-            str(tmp_path),
-            "--arm",
-            "bimu",
-            "--seed",
-            "157001",
-        ]
-    ) == 1
-    campaign.validate_failed_bimu_shard(
-        campaign.load_json_strict(
-            invalid_destination, byte_ceiling=campaign.MAX_SHARD_BYTES
+    assert (
+        campaign.main(
+            [
+                "run-shard",
+                "--root",
+                str(tmp_path),
+                "--arm",
+                "bimu",
+                "--seed",
+                "157001",
+            ]
         )
+        == 1
+    )
+    campaign.validate_failed_bimu_shard(
+        campaign.load_json_strict(invalid_destination, byte_ceiling=campaign.MAX_SHARD_BYTES)
     )
 
 
@@ -516,9 +573,7 @@ def test_cli_reserves_exact_shard_before_execution(
 def test_replaced_visible_reservation_cannot_publish_shard(
     tmp_path: Path, tiny_campaign: Any
 ) -> None:
-    destination = campaign.campaign_path(
-        tmp_path, "shard", arm="memory_off", seed=157001
-    )
+    destination = campaign.campaign_path(tmp_path, "shard", arm="memory_off", seed=157001)
     reservation = campaign._reserve_shard_destination(destination, root=tmp_path)
     _, parent_descriptor, _, reservation_name = reservation
     hidden_name = f"{reservation_name}.held"
@@ -552,43 +607,15 @@ def test_replaced_visible_reservation_cannot_publish_shard(
         campaign._release_shard_reservation(reservation)
 
 
-def test_cli_allows_disposable_plan_preview_but_rejects_relocated_shard(
+def test_cli_rejects_unauthorized_disposable_plan_preview(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     registered = tmp_path / "registered"
     preview = tmp_path / "preview"
-    published: list[tuple[Path, Path]] = []
-
-    def capture_plan(path: Path, value: object, *, root: Path, **kwargs: object) -> None:
-        assert campaign.validate_plan_document(value) == value
-        path.parent.mkdir(parents=True)
-        (path.parent / "shards").mkdir()
-        path.write_bytes(campaign._canonical(value) + b"\n")
-        published.append((path, root))
-
     monkeypatch.setattr(campaign, "REGISTERED_OUTPUT_ROOT", registered)
-    monkeypatch.setattr(campaign, "publish_json", capture_plan)
-
-    assert campaign.main(["plan", "--root", str(preview)]) == 0
-    assert campaign.main(["validate", "--root", str(preview)]) == 0
-    assert published == [(campaign.campaign_path(preview, "plan"), preview)]
-
-    monkeypatch.setattr(campaign, "EXECUTION_AUTHORIZED", True)
-    with pytest.raises(ValueError, match="registered repository root"):
-        campaign.main(
-            [
-                "run-shard",
-                "--root",
-                str(preview),
-                "--arm",
-                "memory_off",
-                "--seed",
-                "157001",
-            ]
-        )
-    with pytest.raises(ValueError, match="registered repository root"):
-        campaign.main(["summarize", "--root", str(preview)])
-    assert len(published) == 1
+    with pytest.raises(PermissionError, match="not authorized"):
+        campaign.main(["plan", "--root", str(preview)])
+    assert not preview.exists()
 
 
 def test_public_publisher_rejects_relocated_shard_before_namespace_access(
@@ -597,9 +624,7 @@ def test_public_publisher_rejects_relocated_shard_before_namespace_access(
     registered = tmp_path / "registered"
     relocated = tmp_path / "relocated"
     monkeypatch.setattr(campaign, "REGISTERED_OUTPUT_ROOT", registered)
-    destination = campaign.campaign_path(
-        relocated, "shard", arm="memory_off", seed=157001
-    )
+    destination = campaign.campaign_path(relocated, "shard", arm="memory_off", seed=157001)
     with pytest.raises(ValueError, match="registered repository root"):
         campaign.publish_json(
             destination,
@@ -610,9 +635,7 @@ def test_public_publisher_rejects_relocated_shard_before_namespace_access(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
-def test_cli_completes_and_revalidates_reserved_shard(
-    tmp_path: Path, tiny_campaign: Any
-) -> None:
+def test_cli_completes_and_revalidates_reserved_shard(tmp_path: Path, tiny_campaign: Any) -> None:
     campaign.publish_json(
         campaign.campaign_path(tmp_path, "plan"),
         campaign.build_plan_document(),
@@ -620,17 +643,20 @@ def test_cli_completes_and_revalidates_reserved_shard(
     )
     destination = campaign.campaign_path(tmp_path, "shard", arm="bimu", seed=157003)
 
-    assert campaign.main(
-        [
-            "run-shard",
-            "--root",
-            str(tmp_path),
-            "--arm",
-            "bimu",
-            "--seed",
-            "157003",
-        ]
-    ) == 0
+    assert (
+        campaign.main(
+            [
+                "run-shard",
+                "--root",
+                str(tmp_path),
+                "--arm",
+                "bimu",
+                "--seed",
+                "157003",
+            ]
+        )
+        == 0
+    )
 
     assert destination.stat().st_mode & 0o777 == 0o444
     campaign.validate_bimu_shard(
@@ -645,9 +671,7 @@ def test_publication_rejects_zero_progress_write(
     document = campaign.build_plan_document()
     monkeypatch.setattr(campaign.os, "write", lambda *args: 0)
     with pytest.raises(OSError, match="no progress"):
-        campaign.publish_json(
-            campaign.campaign_path(tmp_path, "plan"), document, root=tmp_path
-        )
+        campaign.publish_json(campaign.campaign_path(tmp_path, "plan"), document, root=tmp_path)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign file validation is Linux-only")
@@ -697,9 +721,17 @@ def test_json_tree_rejects_hostile_exact_type_subclasses_without_hooks() -> None
 def test_cli_has_only_plan_run_shard_summarize_and_validate() -> None:
     parser = campaign._parser()
     for command in ("plan", "run-shard", "summarize", "validate"):
-        assert parser.parse_args([command, "--root", "/tmp/root", *(
-            ["--arm", "bimu", "--seed", "157001"] if command == "run-shard" else []
-        )]).command == command
+        assert (
+            parser.parse_args(
+                [
+                    command,
+                    "--root",
+                    "/tmp/root",
+                    *(["--arm", "bimu", "--seed", "157001"] if command == "run-shard" else []),
+                ]
+            ).command
+            == command
+        )
 
 
 def test_aggregate_validator_rejects_resigned_outcome_reclassification(

@@ -25,10 +25,13 @@ secondary and cannot change that classification. Timing is telemetry only.
 
 ## Review and execution gate
 
-`EXECUTION_AUTHORIZED` is frozen to `False` in
+`EXECUTION_AUTHORIZED` and `AUTHORIZATION_TRANSITION_APPROVED` are frozen to
+`False` in
 `alberta_framework/evaluation/bimu_matched_nonpromoting.py`. The `run-shard`
-command fails before loading MNIST while that literal is false. A separate
-reviewed authorization change must open the gate; that source change also
+command and every publisher fail before plan, data, replay, or execution work
+unless both literals are exact `True`. A separate reviewed authorization change
+must open both gates; both values are bound into the plan, identity, policy,
+completed and failed shards, and status. That source change also
 changes the plan's source identity, so the plan must then be published from
 the authorized revision before any shard starts. That review must also update
 the literal `FROZEN_PLAN_SHA256`; an authorization flip without the matching
@@ -66,8 +69,10 @@ Once all six fixed shard paths exist, summarize and revalidate:
 .venv/bin/asi-bimu-matched-development validate --root .
 ```
 
-All files publish without replacement under
-`outputs/bimu_matched/development.v1/`. Keep supported, rejected, and
+All files publish without replacement under the registered repository's exact
+`outputs/bimu_matched/development.v1/` namespace. Plan and aggregate work is
+reserved before validation, data loading, or strict replay; reservation cleanup
+compares held and live inode identities. Keep supported, rejected, and
 inconclusive aggregates. An ordinary `Exception` during shard execution or
 strict validation publishes one generic failed-attempt receipt atomically at
 that shard's canonical path and returns nonzero. The receipt retains no

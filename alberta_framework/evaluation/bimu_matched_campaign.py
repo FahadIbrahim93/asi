@@ -19,7 +19,7 @@ import secrets
 import stat
 import time
 from collections.abc import Mapping, Sequence
-from pathlib import Path
+from pathlib import Path, PosixPath
 from typing import Any, Final, NoReturn, cast
 
 import jax.random as jr
@@ -39,10 +39,12 @@ from alberta_framework.benchmarks.bimu import (
 )
 from alberta_framework.benchmarks.upgd_ipmnist import load_mnist_train
 from alberta_framework.evaluation.bimu_matched_nonpromoting import (
+    AUTHORIZATION_TRANSITION_APPROVED,
     EXECUTION_AUTHORIZED,
     FROZEN_BIMU_MATCHED_PLAN,
     OUTPUT_NAMESPACE,
     BiMUMatchedDevelopmentPlan,
+    _authorization_identity,
     _canonical,
     _dependency_identity,
     _plan_payload,
@@ -92,6 +94,7 @@ _POLICY: Final = {
     "ordinary_exception_failure_receipts_retained": True,
     "failed_attempt_reservation_retained": False,
     "base_exception_failure_retention_guaranteed": False,
+    "seed_status": "frozen_exposed_consumed_for_promotion",
 }
 _TIMING_POLICY: Final = {
     "qualified": False,
@@ -103,6 +106,11 @@ _TIMING_POLICY: Final = {
 
 def _fail(message: str) -> NoReturn:
     raise ValueError(message)
+
+
+def _require_execution_authorized() -> None:
+    if EXECUTION_AUTHORIZED is not True or AUTHORIZATION_TRANSITION_APPROVED is not True:
+        raise PermissionError("BiMU campaign execution is not authorized in this source revision")
 
 
 def _validate_json_tree(value: object) -> None:
@@ -253,6 +261,7 @@ def _current_identity() -> dict[str, object]:
         "source_sha256": _source_identity(),
         "runtime": _runtime_identity(),
         "dependencies": _dependency_identity(),
+        "authorization": _authorization_identity(),
         "consistency_not_attestation": True,
     }
 
@@ -268,7 +277,7 @@ def build_plan_document() -> dict[str, object]:
         "identity": _current_identity(),
         "policy": {
             **_POLICY,
-            "execution_authorized": EXECUTION_AUTHORIZED,
+            **_authorization_identity(),
         },
     }
     document["document_sha256"] = _sha256(document)
@@ -284,15 +293,13 @@ def validate_plan_document(value: object) -> dict[str, object]:
         "campaign plan",
     )
     expected_plan = frozen_plan_payload()
-    if root["schema"] != PLAN_DOCUMENT_SCHEMA or not _json_exact_equal(
-        root["plan"], expected_plan
-    ):
+    if root["schema"] != PLAN_DOCUMENT_SCHEMA or not _json_exact_equal(root["plan"], expected_plan):
         _fail("campaign plan does not match the current literal plan")
     if root["plan_sha256"] != _sha256(expected_plan):
         _fail("campaign plan digest drifted")
     if not _json_exact_equal(root["identity"], _current_identity()):
         _fail("campaign plan identity drifted")
-    expected_policy = {**_POLICY, "execution_authorized": EXECUTION_AUTHORIZED}
+    expected_policy = {**_POLICY, **_authorization_identity()}
     if not _json_exact_equal(root["policy"], expected_policy):
         _fail("campaign plan policy drifted")
     if root["document_sha256"] != digest_without(root, "document_sha256"):
@@ -446,8 +453,7 @@ def _expected_counters(plan: BiMUMatchedDevelopmentPlan) -> dict[str, int]:
 def _expected_resources(plan: BiMUMatchedDevelopmentPlan) -> dict[str, int]:
     values = cast(dict[str, object], _plan_payload(plan)["expected_resources_per_arm"])
     return {
-        field: cast(int, values[field])
-        for field in (*_MATCHED_RESOURCES, "dataset_numeric_bytes")
+        field: cast(int, values[field]) for field in (*_MATCHED_RESOURCES, "dataset_numeric_bytes")
     }
 
 
@@ -460,17 +466,18 @@ def run_bimu_shard(
 ) -> dict[str, object]:
     """Execute exactly one authorized arm/seed shard in this process."""
 
-    if EXECUTION_AUTHORIZED is not True:
-        raise PermissionError("BiMU campaign execution is not authorized in this source revision")
+    _require_execution_authorized()
     if type(seed) is not int or seed not in FROZEN_BIMU_MATCHED_PLAN.seeds:
         _fail("seed is outside the frozen roster")
     config = _arm_config(FROZEN_BIMU_MATCHED_PLAN, arm)
     plan_doc = (
-        build_plan_document()
-        if plan_document is None
-        else validate_plan_document(plan_document)
+        build_plan_document() if plan_document is None else validate_plan_document(plan_document)
     )
-    if cast(dict[str, object], plan_doc["policy"])["execution_authorized"] is not True:
+    bound_policy = cast(dict[str, object], plan_doc["policy"])
+    if (
+        bound_policy["execution_authorized"] is not True
+        or bound_policy["authorization_transition_approved"] is not True
+    ):
         raise PermissionError("the bound campaign plan is not authorized for execution")
     execution_identity = _current_identity()
     if not _json_exact_equal(plan_doc["identity"], execution_identity):
@@ -496,7 +503,7 @@ def run_bimu_shard(
             "dataset_sha256": FROZEN_BIMU_MATCHED_PLAN.dataset_sha256,
             "process": _process_identity(),
         },
-        "policy": {**_POLICY, "execution_authorized": True},
+        "policy": {**_POLICY, **_authorization_identity()},
         "result": result,
         "resources": {
             **_expected_resources(FROZEN_BIMU_MATCHED_PLAN),
@@ -596,6 +603,7 @@ def validate_bimu_shard(value: object) -> dict[str, object]:
             "source_sha256",
             "runtime",
             "dependencies",
+            "authorization",
             "consistency_not_attestation",
             "dataset_sha256",
             "process",
@@ -612,7 +620,7 @@ def validate_bimu_shard(value: object) -> dict[str, object]:
     ):
         _fail("shard execution identity drifted")
     _validate_process(identity["process"])
-    if not _json_exact_equal(root["policy"], {**_POLICY, "execution_authorized": True}):
+    if not _json_exact_equal(root["policy"], {**_POLICY, **_authorization_identity()}):
         _fail("shard policy drifted")
     result = root["result"]
     validate_bimu_result(result)
@@ -623,9 +631,7 @@ def validate_bimu_shard(value: object) -> dict[str, object]:
         _fail("shard result does not match its arm/seed spec")
     if resolved["dataset_sha256"] != FROZEN_BIMU_MATCHED_PLAN.dataset_sha256:
         _fail("shard result dataset identity drifted")
-    expected_initial, expected_schedule = _expected_fixed_identities(
-        FROZEN_BIMU_MATCHED_PLAN, seed
-    )
+    expected_initial, expected_schedule = _expected_fixed_identities(FROZEN_BIMU_MATCHED_PLAN, seed)
     if resolved["initial_state_sha256"] != expected_initial:
         _fail("shard initial-state identity drifted")
     if resolved["schedule_sha256"] != expected_schedule:
@@ -693,7 +699,7 @@ def build_failed_bimu_shard(arm: str, seed: int) -> dict[str, object]:
         "identity": {**_current_identity(), "process": _process_identity()},
         "policy": {
             **_POLICY,
-            "execution_authorized": True,
+            **_authorization_identity(),
             "used_for_outcome": False,
             "retry_authorized": False,
         },
@@ -743,6 +749,7 @@ def validate_failed_bimu_shard(value: object) -> dict[str, object]:
             "source_sha256",
             "runtime",
             "dependencies",
+            "authorization",
             "consistency_not_attestation",
             "process",
         },
@@ -756,7 +763,7 @@ def validate_failed_bimu_shard(value: object) -> dict[str, object]:
     _validate_process(identity["process"])
     expected_policy = {
         **_POLICY,
-        "execution_authorized": True,
+        **_authorization_identity(),
         "used_for_outcome": False,
         "retry_authorized": False,
     }
@@ -789,6 +796,7 @@ def validate_bimu_shard_by_reexecution(
 ) -> dict[str, object]:
     """Reexecute one shard and compare every deterministic result field."""
 
+    _require_execution_authorized()
     replay_identity = _current_identity()
     root = validate_bimu_shard(value)
     arrays = _validated_arrays(
@@ -809,8 +817,7 @@ def validate_bimu_shard_by_reexecution(
     reported = cast(dict[str, object], root["result"])
     deterministic_fields = set(replay) - {"timing"}
     if set(reported) - {"timing"} != deterministic_fields or any(
-        not _json_exact_equal(reported[field], replay[field])
-        for field in deterministic_fields
+        not _json_exact_equal(reported[field], replay[field]) for field in deterministic_fields
     ):
         _fail("shard result does not match strict seed/arm reexecution")
     if _dataset_sha256(*arrays) != FROZEN_BIMU_MATCHED_PLAN.dataset_sha256:
@@ -873,11 +880,7 @@ def _outcome(paired: dict[str, object]) -> dict[str, object]:
 
 def _validate_pair_matching(shards: list[dict[str, object]]) -> None:
     for seed in FROZEN_BIMU_MATCHED_PLAN.seeds:
-        pair = [
-            shard
-            for shard in shards
-            if cast(dict[str, object], shard["spec"])["seed"] == seed
-        ]
+        pair = [shard for shard in shards if cast(dict[str, object], shard["spec"])["seed"] == seed]
         if len(pair) != 2:
             _fail("aggregate roster lacks one complete pair per seed")
         by_arm = {
@@ -898,8 +901,7 @@ def _validate_pair_matching(shards: list[dict[str, object]]) -> None:
         control_resources = cast(dict[str, object], control["resources"])
         candidate_resources = cast(dict[str, object], candidate["resources"])
         if any(
-            control_resources[field] != candidate_resources[field]
-            for field in _MATCHED_RESOURCES
+            control_resources[field] != candidate_resources[field] for field in _MATCHED_RESOURCES
         ):
             _fail("matched pair resource drifted")
 
@@ -907,8 +909,7 @@ def _validate_pair_matching(shards: list[dict[str, object]]) -> None:
 def _aggregate_resources(shards: list[dict[str, object]]) -> dict[str, object]:
     totals = {
         field: sum(
-            cast(int, cast(dict[str, object], shard["resources"])[field])
-            for shard in shards
+            cast(int, cast(dict[str, object], shard["resources"])[field]) for shard in shards
         )
         for field in (*_MATCHED_RESOURCES, "dataset_numeric_bytes")
     }
@@ -935,9 +936,7 @@ def _summarize_bimu_shards_unchecked(values: object) -> dict[str, object]:
     if type(values) is not list or len(cast(list[object], values)) != 6:
         _fail("aggregate roster must contain exactly six shards")
     shards = [validate_bimu_shard(item) for item in cast(list[object], values)]
-    expected_roster = [
-        (seed, arm) for seed in FROZEN_BIMU_MATCHED_PLAN.seeds for arm in _ARMS
-    ]
+    expected_roster = [(seed, arm) for seed in FROZEN_BIMU_MATCHED_PLAN.seeds for arm in _ARMS]
     observed_roster = [
         (
             cast(dict[str, object], shard["spec"])["seed"],
@@ -981,10 +980,7 @@ def _summarize_bimu_shards_unchecked(values: object) -> dict[str, object]:
         }
         for shard in shards
     ]
-    if any(
-        not _json_exact_equal(identity, shared_identity[0])
-        for identity in shared_identity[1:]
-    ):
+    if any(not _json_exact_equal(identity, shared_identity[0]) for identity in shared_identity[1:]):
         _fail("aggregate mixes source, runtime, dependency, or dataset identities")
     _validate_pair_matching(shards)
     paired = _paired_metrics(shards)
@@ -1098,35 +1094,61 @@ def _allowed_path(path: Path, root: Path) -> bool:
 
 
 def _require_registered_root(root: Path) -> None:
-    if Path(os.path.abspath(os.fspath(root))) != REGISTERED_OUTPUT_ROOT:
+    if type(root) is not PosixPath or type(REGISTERED_OUTPUT_ROOT) is not PosixPath:
+        raise TypeError("campaign root must be an exact POSIX Path")
+    if PosixPath(os.path.abspath(os.fspath(root))) != REGISTERED_OUTPUT_ROOT:
         _fail("campaign output root is not the registered repository root")
 
 
-def _open_output_parent(path: Path, *, create: bool) -> tuple[Path, int]:
-    """Open an absolute parent through no-follow directory descriptors."""
-
-    destination = Path(os.path.abspath(os.fspath(path)))
-    descriptor = os.open(os.path.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+def _open_directory_chain(root: Path, segments: Sequence[str], *, create: bool) -> int:
+    if type(root) is not PosixPath or not root.is_absolute():
+        raise ValueError("directory root must be an exact absolute POSIX Path")
+    if (type(segments) is not tuple and type(segments) is not list) or any(
+        type(segment) is not str
+        or not segment
+        or segment in {".", ".."}
+        or "/" in segment
+        or "\x00" in segment
+        for segment in segments
+    ):
+        raise ValueError("directory segments must be an exact safe sequence")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open(root, flags)
     try:
-        for component in destination.parent.parts[1:]:
-            if component in ("", ".", ".."):
-                _fail("campaign path contains an unsafe directory component")
+        for segment in segments:
             if create:
                 try:
-                    os.mkdir(component, mode=0o755, dir_fd=descriptor)
+                    os.mkdir(segment, mode=0o755, dir_fd=descriptor)
                 except FileExistsError:
                     pass
-            next_descriptor = os.open(
-                component,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=descriptor,
-            )
+            child = os.open(segment, flags, dir_fd=descriptor)
             os.close(descriptor)
-            descriptor = next_descriptor
-        return destination, descriptor
+            descriptor = child
+        return descriptor
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _open_output_parent(path: Path, *, create: bool) -> tuple[Path, int]:
+    """Open one registered parent from the exact pinned repository root."""
+
+    if type(path) is not PosixPath:
+        raise TypeError("campaign path must be an exact POSIX Path")
+    destination = PosixPath(os.path.abspath(os.fspath(path)))
+    candidates = {
+        campaign_path(REGISTERED_OUTPUT_ROOT, "plan"),
+        campaign_path(REGISTERED_OUTPUT_ROOT, "aggregate"),
+        *(
+            campaign_path(REGISTERED_OUTPUT_ROOT, "shard", arm=arm, seed=seed)
+            for seed in FROZEN_BIMU_MATCHED_PLAN.seeds
+            for arm in _ARMS
+        ),
+    }
+    if destination not in candidates:
+        _fail("destination is outside the registered campaign namespace")
+    segments = tuple(destination.parent.relative_to(REGISTERED_OUTPUT_ROOT).parts)
+    return destination, _open_directory_chain(REGISTERED_OUTPUT_ROOT, segments, create=create)
 
 
 def _link_unnamed_file(file_descriptor: int, parent_descriptor: int, name: str) -> None:
@@ -1161,12 +1183,13 @@ def _require_live_parent(destination: Path, parent_descriptor: int) -> None:
 ShardReservation = tuple[Path, int, int, str]
 
 
-def _reserve_shard_destination(path: Path, *, root: Path) -> ShardReservation:
-    """Reserve one exact shard path before dataset load or execution."""
+def _reserve_destination(path: Path, *, root: Path) -> ShardReservation:
+    """Reserve one exact artifact before plan/data/replay/execution work."""
 
+    _require_execution_authorized()
     _require_registered_root(root)
-    if not _allowed_path(path, root) or path.parent.name != "shards":
-        _fail("only one canonical shard destination may be reserved")
+    if not _allowed_path(path, root):
+        _fail("only one canonical campaign destination may be reserved")
     destination, parent_descriptor = _open_output_parent(path, create=True)
     reservation_name = f".{destination.name}.reservation"
     try:
@@ -1175,16 +1198,14 @@ def _reserve_shard_destination(path: Path, *, root: Path) -> ShardReservation:
         except FileNotFoundError:
             pass
         else:
-            raise FileExistsError(
-                f"refusing to replace existing campaign artifact: {destination}"
-            )
+            raise FileExistsError(f"refusing to replace existing campaign artifact: {destination}")
         reservation_descriptor = os.open(
             reservation_name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
             0o400,
             dir_fd=parent_descriptor,
         )
-        marker = b"asi-bimu-matched-shard-reservation-v1\n"
+        marker = b"asi-bimu-matched-campaign-reservation-v1\n"
         written = os.write(reservation_descriptor, marker)
         if written != len(marker):
             raise OSError("campaign reservation write made no progress")
@@ -1199,6 +1220,12 @@ def _reserve_shard_destination(path: Path, *, root: Path) -> ShardReservation:
             os.close(parent_descriptor)
         raise
     return destination, parent_descriptor, reservation_descriptor, reservation_name
+
+
+def _reserve_shard_destination(path: Path, *, root: Path) -> ShardReservation:
+    if path.parent.name != "shards":
+        _fail("only one canonical shard destination may be reserved")
+    return _reserve_destination(path, root=root)
 
 
 def _release_shard_reservation(reservation: ShardReservation) -> None:
@@ -1237,8 +1264,10 @@ def publish_json(
     complete result or a generic failed-attempt receipt is durably published.
     """
 
-    if type(path) is not type(Path()) or type(root) is not type(Path()):
-        raise TypeError("path and root must be exact Paths")
+    if type(path) is not PosixPath or type(root) is not PosixPath:
+        raise TypeError("path and root must be exact POSIX Paths")
+    _require_execution_authorized()
+    _require_registered_root(root)
     if not _allowed_path(path, root):
         _fail("destination is outside the fixed campaign namespace")
     if path != campaign_path(root, "plan"):
@@ -1253,55 +1282,45 @@ def publish_json(
             if type(candidate) is dict and candidate.get("schema") == FAILED_SHARD_SCHEMA:
                 validate_failed_bimu_shard(candidate)
             else:
-                validate_bimu_shard(candidate)
+                validate_bimu_shard_by_reexecution(candidate, *load_frozen_bimu_dataset())
 
-    validate(value)
-    raw = _canonical(value) + b"\n"
-    shard_path = campaign_path(
-        root,
-        "shard",
-        arm=_ARMS[0],
-        seed=FROZEN_BIMU_MATCHED_PLAN.seeds[0],
+    owns_reservation = _reservation is None
+    reservation = _reserve_destination(path, root=root) if _reservation is None else _reservation
+    destination, parent_descriptor, reservation_descriptor, reservation_name = reservation
+    if destination != PosixPath(os.path.abspath(os.fspath(path))):
+        _fail("campaign reservation does not match its exact destination")
+    _require_live_parent(destination, parent_descriptor)
+    reservation_stat = os.fstat(reservation_descriptor)
+    visible_reservation = os.stat(
+        reservation_name,
+        dir_fd=parent_descriptor,
+        follow_symlinks=False,
     )
-    _, shard_parent_descriptor = _open_output_parent(shard_path, create=True)
-    os.close(shard_parent_descriptor)
-    if _reservation is None:
-        destination, parent_descriptor = _open_output_parent(path, create=True)
-        close_parent = True
-    else:
-        (
-            destination,
-            parent_descriptor,
-            reservation_descriptor,
-            reservation_name,
-        ) = _reservation
-        close_parent = False
-        if destination != Path(os.path.abspath(os.fspath(path))):
-            _fail("campaign reservation does not match its exact destination")
-        _require_live_parent(destination, parent_descriptor)
-        reservation_stat = os.fstat(reservation_descriptor)
-        visible_reservation = os.stat(
-            reservation_name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        if (
-            not stat.S_ISREG(reservation_stat.st_mode)
-            or reservation_stat.st_nlink != 1
-            or (reservation_stat.st_dev, reservation_stat.st_ino)
-            != (visible_reservation.st_dev, visible_reservation.st_ino)
-        ):
-            _fail("campaign shard reservation is not the owned regular marker")
+    if (
+        not stat.S_ISREG(reservation_stat.st_mode)
+        or reservation_stat.st_nlink != 1
+        or (reservation_stat.st_dev, reservation_stat.st_ino)
+        != (visible_reservation.st_dev, visible_reservation.st_ino)
+    ):
+        _fail("campaign reservation is not the owned regular marker")
     file_descriptor: int | None = None
     try:
+        validate(value)
+        raw = _canonical(value) + b"\n"
+        shard_path = campaign_path(
+            root,
+            "shard",
+            arm=_ARMS[0],
+            seed=FROZEN_BIMU_MATCHED_PLAN.seeds[0],
+        )
+        _, shard_parent_descriptor = _open_output_parent(shard_path, create=True)
+        os.close(shard_parent_descriptor)
         try:
             os.stat(destination.name, dir_fd=parent_descriptor, follow_symlinks=False)
         except FileNotFoundError:
             pass
         else:
-            raise FileExistsError(
-                f"refusing to replace existing campaign artifact: {destination}"
-            )
+            raise FileExistsError(f"refusing to replace existing campaign artifact: {destination}")
         if not hasattr(os, "O_TMPFILE"):
             raise OSError("immutable publication requires Linux O_TMPFILE support")
         file_descriptor = os.open(
@@ -1375,8 +1394,8 @@ def publish_json(
     finally:
         if file_descriptor is not None:
             os.close(file_descriptor)
-        if close_parent:
-            os.close(parent_descriptor)
+        if owns_reservation:
+            _release_shard_reservation(reservation)
 
 
 def _load_plan(root: Path) -> dict[str, object]:
@@ -1466,9 +1485,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     root = cast(Path, args.root)
     if args.command == "plan":
+        _require_execution_authorized()
         document = build_plan_document()
         publish_json(campaign_path(root, "plan"), document, root=root)
-        _print_json({"status": "planned", "execution_authorized": EXECUTION_AUTHORIZED})
+        _print_json({"status": "planned", **_authorization_identity()})
         return 0
     if args.command == "run-shard":
         _require_registered_root(root)
@@ -1477,11 +1497,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             require_complete_shards=False,
             require_aggregate=False,
         )
-        if EXECUTION_AUTHORIZED is not True:
+        if EXECUTION_AUTHORIZED is not True or AUTHORIZATION_TRANSITION_APPROVED is not True:
             _print_json(
                 {
                     "status": "execution_unauthorized",
-                    "execution_authorized": False,
+                    **_authorization_identity(),
                     "shard_written": False,
                 }
             )
@@ -1521,11 +1541,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             require_complete_shards=True,
             require_aggregate=False,
         )
-        _load_plan(root)
-        arrays = load_frozen_bimu_dataset(args.data_home)
-        aggregate = summarize_bimu_shards(_load_shards(root, arrays))
         destination = campaign_path(root, "aggregate")
-        publish_json(destination, aggregate, root=root)
+        reservation = _reserve_destination(destination, root=root)
+        try:
+            _load_plan(root)
+            arrays = load_frozen_bimu_dataset(args.data_home)
+            aggregate = summarize_bimu_shards(_load_shards(root, arrays))
+            publish_json(destination, aggregate, root=root, _reservation=reservation)
+        finally:
+            _release_shard_reservation(reservation)
         _print_json(cast(dict[str, object], aggregate["outcome"]))
         return 0
     if args.command == "validate":
@@ -1544,12 +1568,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         plan = _load_plan(root)
         result: dict[str, object] = {
             "plan_sha256": plan["plan_sha256"],
-            "execution_authorized": EXECUTION_AUTHORIZED,
+            **_authorization_identity(),
             "shards": [],
             "aggregate": None,
         }
         replayed_shards: list[dict[str, object]] | None = None
         if any_shards:
+            _require_execution_authorized()
             arrays = load_frozen_bimu_dataset(args.data_home)
             replayed_shards = _load_shards(root, arrays)
             result["shards"] = [shard["shard_sha256"] for shard in replayed_shards]

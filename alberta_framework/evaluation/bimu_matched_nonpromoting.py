@@ -22,31 +22,34 @@ from alberta_framework.benchmarks.bimu import BiMUConfig, _dataset_sha256
 PLAN_SCHEMA: Final = "asi.bimu.matched-development-plan.v3"
 OUTPUT_NAMESPACE: Final = Path("outputs/bimu_matched/development.v1")
 EXECUTION_AUTHORIZED: Final = False
+AUTHORIZATION_TRANSITION_APPROVED: Final = False
 _DIGEST = "85c681c2f5fc5c274870b30c9accb3d2a6e9eb90a4575a2bf1ccca64f58b6227"
-FROZEN_PLAN_SHA256: Final = "633b8e6b6bc212798e3af6b8550e39b99d800c3aae332384cda352dde31c4c75"
+FROZEN_PLAN_SHA256: Final = "182632b37c3a8598a30fb943742605374a846d965c5602f4db039f27f78754c1"
 
-INVALID_PRIOR_ATTEMPT: Final[Mapping[str, object]] = MappingProxyType({
-    "pull_request": 1686,
-    "head_commit": "86a67df39781bba77e1a2c47451f646205daee65",
-    "seed": 23,
-    "status": "invalid_never_merged",
-    "reason": (
-        "colliding RNG domains, unpinned PRNG, majority-vote inference, and an immediate-task "
-        "metric mislabeled as the paper final-model late-five metric"
-    ),
-    "result_retained": False,
-    "seed_reuse_allowed": False,
-    "unmerged_result_sha256": (
-        "9b11c3944379323e33ee067cf80a9f4d772a3af4080f9718cec3b6e1d1e91a23",
-        "00faf161ead42d11c8daed668ba96a905ef25baf18b0c77b04bc08e4435c4fa7",
-        "0f665cbddf209422456d68835f835c8302a632372e59a0e2518297a41c30a5cb",
-    ),
-    "unmerged_artifact_file_sha256": (
-        "0e313a49c5b2e5fb3b7a4c61c6d2618815432dfc24aac30c64b16777ed1328cb",
-        "7da4d6e0411546a39d431bf1d3b6c47372c7c634c372f7133f15481851132daa",
-        "2d3a05db3ba2b8af50d522ba13564d82999829f340f426f0f4b1b1389607ade0",
-    ),
-})
+INVALID_PRIOR_ATTEMPT: Final[Mapping[str, object]] = MappingProxyType(
+    {
+        "pull_request": 1686,
+        "head_commit": "86a67df39781bba77e1a2c47451f646205daee65",
+        "seed": 23,
+        "status": "invalid_never_merged",
+        "reason": (
+            "colliding RNG domains, unpinned PRNG, majority-vote inference, and an immediate-task "
+            "metric mislabeled as the paper final-model late-five metric"
+        ),
+        "result_retained": False,
+        "seed_reuse_allowed": False,
+        "unmerged_result_sha256": (
+            "9b11c3944379323e33ee067cf80a9f4d772a3af4080f9718cec3b6e1d1e91a23",
+            "00faf161ead42d11c8daed668ba96a905ef25baf18b0c77b04bc08e4435c4fa7",
+            "0f665cbddf209422456d68835f835c8302a632372e59a0e2518297a41c30a5cb",
+        ),
+        "unmerged_artifact_file_sha256": (
+            "0e313a49c5b2e5fb3b7a4c61c6d2618815432dfc24aac30c64b16777ed1328cb",
+            "7da4d6e0411546a39d431bf1d3b6c47372c7c634c372f7133f15481851132daa",
+            "2d3a05db3ba2b8af50d522ba13564d82999829f340f426f0f4b1b1389607ade0",
+        ),
+    }
+)
 
 
 def _invalid_prior_attempt_payload() -> dict[str, object]:
@@ -57,8 +60,9 @@ def _invalid_prior_attempt_payload() -> dict[str, object]:
     }
 
 
-def _config(*, memory_window: int | None, input_dim: int = 784, n_classes: int = 10,
-            examples: int = 256) -> BiMUConfig:
+def _config(
+    *, memory_window: int | None, input_dim: int = 784, n_classes: int = 10, examples: int = 256
+) -> BiMUConfig:
     return BiMUConfig(
         input_dim=input_dim,
         hidden_units=32,
@@ -162,6 +166,13 @@ def _canonical(value: object) -> bytes:
     ).encode("ascii")
 
 
+def _authorization_identity() -> dict[str, bool]:
+    return {
+        "execution_authorized": EXECUTION_AUTHORIZED,
+        "authorization_transition_approved": AUTHORIZATION_TRANSITION_APPROVED,
+    }
+
+
 def _plan_payload(plan: BiMUMatchedDevelopmentPlan) -> dict[str, object]:
     checked = BiMUMatchedDevelopmentPlan(**plan.__dict__)
     config = checked.candidate_config
@@ -189,8 +200,14 @@ def _plan_payload(plan: BiMUMatchedDevelopmentPlan) -> dict[str, object]:
         "dataset_selection": checked.dataset_selection,
         "prior_invalid_attempts": [_invalid_prior_attempt_payload()],
         "matched_axes": [
-            "seed", "dataset", "schedule", "observations", "label_queries",
-            "optimizer_seen", "model_forward_queries", "initial_state",
+            "seed",
+            "dataset",
+            "schedule",
+            "observations",
+            "label_queries",
+            "optimizer_seen",
+            "model_forward_queries",
+            "initial_state",
         ],
         "expected_counters_per_arm": {
             "environment_steps": observations,
@@ -234,7 +251,7 @@ def _plan_payload(plan: BiMUMatchedDevelopmentPlan) -> dict[str, object]:
             "retained_matched_result_exists": False,
             "reason": "the literal development roster is publicly exposed",
         },
-        "execution_authorized": EXECUTION_AUTHORIZED,
+        "authorization": _authorization_identity(),
     }
 
 
@@ -275,9 +292,14 @@ def _runtime_identity() -> dict[str, object]:
         for device in jax.devices()
     ]
     environment_names = (
-        "JAX_DEFAULT_MATMUL_PRECISION", "JAX_DEFAULT_PRNG_IMPL", "JAX_ENABLE_X64",
-        "JAX_NUM_CPU_DEVICES", "JAX_PLATFORMS", "JAX_PLATFORM_NAME",
-        "JAX_RANDOM_SEED_OFFSET", "XLA_FLAGS",
+        "JAX_DEFAULT_MATMUL_PRECISION",
+        "JAX_DEFAULT_PRNG_IMPL",
+        "JAX_ENABLE_X64",
+        "JAX_NUM_CPU_DEVICES",
+        "JAX_PLATFORMS",
+        "JAX_PLATFORM_NAME",
+        "JAX_RANDOM_SEED_OFFSET",
+        "XLA_FLAGS",
     )
     return {
         "schema": "asi.bimu.matched-runtime.v1",

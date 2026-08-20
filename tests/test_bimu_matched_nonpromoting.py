@@ -21,7 +21,7 @@ def test_frozen_bimu_plan_is_matched_and_prospective() -> None:
     candidate = plan.candidate_config.to_protocol_payload()
     assert {key for key in control if control[key] != candidate[key]} == {"memory_window"}
     assert plan.dataset_sha256 == "85c681c2f5fc5c274870b30c9accb3d2a6e9eb90a4575a2bf1ccca64f58b6227"
-    assert FROZEN_PLAN_SHA256 == "633b8e6b6bc212798e3af6b8550e39b99d800c3aae332384cda352dde31c4c75"
+    assert FROZEN_PLAN_SHA256 == "182632b37c3a8598a30fb943742605374a846d965c5602f4db039f27f78754c1"
     assert bimu_plan.frozen_plan_payload()["seed_status"] == {
         "consumed_for_promotion": True,
         "retained_matched_result_exists": False,
@@ -45,7 +45,10 @@ def test_frozen_bimu_plan_is_matched_and_prospective() -> None:
         "numeric_resource_ceiling_bytes": 256 * 1024 * 1024,
     }
     assert payload["comparison_scope"]["paper_comparable"] is False
-    assert payload["execution_authorized"] is False
+    assert payload["authorization"] == {
+        "execution_authorized": False,
+        "authorization_transition_approved": False,
+    }
     assert payload["output_namespace"] == "outputs/bimu_matched/development.v1"
     assert payload["paired_outcome_rule"] == {
         "schema": "asi.bimu.paired-outcome-rule.v1",
