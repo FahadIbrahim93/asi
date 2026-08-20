@@ -71,15 +71,6 @@ AID_RELU_PROBABILITY = 0.75
 # registry: smooth_leaky alpha=1, aid relu_probability=1, deep_fourier disabled.
 # `aid_off` is ReLU by construction and must therefore reproduce the control
 # exactly, which is what pins the harness itself as mechanism-neutral.
-ARM_IDS = (
-    "sgd_current_control",
-    "smooth_leaky",
-    "smooth_leaky_off",
-    "aid",
-    "aid_off",
-    "deep_fourier",
-    "deep_fourier_off",
-)
 ArmID = Literal[
     "sgd_current_control",
     "smooth_leaky",
@@ -89,6 +80,15 @@ ArmID = Literal[
     "deep_fourier",
     "deep_fourier_off",
 ]
+ARM_IDS: tuple[ArmID, ...] = (
+    "sgd_current_control",
+    "smooth_leaky",
+    "smooth_leaky_off",
+    "aid",
+    "aid_off",
+    "deep_fourier",
+    "deep_fourier_off",
+)
 
 # Deep Fourier features emit two post-activation values per preactivation. The
 # lane matches post-activation width across arms, so this arm carries half the
