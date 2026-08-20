@@ -64,10 +64,11 @@ class HistoryFeatureState:
 # =============================================================================
 
 _INT32_MAX = 2**31 - 1
-# Same list ceiling as HordeSpec demons / JAX seed-sequence length. Origin
-# enumerated every decay/channel before the INT32 feature_dim product.
-_MAX_HISTORY_DECAY_RATES = 4_096
-_MAX_HISTORY_CHANNELS = 4_096
+# One 12-bit cardinality budget bounds direct tuple validation, serialized-list
+# normalization, and the implicit all-channel expansion before per-item work.
+_MAX_HISTORY_CONFIGURATION_ITEMS = 1 << 12
+_MAX_HISTORY_DECAY_RATES = _MAX_HISTORY_CONFIGURATION_ITEMS
+_MAX_HISTORY_CHANNELS = _MAX_HISTORY_CONFIGURATION_ITEMS
 _ACTUAL_INT_TYPES = frozenset(
     {
         int,
@@ -253,6 +254,10 @@ class HistoryFeatureExtractor:
             n_channels=channel_count,
             feature_dim=feature_dim,
         )
+        if channel_count > _MAX_HISTORY_CHANNELS:
+            raise ValueError(
+                f"channels must contain at most {_MAX_HISTORY_CHANNELS} indices"
+            )
         if canonical_channels is None:
             canonical_channels = tuple(range(raw_dim))
 

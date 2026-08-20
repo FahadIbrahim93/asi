@@ -1,13 +1,12 @@
-"""List ceilings for history-feature decay rates and channel indices.
-
-Origin enumerated every decay/channel before the INT32 feature_dim product.
-A cheap pointer-repeat still walks the validator; public last-fit is 4096.
-"""
+"""Cardinality preflights for history-feature decay rates and channels."""
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
+import alberta_framework.core.history_features as history_features
 from alberta_framework.core.history_features import (
     _MAX_HISTORY_CHANNELS,
     _MAX_HISTORY_DECAY_RATES,
@@ -15,9 +14,12 @@ from alberta_framework.core.history_features import (
 )
 
 
-def test_documented_protocol_ceilings() -> None:
-    assert _MAX_HISTORY_DECAY_RATES == 4096
-    assert _MAX_HISTORY_CHANNELS == 4096
+class _HostileList(list[object]):
+    calls = 0
+
+    def __len__(self) -> int:
+        type(self).calls += 1
+        raise AssertionError("list length hook executed")
 
 
 def test_last_fit_decay_count_is_accepted() -> None:
@@ -50,7 +52,7 @@ def test_rejects_oversized_decay_rates_before_per_rate_walk() -> None:
             calls += 1
             raise AssertionError("oversized decay tuple walked an element")
 
-    hostile = HostileFloat()
+    hostile: Any = HostileFloat()
     with pytest.raises(ValueError, match="at most 4096"):
         HistoryFeatureExtractor(raw_dim=1, decay_rates=(hostile,) * 4097)
     assert calls == 0
@@ -65,7 +67,7 @@ def test_rejects_oversized_channels_before_per_index_walk() -> None:
             calls += 1
             raise AssertionError("oversized channel tuple walked an element")
 
-    hostile = HostileIndex()
+    hostile: Any = HostileIndex()
     with pytest.raises(ValueError, match="at most 4096"):
         HistoryFeatureExtractor(
             raw_dim=1,
@@ -73,6 +75,22 @@ def test_rejects_oversized_channels_before_per_index_walk() -> None:
             channels=(hostile,) * 4097,
         )
     assert calls == 0
+
+
+def test_default_channels_reject_before_range_expansion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def range_must_not_run(*args: object) -> range:
+        raise AssertionError("default channel range expanded before its count bound")
+
+    monkeypatch.setattr(history_features, "range", range_must_not_run, raising=False)
+    with pytest.raises(ValueError, match="channels must contain at most 4096"):
+        HistoryFeatureExtractor(
+            raw_dim=_MAX_HISTORY_CHANNELS + 1,
+            decay_rates=(0.5,),
+            channels=None,
+            include_raw=False,
+        )
 
 
 @pytest.mark.parametrize(
@@ -89,3 +107,13 @@ def test_from_config_rejects_oversized_lists_before_tuple_copy(
     config[field] = value
     with pytest.raises(ValueError, match="at most 4096"):
         HistoryFeatureExtractor.from_config(config)
+
+
+@pytest.mark.parametrize("field", ["decay_rates", "channels"])
+def test_from_config_rejects_list_subclasses_before_length_hooks(field: str) -> None:
+    config = HistoryFeatureExtractor(raw_dim=1).to_config()
+    config[field] = _HostileList()
+    _HostileList.calls = 0
+    with pytest.raises(ValueError, match="actual tuple"):
+        HistoryFeatureExtractor.from_config(config)
+    assert _HostileList.calls == 0
