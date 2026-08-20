@@ -506,6 +506,7 @@ def test_cli_reserves_exact_shard_before_execution(
     )
     destination = campaign.campaign_path(tmp_path, "shard", arm="memory_off", seed=157001)
     original_load_plan = campaign._load_plan
+    run_called = False
 
     def load_plan_after_reservation(root: Path) -> dict[str, object]:
         assert not destination.exists()
@@ -514,6 +515,8 @@ def test_cli_reserves_exact_shard_before_execution(
         return original_load_plan(root)
 
     def fail_after_reservation(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal run_called
+        run_called = True
         assert not destination.exists()
         marker = destination.with_name(f".{destination.name}.reservation")
         assert marker.is_file()
@@ -535,6 +538,7 @@ def test_cli_reserves_exact_shard_before_execution(
         )
         == 1
     )
+    assert run_called
     assert destination.is_file()
     assert destination.stat().st_mode & 0o777 == 0o444
     assert not destination.with_name(f".{destination.name}.reservation").exists()
@@ -632,6 +636,19 @@ def test_public_publisher_rejects_relocated_shard_before_namespace_access(
             root=relocated,
         )
     assert not relocated.exists()
+
+
+def test_validate_rejects_relocated_shards_before_loading_them(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    registered = tmp_path / "registered"
+    relocated = tmp_path / "relocated"
+    monkeypatch.setattr(campaign, "REGISTERED_OUTPUT_ROOT", registered)
+    shard = campaign.campaign_path(relocated, "shard", arm="memory_off", seed=157001)
+    shard.parent.mkdir(parents=True)
+    shard.write_bytes(b"")
+    with pytest.raises(ValueError, match="registered repository root"):
+        campaign.main(["validate", "--root", str(relocated)])
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")

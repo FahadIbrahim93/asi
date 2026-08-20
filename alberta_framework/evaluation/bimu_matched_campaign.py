@@ -91,8 +91,9 @@ _POLICY: Final = {
     "sota_claim_allowed": False,
     "paper_comparable": False,
     "completed_outcomes_retained": True,
-    "ordinary_exception_failure_receipts_retained": True,
+    "ordinary_exception_failure_receipts_enabled": True,
     "failed_attempt_reservation_retained": False,
+    "failure_receipt_publication_guaranteed": False,
     "base_exception_failure_retention_guaranteed": False,
     "seed_status": "frozen_exposed_consumed_for_promotion",
 }
@@ -1517,7 +1518,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     data_home=args.data_home,
                     plan_document=plan,
                 )
-                publish_json(destination, shard, root=root, _reservation=reservation)
+                validate_bimu_shard(shard)
             except Exception:
                 failed = build_failed_bimu_shard(args.arm, args.seed)
                 publish_json(destination, failed, root=root, _reservation=reservation)
@@ -1530,6 +1531,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     }
                 )
                 return 1
+            publish_json(destination, shard, root=root, _reservation=reservation)
         finally:
             _release_shard_reservation(reservation)
         _print_json({"status": "complete", "shard": str(destination)})
@@ -1560,6 +1562,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             for arm in _ARMS
         ]
         any_shards = any(path.exists() for path in shard_paths)
+        if any_shards or aggregate_path.exists():
+            _require_registered_root(root)
         _validate_namespace(
             root,
             require_complete_shards=any_shards,

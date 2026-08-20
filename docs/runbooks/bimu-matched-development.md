@@ -37,19 +37,16 @@ the authorized revision before any shard starts. That review must also update
 the literal `FROZEN_PLAN_SHA256`; an authorization flip without the matching
 reviewed plan digest fails closed.
 
-Inspect the currently unauthorized plan in a disposable preview namespace:
+Inspect the currently unauthorized plan without publishing an artifact:
 
 ```bash
-campaign_preview=$(mktemp -d)
-.venv/bin/asi-bimu-matched-development plan --root "$campaign_preview"
-.venv/bin/asi-bimu-matched-development validate --root "$campaign_preview"
+.venv/bin/python -c 'import json; from alberta_framework.evaluation.bimu_matched_campaign import build_plan_document; print(json.dumps(build_plan_document(), sort_keys=True))'
 ```
 
-Disposable plan publication and read-only validation cannot dispatch a shard
-or produce an aggregate. `run-shard` and `summarize` accept only the registered
-repository root. Do not invoke `plan --root .` until a reviewed authorization
-transition is ready to publish the source-bound plan in the new immutable
-namespace.
+Every mutating CLI command accepts only the registered repository root and
+fails while either authorization gate is closed. Do not invoke `plan --root .`
+until a reviewed authorization transition is ready to publish the source-bound
+plan in the new immutable namespace.
 
 If any file already exists in `development.v1`, the authorization change must
 advance the namespace rather than replace that file.
@@ -73,11 +70,12 @@ All files publish without replacement under the registered repository's exact
 `outputs/bimu_matched/development.v1/` namespace. Plan and aggregate work is
 reserved before validation, data loading, or strict replay; reservation cleanup
 compares held and live inode identities. Keep supported, rejected, and
-inconclusive aggregates. An ordinary `Exception` during shard execution or
-strict validation publishes one generic failed-attempt receipt atomically at
-that shard's canonical path and returns nonzero. The receipt retains no
-exception type, message, or representation, cannot enter aggregation, and
-forbids retry in this namespace. `BaseException`, process death, and failure to
-publish the failure receipt remain outside this retention guarantee. Source,
+inconclusive aggregates. The runner attempts to publish one generic
+failed-attempt receipt when plan admission, shard execution, or prepublication
+strict validation raises an ordinary `Exception`. A successfully published
+receipt returns nonzero, retains no exception type, message, or representation,
+cannot enter aggregation, and forbids retry in this namespace. `BaseException`,
+process death, completed-result publication failures, and failure to build or
+publish the failure receipt remain outside this retention boundary. Source,
 runtime, dependency, process, dataset, resource, and telemetry digests are
 consistency bindings, not authenticated execution attestation.
