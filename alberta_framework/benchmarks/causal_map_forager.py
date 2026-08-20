@@ -32,6 +32,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._scan_resources import ScanBudget, require_scan_steps
 from alberta_framework.benchmarks.forager import (
     FORAGER_ENVIRONMENT_RNG_SCHEDULE,
     FORAGER_FOV_EMA_DECAY,
@@ -87,6 +88,7 @@ def _require_exact_str(name: object, value: object) -> str:
         raise ValueError(f"{name} must be an exact string")
     return value
 _INT32_MAX = int(np.iinfo(np.int32).max)
+_CAUSAL_MAP_CHUNK_BUDGET = ScanBudget("causal-map JAX chunk", 10_000)
 _MAX_CAUSAL_MAP_CELLS = 4_096
 _MAX_SAFE_FLOAT32_INT32 = float(
     np.nextafter(np.float32(_INT32_MAX), np.float32(-np.inf))
@@ -3077,14 +3079,11 @@ def _validate_benchmark_contract(
         raise ValueError(
             "causal-map benchmark steps must be a positive int below int32 maximum"
         )
-    if (
-        type(benchmark_config.jax_chunk_size) is not int
-        or benchmark_config.jax_chunk_size < 1
-        or benchmark_config.jax_chunk_size >= _INT32_MAX
-    ):
-        raise ValueError(
-            "causal-map jax_chunk_size must be a positive int below int32 maximum"
-        )
+    require_scan_steps(
+        "causal-map jax_chunk_size",
+        benchmark_config.jax_chunk_size,
+        _CAUSAL_MAP_CHUNK_BUDGET,
+    )
     if env.preset != "field_of_view" or env.resolved_env_id != "ForagaxTwoBiomeLarge-v1":
         raise ValueError(
             "causal-map variant is defined only for stationary Forager field_of_view"

@@ -34,6 +34,7 @@ import numpy as np
 from jax import Array
 from jaxtyping import Float, Int
 
+from alberta_framework._scan_resources import ScanBudget, require_scan_steps
 from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
 from alberta_framework.core.behavior_model import (
     BehaviorModel,
@@ -51,6 +52,10 @@ from alberta_framework.core.world_model import (
 )
 
 _INT32_MAX = 2**31 - 1
+# Public last-fit in tests is rollout_horizon=5. Origin handed large
+# horizons to jnp.arange with no last-fit reject — hang/OOM, not INT32 leftover.
+_DREAM_ROLLOUT_BUDGET = ScanBudget("dream rollout", maximum_steps=10_000)
+_DREAM_ROLLOUT_MAX_HORIZON = _DREAM_ROLLOUT_BUDGET.maximum_steps
 _ACTUAL_INT_TYPES: frozenset[type] = frozenset(
     {
         int,
@@ -85,6 +90,11 @@ def _require_int(
     if not minimum <= canonical <= maximum:
         raise ValueError(f"{name} must be an integer")
     return canonical
+
+
+def _require_dream_rollout_horizon(value: object) -> int:
+    """Reject rollout lengths above the public last-fit before ``jnp.arange``."""
+    return require_scan_steps("rollout_horizon", value, _DREAM_ROLLOUT_BUDGET)
 
 
 def _validated_config_float(
@@ -202,7 +212,12 @@ class DreamingConfig:
         object.__setattr__(
             self,
             "rollout_horizon",
-            _require_int("rollout_horizon", self.rollout_horizon, minimum=1),
+            _require_int(
+                "rollout_horizon",
+                self.rollout_horizon,
+                minimum=1,
+                maximum=_DREAM_ROLLOUT_MAX_HORIZON,
+            ),
         )
         object.__setattr__(
             self, "stop_on_terminal", _require_bool(self.stop_on_terminal, "stop_on_terminal")
@@ -383,7 +398,12 @@ class GuardedDreamer:
             _validated_config_float(
                 "max_discount", self._config.max_discount, lower=0.0
             )
-        _require_int("rollout_horizon", self._config.rollout_horizon, minimum=1)
+        _require_int(
+            "rollout_horizon",
+            self._config.rollout_horizon,
+            minimum=1,
+            maximum=_DREAM_ROLLOUT_MAX_HORIZON,
+        )
         _validated_config_float(
             "confidence_threshold", self._config.confidence_threshold, lower=0.0
         )
@@ -726,7 +746,12 @@ class DreamRolloutConfig:
         object.__setattr__(
             self,
             "rollout_horizon",
-            _require_int("rollout_horizon", self.rollout_horizon, minimum=1),
+            _require_int(
+                "rollout_horizon",
+                self.rollout_horizon,
+                minimum=1,
+                maximum=_DREAM_ROLLOUT_MAX_HORIZON,
+            ),
         )
         for name in ("confidence_threshold", "max_model_error", "discount_floor"):
             object.__setattr__(
@@ -1008,7 +1033,13 @@ def dream_rollout(
     rollout_state: DreamRolloutState,
     config: DreamRolloutConfig,
 ) -> DreamRolloutResult:
-    """Generate a bounded short rollout using ``jax.lax.scan``."""
+    """Generate a bounded short rollout using ``jax.lax.scan``.
+
+    Raises:
+        ValueError: If ``config.rollout_horizon`` is not an exact integer in
+            ``[1, 10_000]``.
+    """
+    horizon = _require_dream_rollout_horizon(config.rollout_horizon)
 
     def step_fn(
         carry: DreamRolloutState,
@@ -1026,7 +1057,7 @@ def dream_rollout(
     final_state, transitions = jax.lax.scan(
         step_fn,
         rollout_state,
-        jnp.arange(config.rollout_horizon, dtype=jnp.int32),
+        jnp.arange(horizon, dtype=jnp.int32),
     )
     return DreamRolloutResult(state=final_state, transitions=transitions)
 

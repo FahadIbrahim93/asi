@@ -17,7 +17,7 @@ import math
 import re
 import threading
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
@@ -172,6 +172,56 @@ def _shape_size(shape: tuple[int, ...]) -> int:
     for dimension in shape:
         size *= dimension
     return size
+
+
+def _require_bounded_sequence_length(
+    value: object,
+    *,
+    name: str,
+    maximum: int,
+) -> int:
+    if type(value) not in (list, tuple, range, np.ndarray):
+        raise ValueError(f"{name} must be an exact bounded sequence")
+    sequence = cast(list[object] | tuple[object, ...] | range | np.ndarray[Any, Any], value)
+    count = len(sequence)
+    if type(count) is not int or count < 0 or count > maximum:
+        raise ValueError(f"{name} exceeds the array element limit")
+    return count
+
+
+def _require_builtin_value_shape(
+    value: object,
+    *,
+    expected: tuple[int, ...],
+    name: str,
+) -> None:
+    """Validate a bounded builtin nested sequence before NumPy conversion."""
+    if type(value) is np.ndarray:
+        array = value
+        if array.size > _MAX_ARRAY_ELEMENTS or array.shape != expected:
+            raise ValueError(f"{name} shape must be {expected}, got {array.shape}")
+        return
+    if not expected:
+        if type(value) in (list, tuple, range):
+            raise ValueError(f"{name} shape must be {expected}")
+        return
+    if type(value) is range:
+        count = _require_bounded_sequence_length(
+            value, name=name, maximum=_MAX_ARRAY_ELEMENTS
+        )
+        if len(expected) != 1 or count != expected[0]:
+            raise ValueError(f"{name} shape must be {expected}, got ({count},)")
+        return
+    if type(value) not in (list, tuple):
+        raise ValueError(f"{name} must be an exact bounded sequence or numeric array")
+    count = _require_bounded_sequence_length(
+        value, name=name, maximum=_MAX_ARRAY_ELEMENTS
+    )
+    if count != expected[0]:
+        raise ValueError(f"{name} shape must be {expected}, got ({count},)")
+    children = cast(list[object] | tuple[object, ...], value)
+    for child in children:
+        _require_builtin_value_shape(child, expected=expected[1:], name=name)
 
 
 def _numeric_array(value: Any, *, name: str) -> np.ndarray[Any, Any]:
@@ -344,9 +394,17 @@ class SpaceSpec:
         if self.low is None:
             return
         assert self.high is not None
+        size = _shape_size(self.shape)
+        low_count = _require_bounded_sequence_length(
+            self.low, name="box low bounds", maximum=_MAX_ARRAY_ELEMENTS
+        )
+        high_count = _require_bounded_sequence_length(
+            self.high, name="box high bounds", maximum=_MAX_ARRAY_ELEMENTS
+        )
+        if low_count != size or high_count != size:
+            raise ValueError("box bounds must contain one value per flattened shape entry")
         lows = _numeric_array(self.low, name="box low bounds")
         highs = _numeric_array(self.high, name="box high bounds")
-        size = _shape_size(self.shape)
         if lows.shape != (size,) or highs.shape != (size,):
             raise ValueError("box bounds must contain one value per flattened shape entry")
         if np.any(lows > highs):
@@ -398,13 +456,39 @@ class SpaceSpec:
         high: Sequence[float | int] | None,
         semantic_id: str,
     ) -> SpaceSpec:
+        try:
+            rank = len(shape)
+        except TypeError as exc:
+            raise ValueError("shape must be a tuple of positive integer dimensions or ()") from exc
+        if rank > _MAX_ARRAY_RANK:
+            raise ValueError(f"space rank must be <= {_MAX_ARRAY_RANK}")
+        host_shape = tuple(shape)
+        host_low: tuple[float | int, ...] | None = None
+        host_high: tuple[float | int, ...] | None = None
+        if low is not None or high is not None:
+            if low is None or high is None:
+                raise ValueError("box low and high bounds must both be present or both be absent")
+            low_count = _require_bounded_sequence_length(
+                low, name="box low bounds", maximum=_MAX_ARRAY_ELEMENTS
+            )
+            high_count = _require_bounded_sequence_length(
+                high, name="box high bounds", maximum=_MAX_ARRAY_ELEMENTS
+            )
+            if any(type(dimension) is not int or dimension <= 0 for dimension in host_shape):
+                if host_shape:
+                    raise ValueError("shape must be a tuple of positive integer dimensions or ()")
+            size = _shape_size(host_shape)
+            if low_count != size or high_count != size:
+                raise ValueError("box bounds must contain one value per flattened shape entry")
+            host_low = tuple(low)
+            host_high = tuple(high)
         return cls(
             kind="box",
-            shape=tuple(shape),
+            shape=host_shape,
             dtype=dtype,
             semantic_id=semantic_id,
-            low=None if low is None else tuple(low),
-            high=None if high is None else tuple(high),
+            low=host_low,
+            high=host_high,
         )
 
     def encode(self, value: Any) -> ArrayValue:
@@ -430,6 +514,12 @@ class SpaceSpec:
                     raise ValueError(
                         f"space value dtype must be exactly {self.dtype}, got {supplied_name}"
                     )
+            if self.shape != () and supplied_dtype is None:
+                _require_builtin_value_shape(
+                    value,
+                    expected=self.shape,
+                    name="space value",
+                )
             array = _numeric_array(value, name="space value")
             if array.shape != self.shape:
                 raise ValueError(f"space value shape must be {self.shape}, got {array.shape}")

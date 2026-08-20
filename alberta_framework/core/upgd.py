@@ -49,6 +49,12 @@ import numpy as np
 from jax import Array
 from jaxtyping import Float
 
+from alberta_framework._scan_resources import (
+    ScanBudget,
+    require_jax_leading_length,
+    require_matching_jax_leading_length,
+    require_scan_steps,
+)
 from alberta_framework.core._float32_scalars import (
     validated_float32_scalar_with_ratio,
 )
@@ -68,6 +74,10 @@ def _require_exact_str(name: object, value: object) -> str:
 
 
 _INT32_MAX = 2**31 - 1
+# Public last-fit in tests is 5_000 array steps / 50 stream steps. Origin handed
+# ``10**12`` to ``jnp.arange`` with no reject — hang/OOM, not an INT32 leftover.
+_UPGD_LOOP_MAX_STEPS = 10_000
+_UPGD_LOOP_BUDGET = ScanBudget("UPGD learning-loop", _UPGD_LOOP_MAX_STEPS)
 _ACTUAL_INT_TYPES: frozenset[type] = frozenset(
     {
         int,
@@ -100,6 +110,37 @@ def _require_int(name: str, value: object, *, minimum: int, maximum: int = _INT3
     if not minimum <= canonical <= maximum:
         raise ValueError(f"{name} must be an integer")
     return canonical
+
+
+def _require_upgd_loop_steps(name: str, value: object) -> int:
+    """Reject scan lengths above the public last-fit before ``jnp.arange``."""
+    return require_scan_steps(name, value, _UPGD_LOOP_BUDGET)
+
+
+def _require_upgd_array_steps(observations: object, targets: object) -> int:
+    """Reject pre-collected scan lengths above the public last-fit before scan."""
+    if not isinstance(observations, jax.Array):
+        raise TypeError(
+            "observations must be a trusted array; observations and targets must be JAX arrays"
+        )
+    if not isinstance(targets, jax.Array):
+        raise TypeError(
+            "targets must be a trusted array; observations and targets must be JAX arrays"
+        )
+    try:
+        num_steps = require_jax_leading_length(
+            "observations", observations, _UPGD_LOOP_BUDGET, ranks=(2,)
+        )
+    except ValueError as error:
+        if observations.ndim == 2 and not 1 <= observations.shape[0] <= _UPGD_LOOP_MAX_STEPS:
+            raise ValueError(
+                "observations num_steps must be an integer in "
+                f"[1, {_UPGD_LOOP_MAX_STEPS}]"
+            ) from None
+        raise error
+    require_jax_leading_length("targets", targets, _UPGD_LOOP_BUDGET, ranks=(2,))
+    require_matching_jax_leading_length("targets", targets, expected=num_steps)
+    return num_steps
 
 
 def _require_choice(name: str, value: object, choices: frozenset[str]) -> str:
@@ -3348,6 +3389,45 @@ class UPGDLearner:
 # =============================================================================
 
 
+def _has_trusted_array_type(value: object) -> bool:
+    actual_type = type(value)
+    return (
+        actual_type is np.ndarray
+        or issubclass(
+            actual_type,
+            (
+                jax.Array,
+                jax.core.Tracer,
+                jax.ShapeDtypeStruct,
+                jax.core.ShapedArray,
+            ),
+        )
+    )
+
+
+def _trusted_array(
+    name: str,
+    value: object,
+    *,
+    shape: tuple[int, ...],
+    dtype: Any,
+) -> Array:
+    """Validate static array metadata without dispatching on hostile objects."""
+    if not _has_trusted_array_type(value):
+        raise TypeError(f"{name} must be a trusted array")
+    trusted = cast(Array, value)
+    try:
+        actual_shape = tuple(trusted.shape)
+        actual_dtype = np.dtype(trusted.dtype)
+    except (AttributeError, TypeError, ValueError) as error:
+        raise TypeError(f"{name} must expose trusted shape and dtype metadata") from error
+    if actual_shape != shape:
+        raise ValueError(f"{name} must have shape {shape}")
+    if actual_dtype != np.dtype(dtype):
+        raise TypeError(f"{name} must have dtype {np.dtype(dtype)}")
+    return trusted
+
+
 def run_upgd_arrays(
     learner: UPGDLearner,
     state: UPGDState,
@@ -3366,7 +3446,31 @@ def run_upgd_arrays(
     Returns:
         :class:`UPGDLearningResult` with the final state and the per-step
         4-column metrics array.
+
+    Raises:
+        TypeError: If ``observations`` or ``targets`` is not a JAX array.
+        ValueError: If ``num_steps`` is not an exact integer in
+            ``[1, 10_000]``.
     """
+    num_steps = _require_upgd_array_steps(observations, targets)
+    if type(learner) is not UPGDLearner:
+        raise TypeError("learner must be an exact UPGDLearner")
+    if type(state) is not UPGDState:
+        raise TypeError("state must be an exact UPGDState")
+
+    feature_dim = (
+        state.trunk_params.weights[0].shape[1]
+        if state.trunk_params.weights
+        else state.head_params.weights[0].shape[1]
+    )
+    checked_obs = _trusted_array(
+        "observations", observations, shape=(num_steps, feature_dim), dtype=jnp.float32
+    )
+    checked_targets = _trusted_array(
+        "targets", targets, shape=(num_steps, learner.n_heads), dtype=jnp.float32
+    )
+
+    _require_float32_resource("upgd array metrics", vector_scalars=4 * num_steps)
 
     def step_fn(carry: UPGDState, inputs: tuple[Array, Array]) -> tuple[UPGDState, Array]:
         obs, tgt = inputs
@@ -3374,7 +3478,7 @@ def run_upgd_arrays(
         return result.state, result.metrics
 
     t0 = time.time()
-    final_state, metrics = jax.lax.scan(step_fn, state, (observations, targets))
+    final_state, metrics = jax.lax.scan(step_fn, state, (checked_obs, checked_targets))
     elapsed = time.time() - t0
     final_state = final_state.replace(uptime_s=final_state.uptime_s + elapsed)  # type: ignore[attr-defined]  # noqa: E501
     return UPGDLearningResult(state=final_state, metrics=metrics)  # type: ignore[call-arg]
@@ -3405,7 +3509,17 @@ def run_upgd_loop[StreamStateT](
     Returns:
         :class:`UPGDLearningResult` with the final state and the per-step
         4-column metrics array.
+
+    Raises:
+        ValueError: If ``num_steps`` exceeds the documented protocol ceiling
+            (``10_000``).
     """
+    num_steps = _require_upgd_loop_steps("num_steps", num_steps)
+    if type(learner) is not UPGDLearner:
+        raise TypeError("learner must be an exact UPGDLearner")
+    if learner_state is not None and type(learner_state) is not UPGDState:
+        raise TypeError("learner_state must be an exact UPGDState")
+    _require_float32_resource("upgd loop metrics", vector_scalars=4 * num_steps)
     stream_key, init_key = jax.random.split(key)
     if learner_state is None:
         learner_state = learner.init(stream.feature_dim, init_key)

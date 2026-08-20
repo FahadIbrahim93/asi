@@ -10,6 +10,13 @@ from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 
+from alberta_framework._scan_resources import (
+    ScanBudget,
+    require_parallel_count,
+    require_scan_steps,
+    require_step_units,
+)
+
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
     from matplotlib.figure import Figure
@@ -53,6 +60,24 @@ def _require_positive_int(name: str, value: object) -> int:
     if value <= 0:
         raise ValueError(f"{name} must be a positive int")
     return value
+
+
+_VIS_GRID_MAX = 10_000
+_VIS_WINDOW_BUDGET = ScanBudget("visualization smoothing window", _VIS_GRID_MAX)
+_VIS_HEATMAP_BUDGET = ScanBudget(
+    "visualization heatmap",
+    maximum_steps=_VIS_GRID_MAX,
+    maximum_parallel=_VIS_GRID_MAX,
+    maximum_step_units=_VIS_GRID_MAX,
+)
+
+
+def _require_bounded_plot_sequence(name: str, values: object) -> int:
+    """Return a bounded length without dispatching to untrusted sequence hooks."""
+
+    if type(values) not in (list, tuple, range, np.ndarray):
+        raise TypeError(f"{name} must be an exact list, tuple, range, or NumPy array")
+    return len(cast(Any, values))
 
 
 def set_publication_style(
@@ -155,7 +180,11 @@ def plot_learning_curves(
     """
     show_ci = _require_exact_bool("show_ci", show_ci)
     log_scale = _require_exact_bool("log_scale", log_scale)
-    window_size = _require_positive_int("window_size", window_size)
+    window_size = require_scan_steps(
+        "window_size",
+        _require_positive_int("window_size", window_size),
+        _VIS_WINDOW_BUDGET,
+    )
 
     try:
         import matplotlib.pyplot as plt
@@ -344,6 +373,17 @@ def plot_hyperparameter_heatmap(
         Tuple of (figure, axes)
     """
     lower_is_better = _require_exact_bool("lower_is_better", lower_is_better)
+    n1 = require_scan_steps(
+        "param1_values length",
+        _require_bounded_plot_sequence("param1_values", param1_values),
+        _VIS_HEATMAP_BUDGET,
+    )
+    n2 = require_parallel_count(
+        "param2_values length",
+        _require_bounded_plot_sequence("param2_values", param2_values),
+        _VIS_HEATMAP_BUDGET,
+    )
+    require_step_units(n1, n2, _VIS_HEATMAP_BUDGET)
 
     try:
         import matplotlib.pyplot as plt
@@ -355,7 +395,7 @@ def plot_hyperparameter_heatmap(
     else:
         fig = cast("Figure", ax.figure)
     # Build heatmap data
-    data = np.zeros((len(param1_values), len(param2_values)))
+    data = np.zeros((n1, n2))
     for i, p1 in enumerate(param1_values):
         for j, p2 in enumerate(param2_values):
             name = name_pattern.format(p1=p1, p2=p2)

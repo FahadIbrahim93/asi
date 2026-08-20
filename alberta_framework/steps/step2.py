@@ -31,6 +31,7 @@ import numpy as np
 from jax import Array
 
 from alberta_framework._float32 import round_real_to_float32_with_ratio
+from alberta_framework._scan_resources import ScanBudget, require_scan_steps
 from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core.associative_memory import (
     AssociativeFeatureFamily,
@@ -134,6 +135,10 @@ _STEP2_ASSOCIATIVE_CONFIG_KEYS = frozenset(
     }
 )
 _INT32_MAX = 2**31 - 1
+# Public last-fit in tests is 128 smoke steps. Origin accepted INT32_MAX
+# and looped range(steps) with no last-fit reject — hang, not leftover INT32 math.
+_STEP2_LOOP_BUDGET = ScanBudget("Step 2 host loop", maximum_steps=10_000)
+_STEP2_LOOP_MAX_STEPS = _STEP2_LOOP_BUDGET.maximum_steps
 _ACTUAL_INT_TYPES = frozenset(
     {
         int,
@@ -318,6 +323,23 @@ def _require_int(
     if maximum is not None and number > maximum:
         raise ValueError(f"{name} must be <= {maximum}")
     return number
+
+
+def _require_step2_loop_steps(name: str, value: object, *, minimum: int = 1) -> int:
+    """Reject collection/smoke lengths above the public last-fit before ``range``."""
+    if type(minimum) is not int or minimum not in (1, 2):
+        raise ValueError("Step 2 loop minimum must be one or two")
+    try:
+        steps = require_scan_steps(name, value, _STEP2_LOOP_BUDGET)
+    except ValueError:
+        raise ValueError(
+            f"{name} must be an integer in [{minimum}, {_STEP2_LOOP_MAX_STEPS}]"
+        ) from None
+    if steps < minimum:
+        raise ValueError(
+            f"{name} must be an integer in [{minimum}, {_STEP2_LOOP_MAX_STEPS}]"
+        )
+    return steps
 
 
 def _require_bool(name: str, value: object) -> bool:
@@ -1141,7 +1163,7 @@ def collect_step2_arrays(
     experiments use their dedicated runners so they can capture full metadata,
     baselines, and paired seed statistics.
     """
-    steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
+    steps = _require_step2_loop_steps("steps", steps)
     if type(stream) not in (
         OutOfClassPolynomialStream,
         FrequencyMismatchStream,
@@ -1177,7 +1199,7 @@ def run_step2_smoke(
     utility/perturbation metrics, and config serialization.  It is not a
     canonical MLP comparison.
     """
-    steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
+    steps = _require_step2_loop_steps("steps", steps)
     seed = require_jax_seed(seed, name="seed")
     final_window = _require_int("final_window", final_window, minimum=1, maximum=steps)
     cfg = cast(Step2KernelConfig, _exact_config_or_default("config", config, Step2KernelConfig))
@@ -1219,7 +1241,7 @@ def run_step2_associative_smoke(
         Step2AssociativeConfig,
         _exact_config_or_default("config", config, Step2AssociativeConfig),
     )
-    steps = _require_int("steps", steps, minimum=2, maximum=_INT32_MAX)
+    steps = _require_step2_loop_steps("steps", steps, minimum=2)
     seed = require_jax_seed(seed, name="seed")
     window = _require_int("window", window, minimum=1, maximum=steps // 2)
     pattern_count = min(8, max(2, steps // 8))

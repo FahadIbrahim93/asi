@@ -6,7 +6,7 @@ from typing import Any, cast
 import numpy as np
 import pytest
 
-from alberta_framework.steps.step8 import Step8WorldModelConfig
+from alberta_framework.steps.step8 import Step8WorldModelConfig, run_step8_smoke
 
 
 class _EvilStr(str):
@@ -169,6 +169,76 @@ def test_float_subclass_with_lying_ratio_is_rejected() -> None:
     assert RatioFloat.calls == 0
 
 
+def test_step8_smoke_zero_steps_raises() -> None:
+    with pytest.raises(ValueError, match="steps must be an integer in"):
+        run_step8_smoke(steps=0)
+
+
+@pytest.mark.parametrize("steps", [True, False, 1.5])
+def test_step8_smoke_rejects_non_integer_steps(steps: object) -> None:
+    with pytest.raises(ValueError, match="steps must be an integer"):
+        run_step8_smoke(steps=cast(Any, steps))
+
+
+def test_step8_smoke_rejects_class_spoofed_integer_steps() -> None:
+    class _SpoofedInt:
+        """Mimics ``int`` via ``__class__`` to defeat ``isinstance`` checks."""
+
+        @property
+        def __class__(self) -> type:  # type: ignore[override]
+            return int
+
+        def __int__(self) -> int:  # pragma: no cover
+            raise AssertionError("SpoofedInt.__int__ must not be called")
+
+        def __index__(self) -> int:  # pragma: no cover
+            raise AssertionError("SpoofedInt.__index__ must not be called")
+
+    with pytest.raises(ValueError, match="steps must be an integer"):
+        run_step8_smoke(steps=cast(Any, _SpoofedInt()))
+
+
+def test_step8_smoke_rejects_oversized_steps_before_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A hostile/mistaken huge ``steps`` must be rejected before any array is
+    allocated. Origin only checked ``steps < 1`` with no upper bound, so a
+    caller-supplied ``steps=2**31`` (or larger) reached ``jr.normal``/
+    ``jnp.arange`` uncapped -- unbounded allocation, hang/OOM.
+    """
+
+    def _spy(*args: object, **kwargs: object) -> Any:
+        raise AssertionError(f"jr.normal must not run: {args} {kwargs}")
+
+    monkeypatch.setattr("alberta_framework.steps.step8.jr.normal", _spy)
+    with pytest.raises(ValueError, match="Step 8 smoke budget"):
+        run_step8_smoke(steps=2**31)
+
+
+def test_step8_smoke_rejects_trillion_steps_before_allocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def _spy(*args: object, **kwargs: object) -> Any:
+        raise AssertionError(f"jr.normal must not run: {args} {kwargs}")
+
+    monkeypatch.setattr("alberta_framework.steps.step8.jr.normal", _spy)
+    with pytest.raises(ValueError, match="Step 8 smoke budget"):
+        run_step8_smoke(steps=10**12)
+
+
+def test_step8_smoke_accepts_declared_last_fit_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The declared 10,000-step last fit reaches allocation, but larger inputs do not."""
+
+    def _spy(*args: object, **kwargs: object) -> Any:
+        raise AssertionError(f"jr.normal must not run: {args} {kwargs}")
+
+    monkeypatch.setattr("alberta_framework.steps.step8.jr.normal", _spy)
+    with pytest.raises(AssertionError, match="jr.normal must not run"):
+        run_step8_smoke(steps=10_000)
+
+
 def test_from_dict_rejects_hostile_mapping_and_keys() -> None:
     class _HostileDict(dict[str, object]):
         pass
@@ -181,5 +251,3 @@ def test_from_dict_rejects_hostile_mapping_and_keys() -> None:
     bad_keys[_EvilStr("extra")] = 1
     with pytest.raises(ValueError, match="keys must be exact strings"):
         Step8WorldModelConfig.from_dict(cast(Any, bad_keys))
-
-

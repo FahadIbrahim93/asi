@@ -35,6 +35,7 @@ import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int, PRNGKeyArray
 
+from alberta_framework._scan_resources import ScanBudget, require_scan_steps
 from alberta_framework.core._float32_scalars import validated_float32_scalar_with_ratio
 from alberta_framework.core.future_utility import (
     bias_correct_future_utility,
@@ -53,6 +54,12 @@ from alberta_framework.core.update_safety import (
 _INT32_MAX = 2**31 - 1
 _UINT32_MAX = 2**32 - 1
 _MAX_STATE_NBYTES = 256 * 1024 * 1024
+# README / package-init public scan last-fit. Origin handed ``10**12`` to
+# ``jnp.arange`` with no reject — hang/OOM, not an INT32 leftover.
+_FEATURE_DISCOVERY_LOOP_MAX_STEPS = 10_000
+_FEATURE_DISCOVERY_LOOP_BUDGET = ScanBudget(
+    "feature-discovery learning-loop", _FEATURE_DISCOVERY_LOOP_MAX_STEPS
+)
 _ACTUAL_INT_TYPES = frozenset(
     {
         int,
@@ -78,6 +85,11 @@ def _require_int32(name: str, value: object, *, minimum: int) -> int:
     if not minimum <= canonical <= _INT32_MAX:
         raise ValueError(f"{name} must be an integer in [{minimum}, {_INT32_MAX}]")
     return canonical
+
+
+def _require_feature_discovery_loop_steps(name: str, value: object) -> int:
+    """Reject scan lengths above the public last-fit before ``jnp.arange``."""
+    return require_scan_steps(name, value, _FEATURE_DISCOVERY_LOOP_BUDGET)
 
 
 def _saturating_int32_increment(value: Array) -> Array:
@@ -1978,6 +1990,7 @@ def run_feature_discovery_loop(
     learner_state: FeatureDiscoveryState | None = None,
 ) -> FeatureDiscoveryLearningResult:
     """Run feature discovery directly from a scan-compatible stream."""
+    num_steps = _require_feature_discovery_loop_steps("num_steps", num_steps)
     stream_key, learner_key = jr.split(key)
     stream_state = stream.init(stream_key)
     if learner_state is None:
