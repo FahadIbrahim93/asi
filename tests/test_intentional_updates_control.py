@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 from typing import Never
 
@@ -28,6 +29,13 @@ def test_plan_is_fresh_prospective_and_permanently_nonpromoting() -> None:
     assert plan["confidence_critical"] == 5.391949071934058
     assert plan["confidence_critical"].hex() == "0x1.5915b18f69e09p+2"
     assert plan["protocol_families"] == ["supervised_ipmnist", "td_control"]
+
+
+def test_catalog_cli_is_read_only_and_execution_stays_closed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert lane.main(["--catalog"]) == 0
+    assert json.loads(capsys.readouterr().out) == lane.frozen_plan()
 
 
 @pytest.mark.parametrize(
