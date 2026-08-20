@@ -1189,12 +1189,14 @@ def _require_live_parent(destination: Path, parent_descriptor: int) -> None:
 
 
 ShardReservation = tuple[Path, int, int, str]
+_COMPLETED_REPLAY_PROOF_CAPABILITY: Final = object()
 
 
 @dataclass(frozen=True, slots=True)
 class _CompletedShardReplayProof:
     """Private proof that one exact completed payload passed dataset-bound replay."""
 
+    capability: object
     payload_sha256: str
     shard_sha256: str
     dataset_sha256: str
@@ -1209,6 +1211,7 @@ def _prove_completed_shard_by_reexecution(
     validated_arrays = _validated_arrays(*arrays, plan=FROZEN_BIMU_MATCHED_PLAN)
     shard = validate_bimu_shard_by_reexecution(value, *validated_arrays)
     return _CompletedShardReplayProof(
+        capability=_COMPLETED_REPLAY_PROOF_CAPABILITY,
         payload_sha256=hashlib.sha256(_canonical(shard)).hexdigest(),
         shard_sha256=cast(str, shard["shard_sha256"]),
         dataset_sha256=FROZEN_BIMU_MATCHED_PLAN.dataset_sha256,
@@ -1316,9 +1319,14 @@ def publish_json(
                 validate_failed_bimu_shard(candidate)
             else:
                 completed = validate_bimu_shard(candidate)
-                if type(_completed_replay_proof) is not _CompletedShardReplayProof:
+                if (
+                    type(_completed_replay_proof) is not _CompletedShardReplayProof
+                    or _completed_replay_proof.capability
+                    is not _COMPLETED_REPLAY_PROOF_CAPABILITY
+                ):
                     _fail("completed shard publication requires a strict reexecution proof")
                 expected_proof = _CompletedShardReplayProof(
+                    capability=_COMPLETED_REPLAY_PROOF_CAPABILITY,
                     payload_sha256=hashlib.sha256(_canonical(completed)).hexdigest(),
                     shard_sha256=cast(str, completed["shard_sha256"]),
                     dataset_sha256=FROZEN_BIMU_MATCHED_PLAN.dataset_sha256,

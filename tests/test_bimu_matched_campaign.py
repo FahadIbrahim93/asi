@@ -495,6 +495,30 @@ def test_completed_shard_publisher_requires_matching_reexecution_proof(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_completed_shard_publisher_rejects_constructed_proof_without_capability(
+    tmp_path: Path, tiny_campaign: Any
+) -> None:
+    destination = campaign.campaign_path(
+        tmp_path, "shard", arm="memory_off", seed=157001
+    )
+    shard = campaign.run_bimu_shard("memory_off", 157001)
+    forged = campaign._CompletedShardReplayProof(
+        capability=object(),
+        payload_sha256=hashlib.sha256(campaign._canonical(shard)).hexdigest(),
+        shard_sha256=cast(str, shard["shard_sha256"]),
+        dataset_sha256=campaign.FROZEN_BIMU_MATCHED_PLAN.dataset_sha256,
+    )
+    with pytest.raises(ValueError, match="strict reexecution proof"):
+        campaign.publish_json(
+            destination,
+            shard,
+            root=tmp_path,
+            _completed_replay_proof=forged,
+        )
+    assert not destination.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
 def test_forged_self_consistent_completed_shard_cannot_be_retained(
     tmp_path: Path, tiny_campaign: Any
 ) -> None:
