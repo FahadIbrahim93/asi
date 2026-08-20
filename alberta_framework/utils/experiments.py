@@ -26,7 +26,16 @@ import jax.random as jr
 import numpy as np
 from numpy.typing import NDArray
 
-from alberta_framework._seed_validation import require_jax_seed
+from alberta_framework._scan_resources import (
+    ScanBudget,
+    require_parallel_count,
+    require_scan_steps,
+    require_step_units,
+)
+from alberta_framework._seed_validation import (
+    JAX_SEED_SEQUENCE_MAX_LENGTH,
+    require_jax_seed,
+)
 from alberta_framework.core.learners import (
     LinearLearner,
     metrics_to_dicts,
@@ -39,7 +48,14 @@ from alberta_framework.utils.statistics import common_final_window
 _INT32_MAX = 2**31 - 1
 # Public last-fit in tests is seeds=3. Origin handed unbounded counts to
 # list(range(seeds)) with no last-fit reject — hang, not leftover INT32 math.
-_MULTI_SEED_MAX_COUNT = 10_000
+_MULTI_SEED_MAX_CONFIGS = 256
+_MULTI_SEED_BUDGET = ScanBudget(
+    "multi-seed experiment",
+    maximum_steps=JAX_SEED_SEQUENCE_MAX_LENGTH,
+    maximum_parallel=_MULTI_SEED_MAX_CONFIGS,
+    maximum_step_units=JAX_SEED_SEQUENCE_MAX_LENGTH,
+)
+_MULTI_SEED_MAX_COUNT = _MULTI_SEED_BUDGET.maximum_steps
 
 _NUMPY_COORDINATE_TYPES = frozenset(
     np.dtype(dtype_code).type
@@ -488,9 +504,16 @@ def run_multi_seed_experiment(
             seed count is not a positive built-in integer, or if the explicit
             seed list is empty, non-canonical, or contains duplicates
     """
+    if type(configs) not in (list, tuple):
+        raise ValueError("configs must be an exact list or tuple")
+    raw_configs = cast(list[ExperimentConfig] | tuple[ExperimentConfig, ...], configs)
+    config_count = len(raw_configs)
+    if config_count:
+        require_parallel_count("config count", config_count, _MULTI_SEED_BUDGET)
+
     seen_names: set[str] = set()
     duplicate_names: set[str] = set()
-    for config in configs:
+    for config in raw_configs:
         config_name = _require_exact_str("config.name", config.name)
         if config_name in seen_names:
             duplicate_names.add(config_name)
@@ -510,32 +533,23 @@ def run_multi_seed_experiment(
     # Convert seeds to list. Bool is a subclass of int, so isinstance(seeds, int)
     # would treat True as a one-seed experiment and False as an empty run.
     if type(seeds) is int:
-        if seeds < 1 or seeds > _MULTI_SEED_MAX_COUNT:
-            raise ValueError(
-                f"seeds count must be an integer in [1, {_MULTI_SEED_MAX_COUNT}]"
-            )
-        seed_list = list(range(seeds))
+        seed_count = require_scan_steps("seeds count", seeds, _MULTI_SEED_BUDGET)
+        seed_list = list(range(seed_count))
     else:
-        if isinstance(seeds, (str, bytes, bytearray)):
+        if type(seeds) not in (list, tuple):
             raise ValueError(
-                "seeds must be a positive built-in integer count or a sequence "
-                "of unique built-in integer seeds"
+                "seeds must be a positive built-in integer count or an exact "
+                "list or tuple of unique built-in integer seeds"
             )
-        try:
-            raw_seeds = tuple(cast(Iterable[int], seeds))
-        except TypeError as exc:
-            raise ValueError(
-                "seeds must be a positive built-in integer count or a sequence "
-                "of unique built-in integer seeds"
-            ) from exc
-        if not raw_seeds:
-            raise ValueError(
-                "seeds must be a non-empty sequence of unique built-in integer seeds"
-            )
+        raw_seeds = cast(list[object] | tuple[object, ...], seeds)
+        seed_count = require_scan_steps("seeds length", len(raw_seeds), _MULTI_SEED_BUDGET)
         seed_list = [
-            require_jax_seed(seed, name=f"seeds[{index}]")
-            for index, seed in enumerate(raw_seeds)
+            require_jax_seed(raw_seeds[index], name=f"seeds[{index}]")
+            for index in range(seed_count)
         ]
+
+    if config_count:
+        require_step_units(len(seed_list), config_count, _MULTI_SEED_BUDGET)
 
     seen_seeds: set[int] = set()
     duplicate_seeds: set[int] = set()
@@ -551,7 +565,7 @@ def run_multi_seed_experiment(
 
     # Build list of (config, seed) pairs
     tasks: list[tuple[ExperimentConfig, int]] = []
-    for config in configs:
+    for config in raw_configs:
         for seed in seed_list:
             tasks.append((config, seed))
 
