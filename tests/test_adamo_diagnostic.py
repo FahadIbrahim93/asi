@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 from pathlib import Path
+from typing import Never
 
 import numpy as np
 import pytest
@@ -99,6 +100,70 @@ def test_hostile_scalar_alias_and_unfrozen_seed_are_rejected(
         validate_adamo_diagnostic(hostile)
     with pytest.raises(ValueError, match="frozen"):
         run_adamo_diagnostic(*tiny_data, profile="contract-smoke", seed=9)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("frozen_development_seeds",),
+        ("config",),
+        ("dataset",),
+        ("protocol",),
+        ("runtime",),
+        ("source",),
+        ("arms",),
+        ("arms", 0),
+        ("arms", 0, "hyperparameters"),
+        ("arms", 0, "post_task_diagnostics"),
+        ("arms", 0, "post_task_diagnostics", 0),
+        ("arms", 0, "resources"),
+    ],
+)
+def test_nested_container_subclasses_are_rejected_without_invoking_hooks(
+    receipt: dict[str, object], path: tuple[object, ...],
+) -> None:
+    class HostileDict(dict[object, object]):
+        calls = 0
+
+        def __iter__(self) -> Never:
+            type(self).calls += 1
+            raise AssertionError("must not iterate hostile dict")
+
+        def __eq__(self, other: object) -> Never:
+            type(self).calls += 1
+            raise AssertionError("must not compare hostile dict")
+
+    class HostileList(list[object]):
+        calls = 0
+
+        def __iter__(self) -> Never:
+            type(self).calls += 1
+            raise AssertionError("must not iterate hostile list")
+
+        def __eq__(self, other: object) -> Never:
+            type(self).calls += 1
+            raise AssertionError("must not compare hostile list")
+
+    hostile = copy.deepcopy(receipt)
+    parent: object = hostile
+    for component in path[:-1]:
+        parent = parent[component]  # type: ignore[index]
+    leaf = parent[path[-1]]  # type: ignore[index]
+    replacement = HostileDict(leaf) if type(leaf) is dict else HostileList(leaf)
+    parent[path[-1]] = replacement  # type: ignore[index]
+    with pytest.raises(ValueError, match="exact JSON"):
+        validate_adamo_diagnostic(hostile)
+    assert HostileDict.calls == 0
+    assert HostileList.calls == 0
+
+
+def test_frozen_seed_schedule_rejects_boolean_member_alias(
+    receipt: dict[str, object],
+) -> None:
+    hostile = copy.deepcopy(receipt)
+    hostile["frozen_development_seeds"][0] = True
+    with pytest.raises(ValueError, match="frozen seed schedule"):
+        validate_adamo_diagnostic(hostile)
 
 
 def test_runner_observer_is_a_downstream_exact_function_only(

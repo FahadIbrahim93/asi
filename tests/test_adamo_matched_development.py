@@ -185,3 +185,65 @@ def test_validator_binds_execution_commit_to_source_provenance(
     hostile["execution_source_commit"] = "d" * 40
     with pytest.raises(ValueError, match="does not match source provenance"):
         matched.validate_report(hostile, require_current_source=False)
+
+
+def test_build_report_rejects_hostile_sequence_without_hashing_its_metaclass() -> None:
+    class ExplosiveMeta(type):
+        def __hash__(cls) -> Never:
+            raise AssertionError("must not hash a hostile sequence type")
+
+    class HostileSequence(list[object], metaclass=ExplosiveMeta):
+        pass
+
+    with pytest.raises(ValueError, match="complete frozen seed schedule"):
+        matched.build_report(
+            HostileSequence(),
+            dataset_file_sha256="a" * 64,
+            execution_source_commit="b" * 40,
+        )
+
+
+def test_report_schema_subclass_is_rejected_without_equality_hook(
+    receipts: list[dict[str, object]], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_identities(monkeypatch, receipts)
+    report = matched.build_report(
+        receipts,
+        dataset_file_sha256="b" * 64,
+        execution_source_commit="c" * 40,
+    )
+
+    class HostileString(str):
+        calls = 0
+
+        def __eq__(self, other: object) -> Never:
+            type(self).calls += 1
+            raise AssertionError("must not compare hostile string")
+
+    hostile = copy.deepcopy(report)
+    hostile["schema"] = HostileString(matched.SCHEMA)
+    with pytest.raises(ValueError, match="schema"):
+        matched.validate_report(hostile, require_current_source=False)
+    assert HostileString.calls == 0
+
+
+def test_publication_rejects_symlink_parent_without_touching_target(
+    tmp_path: Path,
+    receipts: list[dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_identities(monkeypatch, receipts)
+    report = matched.build_report(
+        receipts,
+        dataset_file_sha256="b" * 64,
+        execution_source_commit="c" * 40,
+    )
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    destination = linked_parent / "report.json"
+    monkeypatch.setattr(matched, "OUTPUT_PATH", destination)
+    with pytest.raises(OSError):
+        matched.publish_report(destination, report)
+    assert not (real_parent / "report.json").exists()
