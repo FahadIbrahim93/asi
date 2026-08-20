@@ -41,6 +41,7 @@ from alberta_framework.benchmarks import forager_matched_trust as trust
 from tests import test_forager_matched_executor as executor_fixtures
 from tests import test_forager_matched_final_analysis as final_analysis_fixtures
 from tests import test_forager_matched_open_protocol as protocol_fixtures
+from tests._forager_matched_platform import HAS_RENAMEAT2, requires_renameat2
 
 pytestmark = pytest.mark.integration
 
@@ -421,6 +422,8 @@ def test_exact_six_by_thirty_manifest_and_initial_inventory(tmp_path: Path) -> N
             "c563582c1c40176af9eadf3a98475e99ea2851a36a8aad6ab14571f5198b1cd1"
         ),
     }
+    if not HAS_RENAMEAT2:
+        pytest.skip("the published inventory half requires Linux renameat2")
     _publish_context(context)
     expected = {
         "runs",
@@ -567,6 +570,7 @@ def test_postpublication_verify_failure_is_uncertain_and_preserves_destination(
     assert (output / "preserved").read_bytes() == b"published"
 
 
+@requires_renameat2
 def test_read_only_verification_never_authenticates_or_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -611,6 +615,7 @@ def test_read_only_verification_never_authenticates_or_writes(
     assert after == before
 
 
+@requires_renameat2
 def test_run_recovers_bound_raw_then_repairs_missing_completion_pointer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -699,6 +704,7 @@ def test_run_recovers_bound_raw_then_repairs_missing_completion_pointer(
     assert len(auth_calls) == 3
 
 
+@requires_renameat2
 @pytest.mark.slow
 def test_full_evaluation_finalizes_stage_specific_unresolved_content(
     tmp_path: Path,
