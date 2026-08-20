@@ -28,6 +28,23 @@ _ASI_SCRIPTS = {
     "asi-plasticity-diagnostic": (
         "alberta_framework.benchmarks.plasticity_diagnostics:main"
     ),
+    "asi-activation-feature-ipmnist": (
+        "alberta_framework.benchmarks.activation_feature_ipmnist:main"
+    ),
+    "asi-adamo-diagnostic": "alberta_framework.benchmarks.adamo_diagnostic:main",
+    "asi-clear-qualification": (
+        "alberta_framework.benchmarks.clear_qualification:main"
+    ),
+    "asi-coom-qualification-smoke": (
+        "alberta_framework.benchmarks.coom_qualification:main"
+    ),
+    "asi-cora-catalog": ("alberta_framework.benchmarks.cora_development:main"),
+    "asi-forager-rerun-preflight": (
+        "alberta_framework.benchmarks.forager_scientific_rerun_preflight:main"
+    ),
+    "asi-telapa-qualification-smoke": (
+        "alberta_framework.benchmarks.telapa_qualification:main"
+    ),
     "asi-reference-life-scorecard": (
         "alberta_framework.benchmarks.reference_life_scorecard:main"
     ),

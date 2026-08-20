@@ -31,9 +31,18 @@ def test_clear_uses_official_curation_source_without_claiming_asset_readiness() 
             "https://github.com/linzhiqiu/continual-learning.git",
             "620cab4a7d99921fde73b67b53879470533cb39a",
         ),
+        ExternalCodeRevision(
+            "https://github.com/ElvishElvis/CLEAR-Continual_Learning_Benchmark.git",
+            "75d5d2e7d412a787e0decf0417a4868c56691252",
+        ),
+        ExternalCodeRevision(
+            "https://github.com/ContinualAI/avalanche.git",
+            "eb075be393e1f458b2c352514ff6c17b5a2c0f4e",
+        ),
     )
     assert "assets_checksums_and_storage_approved" in plan.blockers
     assert "external_code_available_and_license_reviewed" in plan.blockers
+    assert "provider_archive_revision_and_checksums_disclosed" in plan.blockers
 
 
 def test_action_conditioned_lane_pins_official_dreamer_cdp_source() -> None:

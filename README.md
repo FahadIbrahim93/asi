@@ -241,6 +241,12 @@ The console scripts are grouped by responsibility; every command supports `--hel
 |---|---|
 | `alberta-step1-smoke`, `alberta-step2-smoke` | Nonpromoting mechanism smoke checks |
 | `asi-native-supervised-catalog`, `asi-plasticity-diagnostic` | Inspect or run bounded, permanently nonpromoting supervised diagnostics |
+| `asi-adamo-diagnostic` | Catalog or run the bounded, permanently nonpromoting AdamO dynamical-isometry comparator |
+| `asi-clear-qualification` | Verify local CLEAR archive identities and emit a permanently nonpromoting matched setup plan |
+| `asi-coom-qualification-smoke` | Inspect or run the bounded, synthetic, permanently nonpromoting COOM qualification smoke |
+| `asi-cora-catalog` | Inspect the blocked CORA qualification catalog without importing external runtimes |
+| `asi-forager-rerun-preflight` | Report the fail-closed, read-only readiness state for a matched-current Forager rerun |
+| `asi-telapa-qualification-smoke` | Inspect or run the bounded, permanently nonpromoting TeLAPA archive smoke |
 | `asi-reference-life-scorecard` | Run or validate the permanently nonpromoting reference-life development scorecard |
 | `asi-ipmnist-ceiling` | Produce new, atomic no-replace stationary/carried/full or batch ceiling diagnostics |
 | `asi-ipmnist-campaign` | Recompute paired frontiers or ceiling summaries from explicit input directories |
@@ -260,6 +266,12 @@ historical provenance, not the maintained implementation; existing bytes follow 
 immutable or active-campaign append-only policy. The loss-of-plasticity lane has separate
 protocol and cost gates in the
 [`plasticity diagnostics` runbook](docs/research/plasticity-diagnostics.md).
+The AdamO adapter's exact paper/code audit, matched axes, accounting conventions, and
+comparability gaps are recorded in
+[`docs/research/adamo-diagnostic.md`](docs/research/adamo-diagnostic.md).
+The separate
+[`CLEAR qualification runbook`](docs/runbooks/clear-qualification.md) records its
+unresolved dataset-identity and asset-rights gates.
 
 ## Package layout
 
@@ -350,7 +362,9 @@ checks before it is an integrated improvement. Do not infer an ASI, robotics, sc
 state-of-the-art claim from the screening record.
 
 Forager integration and comparator details are in
-[FORAGER_BENCHMARK.md](FORAGER_BENCHMARK.md).
+[FORAGER_BENCHMARK.md](FORAGER_BENCHMARK.md). The blocked matched-current rerun has a
+[read-only preflight](docs/runbooks/forager-matched-rerun-preflight.md) that never pulls or runs
+the missing frozen image.
 
 Before repeating a failed or bounded idea, check
 [the negative-results ledger](docs/evidence/negative-results.md).
@@ -415,6 +429,7 @@ consumed seeds, or modify immutable `outputs/` records. See
 
 ### Research and historical audits
 
+- [CORA continual-RL qualification](docs/research/cora-qualification.md)
 - [IPMNIST theory](docs/research/ipmnist-theory.md)
 - [Current IPMNIST campaign index](docs/research/ipmnist-campaign-index.md)
 - [RTU Taylor-correction derivation](docs/design/rtu-taylor-correction.md)
