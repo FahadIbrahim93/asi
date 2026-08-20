@@ -431,6 +431,7 @@ def _decode_array_value(value: Any, *, path: str) -> ArrayValue:
         {"semantic_id", "dtype", "shape", "payload_hex"},
         path=path,
     )
+    semantic_id = _require_str(data["semantic_id"], path=f"{path}.semantic_id")
     shape_raw = data["shape"]
     if type(shape_raw) is not list:
         _fail(f"{path}.shape must be a JSON array")
@@ -454,7 +455,7 @@ def _decode_array_value(value: Any, *, path: str) -> ArrayValue:
         payload_hex, path=path, expected_bytes=expected_bytes
     )
     return ArrayValue(
-        semantic_id=_require_str(data["semantic_id"], path=f"{path}.semantic_id"),
+        semantic_id=semantic_id,
         dtype=dtype_name,
         shape=shape,
         payload=payload,

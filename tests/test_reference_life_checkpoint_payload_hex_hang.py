@@ -46,6 +46,16 @@ def test_array_value_rejects_mismatched_hex_before_charset_walk(
         _decode_array_value(payload, path="observation")
 
 
+def test_array_value_rejects_semantic_id_before_charset_walk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = dict(_SCALAR_FLOAT32)
+    payload["semantic_id"] = 1
+    monkeypatch.setattr(checkpoint_module, "_LOWER_HEX_PATTERN", _ForbiddenPattern())
+    with pytest.raises(ValueError, match="semantic_id must be a string"):
+        _decode_array_value(payload, path="observation")
+
+
 def test_array_value_accepts_matching_lowercase_hex() -> None:
     value = _decode_array_value(_SCALAR_FLOAT32, path="observation")
     assert value.shape == (1,)
