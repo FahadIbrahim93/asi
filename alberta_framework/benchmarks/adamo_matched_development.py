@@ -7,9 +7,13 @@ change must flip ``_EXECUTION_AUTHORIZED`` before the reserved matrix can run.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import math
+import os
+import secrets
+import stat
 import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -26,7 +30,6 @@ from alberta_framework.benchmarks.ipmnist_screening import (
     _screening_runtime_environment,
     _screening_source_provenance,
 )
-from alberta_framework.benchmarks.upgd_ipmnist import atomic_write_new_json
 
 SCHEMA: Final[str] = "asi.adamo-matched-development.report.v1"
 PLAN_ID: Final[str] = "issue-1560-adamo-bounded-development-v1"
@@ -49,6 +52,14 @@ _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 OUTPUT_PATH: Final[Path] = _REPO_ROOT / "outputs/adamo_matched_development/report.v1.json"
 _MAX_JSON_NODES: Final[int] = 100_000
 _MAX_JSON_STRING_BYTES: Final[int] = 2 * 1024 * 1024
+_MAX_REPORT_BYTES: Final[int] = 32 * 1024 * 1024
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _OutputReservation:
+    directory_fd: int
+    destination_name: str
+    reservation_name: str
 
 
 def frozen_plan() -> dict[str, object]:
@@ -336,7 +347,9 @@ def build_report(
     execution_source_commit: str,
 ) -> dict[str, object]:
     """Build and strictly validate the complete seed-by-arm campaign report."""
-    if type(receipts) not in {list, tuple} or len(receipts) != len(SEEDS):
+    if (type(receipts) is not list and type(receipts) is not tuple) or len(receipts) != len(
+        SEEDS
+    ):
         raise ValueError("receipts must contain the complete frozen seed schedule")
     by_seed: dict[int, dict[str, object]] = {}
     ordered: list[dict[str, object]] = []
@@ -417,7 +430,7 @@ def validate_report(
         ),
         context="report",
     )
-    if report["schema"] != SCHEMA or type(report["schema"]) is not str:
+    if type(report["schema"]) is not str or report["schema"] != SCHEMA:
         raise ValueError("report schema does not match the frozen protocol")
     _validate_plan(report["plan"])
     file_digest = _digest(report["dataset_file_sha256"], context="dataset file sha256")
@@ -487,14 +500,165 @@ def validate_report(
     return cast(dict[str, object], report)
 
 
-def publish_report(path: Path, report: object) -> Path:
-    """Validate then atomically publish one immutable report generation."""
+def _open_pinned_parent(path: Path) -> int:
+    """Open or create the final directory without following its leaf name."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    try:
+        return os.open(path.parent, flags)
+    except FileNotFoundError:
+        grandparent_fd = os.open(path.parent.parent, flags)
+        try:
+            try:
+                os.mkdir(path.parent.name, mode=0o755, dir_fd=grandparent_fd)
+                os.fsync(grandparent_fd)
+            except FileExistsError:
+                pass
+            return os.open(path.parent.name, flags, dir_fd=grandparent_fd)
+        finally:
+            os.close(grandparent_fd)
+
+
+def _reserve_output(path: Path) -> _OutputReservation:
+    """Acquire an O_EXCL sibling before execution and pin the destination directory."""
     if type(path) is not type(Path()):
         raise ValueError("output path must be an exact pathlib.Path")
     if path.absolute() != OUTPUT_PATH.absolute():
         raise ValueError(f"output path must be the reserved NEW path {OUTPUT_PATH}")
-    validated = validate_report(report, require_current_source=True)
-    return atomic_write_new_json(path, validated)
+    if not path.name or path.name in {".", ".."}:
+        raise ValueError("output path must have one exact destination name")
+    directory_fd = _open_pinned_parent(path)
+    reservation_name = f".{path.name}.reservation"
+    reservation_fd = -1
+    try:
+        reservation_fd = os.open(
+            reservation_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o400,
+            dir_fd=directory_fd,
+        )
+        reservation_bytes = f"reserved:{path.name}\n".encode("ascii")
+        written = os.write(reservation_fd, reservation_bytes)
+        if written != len(reservation_bytes):
+            raise OSError("short write while reserving immutable output")
+        os.fsync(reservation_fd)
+        os.close(reservation_fd)
+        reservation_fd = -1
+        os.fsync(directory_fd)
+        try:
+            os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(f"refusing to overwrite immutable output: {path}")
+        return _OutputReservation(directory_fd, path.name, reservation_name)
+    except BaseException:
+        if reservation_fd >= 0:
+            os.close(reservation_fd)
+        try:
+            os.unlink(reservation_name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        except FileNotFoundError:
+            pass
+        os.close(directory_fd)
+        raise
+
+
+def _release_reservation(reservation: _OutputReservation) -> None:
+    try:
+        os.unlink(reservation.reservation_name, dir_fd=reservation.directory_fd)
+        os.fsync(reservation.directory_fd)
+    except FileNotFoundError:
+        pass
+    finally:
+        os.close(reservation.directory_fd)
+
+
+def _strict_reread(reservation: _OutputReservation, expected: bytes) -> object:
+    descriptor = os.open(
+        reservation.destination_name,
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        dir_fd=reservation.directory_fd,
+    )
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= _MAX_REPORT_BYTES:
+            raise ValueError("published report is not one bounded regular file")
+        chunks: list[bytes] = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not chunk:
+                raise ValueError("published report ended before its signed size")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ValueError("published report grew during strict reread")
+        actual = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    if actual != expected:
+        raise ValueError("published report bytes differ from the validated generation")
+    try:
+        parsed = json.loads(actual)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("published report is not strict JSON") from error
+    return _bounded_json(parsed, context="published report")
+
+
+def _publish_reserved(reservation: _OutputReservation, report: dict[str, object]) -> None:
+    encoded = (
+        json.dumps(report, allow_nan=False, ensure_ascii=True, indent=2, sort_keys=True) + "\n"
+    ).encode("ascii")
+    if len(encoded) > _MAX_REPORT_BYTES:
+        raise ValueError("validated report exceeds the immutable publication bound")
+    temporary_name = f".{reservation.destination_name}.{secrets.token_hex(16)}.tmp"
+    temporary_fd = -1
+    try:
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o400,
+            dir_fd=reservation.directory_fd,
+        )
+        view = memoryview(encoded)
+        while view:
+            count = os.write(temporary_fd, view)
+            if count <= 0:
+                raise OSError("immutable report write made no progress")
+            view = view[count:]
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = -1
+        os.link(
+            temporary_name,
+            reservation.destination_name,
+            src_dir_fd=reservation.directory_fd,
+            dst_dir_fd=reservation.directory_fd,
+            follow_symlinks=False,
+        )
+        os.fsync(reservation.directory_fd)
+        reread = _strict_reread(reservation, encoded)
+        if reread != report:
+            raise ValueError("published report semantic reread differs from validation")
+    finally:
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        try:
+            os.unlink(temporary_name, dir_fd=reservation.directory_fd)
+            os.fsync(reservation.directory_fd)
+        except FileNotFoundError:
+            pass
+
+
+def publish_report(path: Path, report: object) -> Path:
+    """Reserve, validate, and no-replace publish one immutable generation."""
+    reservation = _reserve_output(path)
+    try:
+        validated = validate_report(report, require_current_source=True)
+        _publish_reserved(reservation, validated)
+    finally:
+        _release_reservation(reservation)
+    return path
 
 
 def _execution_commit() -> str:
@@ -516,25 +680,29 @@ def run_campaign(dataset_path: Path, output_path: Path = OUTPUT_PATH) -> dict[st
         raise ValueError("dataset and output paths must be exact pathlib.Path values")
     if output_path.absolute() != OUTPUT_PATH.absolute():
         raise ValueError(f"output path must be the reserved NEW path {OUTPUT_PATH}")
-    if _sha256_file(dataset_path) != DATASET_FILE_SHA256:
-        raise ValueError("dataset file does not match the prospectively frozen input")
-    source_before = _current_source_provenance()
-    runtime_before = _current_runtime_environment()
-    inputs, labels = _load_dataset(dataset_path)
-    receipts = [
-        run_adamo_diagnostic(inputs, labels, profile=PROFILE, seed=seed) for seed in SEEDS
-    ]
-    if source_before != _current_source_provenance():
-        raise RuntimeError("source identity changed during matched execution")
-    if runtime_before != _current_runtime_environment():
-        raise RuntimeError("runtime identity changed during matched execution")
-    report = build_report(
-        receipts,
-        dataset_file_sha256=_sha256_file(dataset_path),
-        execution_source_commit=_execution_commit(),
-    )
-    publish_report(output_path, report)
-    return report
+    reservation = _reserve_output(output_path)
+    try:
+        if _sha256_file(dataset_path) != DATASET_FILE_SHA256:
+            raise ValueError("dataset file does not match the prospectively frozen input")
+        source_before = _current_source_provenance()
+        runtime_before = _current_runtime_environment()
+        inputs, labels = _load_dataset(dataset_path)
+        receipts = [
+            run_adamo_diagnostic(inputs, labels, profile=PROFILE, seed=seed) for seed in SEEDS
+        ]
+        if source_before != _current_source_provenance():
+            raise RuntimeError("source identity changed during matched execution")
+        if runtime_before != _current_runtime_environment():
+            raise RuntimeError("runtime identity changed during matched execution")
+        report = build_report(
+            receipts,
+            dataset_file_sha256=_sha256_file(dataset_path),
+            execution_source_commit=_execution_commit(),
+        )
+        _publish_reserved(reservation, report)
+        return report
+    finally:
+        _release_reservation(reservation)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

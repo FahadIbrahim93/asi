@@ -45,6 +45,8 @@ ARMS = ("adamw_control", "adamo_inert", "adamo_l1e3", "adam_iso_joint_l1e3")
 FROZEN_DEVELOPMENT_SEEDS = (25600, 25601, 25602, 25603)
 _MAX_DATASET_BYTES = 256 * 1024 * 1024
 _HEX = frozenset("0123456789abcdef")
+_MAX_RECEIPT_NODES = 100_000
+_MAX_RECEIPT_STRING_BYTES = 2 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -303,11 +305,71 @@ def _digest(value: object, name: str) -> str:
     return value
 
 
+def _bounded_exact_json(value: object) -> object:
+    """Copy bounded built-in JSON values before any semantic operation."""
+    nodes = 0
+    string_bytes = 0
+
+    def visit(item: object, *, depth: int, context: str) -> object:
+        nonlocal nodes, string_bytes
+        nodes += 1
+        if nodes > _MAX_RECEIPT_NODES or depth > 18:
+            raise ValueError("receipt must contain bounded exact JSON")
+        if item is None or type(item) is bool:
+            return item
+        if type(item) is int:
+            if not -(1 << 63) <= item <= (1 << 63) - 1:
+                raise ValueError("receipt integer exceeds signed-int64")
+            return item
+        if type(item) is float:
+            if not math.isfinite(item):
+                raise ValueError("receipt must contain finite exact JSON")
+            return item
+        if type(item) is str:
+            try:
+                encoded = item.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise ValueError("receipt strings must be valid UTF-8") from error
+            if len(encoded) > 16_384 or b"\0" in encoded:
+                raise ValueError("receipt must contain bounded exact JSON strings")
+            string_bytes += len(encoded)
+            if string_bytes > _MAX_RECEIPT_STRING_BYTES:
+                raise ValueError("receipt exceeds its exact JSON string-byte budget")
+            return item
+        if type(item) is list:
+            if list.__len__(item) > 4096:
+                raise ValueError("receipt exact JSON list exceeds its bound")
+            return [
+                visit(child, depth=depth + 1, context=f"{context}[{index}]")
+                for index, child in enumerate(list.__iter__(item))
+            ]
+        if type(item) is dict:
+            if dict.__len__(item) > 4096:
+                raise ValueError("receipt exact JSON object exceeds its bound")
+            copied: dict[str, object] = {}
+            for key, child in dict.items(item):
+                if type(key) is not str:
+                    raise ValueError("receipt exact JSON keys must be built-in strings")
+                copied[key] = visit(child, depth=depth + 1, context=f"{context}.{key}")
+            return copied
+        raise ValueError(f"{context} must contain only bounded exact JSON values")
+
+    return visit(value, depth=0, context="receipt")
+
+
+def _exact_object(
+    value: object, keys: frozenset[str], *, context: str
+) -> dict[str, object]:
+    if type(value) is not dict or frozenset(value) != keys:
+        raise ValueError(f"{context} fields do not match the exact schema")
+    return cast(dict[str, object], value)
+
+
 def validate_adamo_diagnostic(payload: object) -> dict[str, object]:
     """Fail closed on malformed, drifted, promoting, or unmatched receipts."""
     if type(payload) is not dict:
         raise TypeError("payload must be an exact dict")
-    result = cast(dict[str, object], payload)
+    result = cast(dict[str, object], _bounded_exact_json(payload))
     required = {
         "schema", "comparison_id", "paper_revision", "paper_url", "official_code",
         "official_code_search_date", "official_parity_status", "profile", "seed",
@@ -315,7 +377,7 @@ def validate_adamo_diagnostic(payload: object) -> dict[str, object]:
         "arms", "outcome", "outcome_retained", "development_only",
         "negative_outcomes_retained", "scientific_promotion_allowed",
     }
-    if set(result) != required:
+    if frozenset(result) != required:
         raise ValueError("payload fields do not match the AdamO v1 schema")
     constants = {
         "schema": SCHEMA, "comparison_id": COMPARISON_ID,
@@ -327,7 +389,7 @@ def validate_adamo_diagnostic(payload: object) -> dict[str, object]:
         "development_only": True, "scientific_promotion_allowed": False,
     }
     for key, expected in constants.items():
-        if result[key] != expected or type(result[key]) is not type(expected):
+        if type(result[key]) is not type(expected) or result[key] != expected:
             raise ValueError(f"{key} violates the permanent protocol")
     profile = result["profile"]
     if type(profile) is not str or profile not in PROFILES:
@@ -335,22 +397,39 @@ def validate_adamo_diagnostic(payload: object) -> dict[str, object]:
     seed = _exact_int(result["seed"], "seed")
     if seed not in FROZEN_DEVELOPMENT_SEEDS:
         raise ValueError("seed is outside the frozen development schedule")
-    if result["frozen_development_seeds"] != list(FROZEN_DEVELOPMENT_SEEDS):
+    frozen_seeds = result["frozen_development_seeds"]
+    if (
+        type(frozen_seeds) is not list
+        or len(frozen_seeds) != len(FROZEN_DEVELOPMENT_SEEDS)
+        or any(type(value) is not int for value in frozen_seeds)
+        or tuple(frozen_seeds) != FROZEN_DEVELOPMENT_SEEDS
+    ):
         raise ValueError("frozen seed schedule drift")
     config = PROFILES[profile].config
-    if result["config"] != asdict(config):
+    expected_config = asdict(config)
+    config_receipt = _exact_object(
+        result["config"], frozenset(expected_config), context="profile configuration"
+    )
+    if any(
+        type(config_receipt[key]) is not int or config_receipt[key] != expected
+        for key, expected in expected_config.items()
+    ):
         raise ValueError("profile configuration drift")
-    dataset = result["dataset"]
-    if type(dataset) is not dict or set(dataset) != {
-        "sha256", "loaded_numeric_bytes", "rows", "materialization"
-    }:
-        raise ValueError("invalid dataset receipt")
+    dataset = _exact_object(
+        result["dataset"],
+        frozenset({"sha256", "loaded_numeric_bytes", "rows", "materialization"}),
+        context="dataset receipt",
+    )
     _digest(dataset["sha256"], "dataset.sha256")
     loaded_bytes = _exact_int(dataset["loaded_numeric_bytes"], "loaded_numeric_bytes", minimum=1)
     rows = _exact_int(dataset["rows"], "rows", minimum=config.task_length)
     if loaded_bytes != rows * (config.input_dim * 4 + 4) or loaded_bytes > _MAX_DATASET_BYTES:
         raise ValueError("dataset byte accounting mismatch")
-    if dataset["materialization"] != "caller-supplied-float32-inputs-int32-labels-v1":
+    if (
+        type(dataset["materialization"]) is not str
+        or dataset["materialization"]
+        != "caller-supplied-float32-inputs-int32-labels-v1"
+    ):
         raise ValueError("dataset materialization drift")
     protocol = result["protocol"]
     expected_protocol = {
@@ -367,7 +446,7 @@ def validate_adamo_diagnostic(payload: object) -> dict[str, object]:
     if type(protocol) is not dict or protocol != expected_protocol:
         raise ValueError("protocol identity or information boundary drift")
     runtime = result["runtime"]
-    if type(runtime) is not dict or set(runtime) != {"python", "jax", "numpy", "backend"}:
+    if type(runtime) is not dict or frozenset(runtime) != {"python", "jax", "numpy", "backend"}:
         raise ValueError("invalid runtime identity")
     expected_runtime = {
         "python": platform.python_version(),
@@ -375,10 +454,13 @@ def validate_adamo_diagnostic(payload: object) -> dict[str, object]:
         "numpy": np.__version__,
         "backend": jax.default_backend(),
     }
-    if runtime != expected_runtime:
+    if (
+        any(type(runtime[key]) is not str for key in expected_runtime)
+        or runtime != expected_runtime
+    ):
         raise ValueError("runtime identity does not match the current runtime")
     sources = result["source"]
-    if type(sources) is not dict or set(sources) != {"adapter_sha256", "runner_sha256"}:
+    if type(sources) is not dict or frozenset(sources) != {"adapter_sha256", "runner_sha256"}:
         raise ValueError("invalid source receipt")
     _digest(sources["adapter_sha256"], "adapter_sha256")
     _digest(sources["runner_sha256"], "runner_sha256")
@@ -392,21 +474,32 @@ def validate_adamo_diagnostic(payload: object) -> dict[str, object]:
     observations = config.n_tasks * config.task_length
     parameter_count = _parameter_count(config)
     for expected_name, arm in zip(ARMS, arms, strict=True):
-        if type(arm) is not dict or set(arm) != {
+        if type(arm) is not dict or frozenset(arm) != {
             "arm", "mechanism", "hyperparameters", "per_task_accuracy", "per_task_loss",
             "per_task_plasticity", "post_task_diagnostics", "resources",
-        } or arm.get("arm") != expected_name:
+        } or type(arm.get("arm")) is not str or arm.get("arm") != expected_name:
             raise ValueError("arm ordering or identity drift")
         expected_spec = screening_spec(expected_name)
-        if arm.get("mechanism") != expected_spec.mechanism or arm.get(
-            "hyperparameters"
-        ) != expected_spec.hyperparameters:
+        hyperparameters = arm.get("hyperparameters")
+        if (
+            type(arm.get("mechanism")) is not str
+            or arm.get("mechanism") != expected_spec.mechanism
+            or type(hyperparameters) is not dict
+            or frozenset(hyperparameters) != frozenset(expected_spec.hyperparameters)
+            or any(
+                type(hyperparameters[key]) is not type(expected)
+                or hyperparameters[key] != expected
+                for key, expected in expected_spec.hyperparameters.items()
+            )
+        ):
             raise ValueError("arm mechanism or hyperparameter drift")
         for curve_name in ("per_task_accuracy", "per_task_loss", "per_task_plasticity"):
             curve = arm.get(curve_name)
             if type(curve) is not list or len(curve) != config.n_tasks:
                 raise ValueError(f"{expected_name}.{curve_name} has invalid shape")
             for value in curve:
+                if type(value) is not float:
+                    raise ValueError(f"{expected_name}.{curve_name} must contain exact floats")
                 numeric = _finite(value, f"{expected_name}.{curve_name}")
                 if curve_name != "per_task_loss" and numeric > 1.0:
                     raise ValueError(f"{expected_name}.{curve_name} must lie in [0, 1]")
@@ -414,12 +507,12 @@ def validate_adamo_diagnostic(payload: object) -> dict[str, object]:
         if type(snapshots) is not list or len(snapshots) != config.n_tasks:
             raise ValueError("diagnostic task coverage mismatch")
         for index, snapshot in enumerate(snapshots):
-            if type(snapshot) is not dict or set(snapshot) != {
+            if type(snapshot) is not dict or frozenset(snapshot) != {
                 "task_index", "parameter_sha256", "learner_state_sha256",
                 "jacobian_min_singular_value", "jacobian_max_singular_value",
                 "jacobian_mean_singular_value", "jacobian_condition_number_clipped_1e12",
                 "jacobian_rms_distance_from_one", "weight_gram_penalty",
-            } or snapshot.get("task_index") != index:
+            } or type(snapshot.get("task_index")) is not int or snapshot.get("task_index") != index:
                 raise ValueError("diagnostic task index mismatch")
             _digest(snapshot.get("parameter_sha256"), "parameter_sha256")
             _digest(snapshot.get("learner_state_sha256"), "learner_state_sha256")
@@ -428,9 +521,12 @@ def validate_adamo_diagnostic(payload: object) -> dict[str, object]:
                 "jacobian_mean_singular_value", "jacobian_condition_number_clipped_1e12",
                 "jacobian_rms_distance_from_one", "weight_gram_penalty",
             ):
-                _finite(snapshot.get(metric), metric)
+                metric_value = snapshot.get(metric)
+                if type(metric_value) is not float:
+                    raise ValueError(f"{metric} must be an exact float")
+                _finite(metric_value, metric)
         resources = arm.get("resources")
-        if type(resources) is not dict or set(resources) != {
+        if type(resources) is not dict or frozenset(resources) != {
             "observations", "updates", "data_steps", "environment_steps", "model_queries",
             "jacobian_reverse_rows", "parameter_count", "persistent_numeric_bytes",
             "peak_gram_working_bytes", "logical_compute_units", "logical_compute_definition",
@@ -466,6 +562,8 @@ def validate_adamo_diagnostic(payload: object) -> dict[str, object]:
             "jacobian_reverse_rows*parameters + active Gram matrix multiply-adds"
         ):
             raise ValueError("logical compute definition drift")
+        if type(resources.get("timing_seconds")) is not float:
+            raise ValueError("timing_seconds must be an exact float")
         _finite(resources.get("timing_seconds"), "timing_seconds")
         if resources.get("timing_is_telemetry_only") is not True:
             raise ValueError("timing may only be telemetry")
