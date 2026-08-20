@@ -40,7 +40,7 @@ Run only on a caller-materialized NPZ containing exactly float32 `inputs` and in
 ```bash
 .venv/bin/asi-adamo-diagnostic --catalog
 .venv/bin/asi-adamo-diagnostic --dataset /new/path/data.npz \
-  --profile contract-smoke --seed 15600
+  --profile contract-smoke --seed 25600
 ```
 
 Receipts bind exact dataset and current-source hashes, runtime identity, data steps, observations,
@@ -61,5 +61,11 @@ Newton-Schulz, ReLU-revival, empirical NTK, effective-rank, CNN, RL, or transfor
 Before a scientific comparison: locate and pin official code or independently verify equations;
 implement the exact paper dataset/task construction, architecture, initialization and full
 diagnostic definitions; qualify the missing model families; freeze a separate preregistered
-protocol and untouched seeds; and establish calibrated compute, memory, and timing gates. The four
-listed seeds are consumed development seeds and can never promote a claim.
+protocol and untouched seeds; and establish calibrated compute, memory, and timing gates. The
+original `15600`-`15603` schedule was consumed by executable qualification and is excluded from
+the retained matched screen. The prospectively frozen `25600`-`25603` schedule can execute only
+through `asi-adamo-matched-development` after a separate authorization review. Any exposed
+outcome consumes those seeds and can never promote a claim. The plan also freezes the exact
+caller-materialized MNIST NPZ (`58320c334531afce90c4899ea0c05976c9b9d1c10b7b37e8eb4289cabd0a00ba`)
+and its canonical numeric-array digest
+(`d25060db8f3f3f6ae7b0bb972e848733e15a1158f02021645e86a2923a5ee8a3`).
