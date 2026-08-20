@@ -10449,7 +10449,7 @@ def run_screening_config(
     else:
         init_fn, step_fn = spec.factory(spec.hyperparameters)
 
-    root = jr.key(jnp.uint32(resolved_seed))
+    root = jr.key(jnp.uint32(resolved_seed), impl="threefry2x32")
     key_init, key_schedule, key_noise = jr.split(root, 3)
     params = init_mlp_params(key_init, config)
     schedule = build_schedule(key_schedule, config, n_train)

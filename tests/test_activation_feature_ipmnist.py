@@ -169,6 +169,17 @@ def test_factories_are_jittable_and_aid_is_deterministic_per_seed() -> None:
     np.testing.assert_array_equal(compiled[2][1], eager[2][1])
 
 
+def test_activation_shard_is_independent_of_ambient_default_prng() -> None:
+    x, y = _data()
+    with jax.default_prng_impl("threefry2x32"):
+        expected = run_activation_feature_arm(x, y, arm="aid", seed=4, config=SMALL)
+    with jax.default_prng_impl("rbg"):
+        actual = run_activation_feature_arm(x, y, arm="aid", seed=4, config=SMALL)
+    np.testing.assert_array_equal(actual.per_task_accuracy, expected.per_task_accuracy)
+    np.testing.assert_array_equal(actual.per_task_loss, expected.per_task_loss)
+    np.testing.assert_array_equal(actual.per_task_plasticity, expected.per_task_plasticity)
+
+
 def test_result_receipt_is_exact_bounded_and_permanently_nonpromoting() -> None:
     x, y = _data()
     result = run_activation_feature_arm(x, y, arm="aid", seed=1, config=SMALL)
@@ -266,7 +277,7 @@ def test_receipt_rejects_config_whose_schedule_cannot_execute() -> None:
         validate_activation_feature_result(payload)
 
 
-def test_receipt_rejects_forged_current_identity_and_peak_schedule_bytes() -> None:
+def test_receipt_rejects_forged_identity_and_retained_schedule_bytes() -> None:
     x, y = _data()
     payload = activation_feature_result_payload(
         run_activation_feature_arm(x, y, arm="aid", seed=0, config=SMALL),
@@ -277,8 +288,8 @@ def test_receipt_rejects_forged_current_identity_and_peak_schedule_bytes() -> No
     with pytest.raises(ValueError, match="current runtime identity"):
         validate_activation_feature_result(forged_runtime)
     forged_peak = copy.deepcopy(payload)
-    forged_peak["resources"]["peak_schedule_working_bytes"] = 1
-    with pytest.raises(ValueError, match="peak_schedule_working_bytes"):
+    forged_peak["resources"]["retained_schedule_numeric_bytes"] = 1
+    with pytest.raises(ValueError, match="retained_schedule_numeric_bytes"):
         validate_activation_feature_result(forged_peak)
 
 
