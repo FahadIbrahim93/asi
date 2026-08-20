@@ -1239,7 +1239,6 @@ def publish_json(
 
     if type(path) is not type(Path()) or type(root) is not type(Path()):
         raise TypeError("path and root must be exact Paths")
-    _require_registered_root(root)
     if not _allowed_path(path, root):
         _fail("destination is outside the fixed campaign namespace")
 
@@ -1449,13 +1448,13 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     root = cast(Path, args.root)
-    _require_registered_root(root)
     if args.command == "plan":
         document = build_plan_document()
         publish_json(campaign_path(root, "plan"), document, root=root)
         _print_json({"status": "planned", "execution_authorized": EXECUTION_AUTHORIZED})
         return 0
     if args.command == "run-shard":
+        _require_registered_root(root)
         _validate_namespace(
             root,
             require_complete_shards=False,
@@ -1499,6 +1498,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _print_json({"status": "complete", "shard": str(destination)})
         return 0
     if args.command == "summarize":
+        _require_registered_root(root)
         _validate_namespace(
             root,
             require_complete_shards=True,

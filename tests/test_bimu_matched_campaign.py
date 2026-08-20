@@ -520,12 +520,16 @@ def test_cli_allows_disposable_plan_preview_but_rejects_relocated_shard(
 
     def capture_plan(path: Path, value: object, *, root: Path, **kwargs: object) -> None:
         assert campaign.validate_plan_document(value) == value
+        path.parent.mkdir(parents=True)
+        (path.parent / "shards").mkdir()
+        path.write_bytes(campaign._canonical(value) + b"\n")
         published.append((path, root))
 
     monkeypatch.setattr(campaign, "REGISTERED_OUTPUT_ROOT", registered)
     monkeypatch.setattr(campaign, "publish_json", capture_plan)
 
     assert campaign.main(["plan", "--root", str(preview)]) == 0
+    assert campaign.main(["validate", "--root", str(preview)]) == 0
     assert published == [(campaign.campaign_path(preview, "plan"), preview)]
 
     monkeypatch.setattr(campaign, "EXECUTION_AUTHORIZED", True)
@@ -541,6 +545,8 @@ def test_cli_allows_disposable_plan_preview_but_rejects_relocated_shard(
                 "157001",
             ]
         )
+    with pytest.raises(ValueError, match="registered repository root"):
+        campaign.main(["summarize", "--root", str(preview)])
     assert len(published) == 1
 
 
