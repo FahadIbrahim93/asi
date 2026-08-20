@@ -81,14 +81,15 @@ def _receipt(
             config, n_train=data[0].shape[0]
         ),
     )
-    return (
-        activation.activation_feature_result_payload(result, outcome="inconclusive")
+    seeds = (
+        campaign.CHEAP_SCREEN_SEEDS
         if stage == "cheap_screen"
-        else activation.activation_feature_campaign_result_payload(
-            result,
-            outcome="inconclusive",
-            development_seeds=campaign.FULL_CONFIRMATION_SEEDS,
-        )
+        else campaign.FULL_CONFIRMATION_SEEDS
+    )
+    return activation.activation_feature_campaign_result_payload(
+        result,
+        outcome="inconclusive",
+        development_seeds=seeds,
     )
 
 
@@ -162,7 +163,7 @@ def test_both_plans_freeze_full_11_by_5_matrix_without_horizon_shrink(
     full = campaign.build_plan("full_confirmation", *data)
     assert cheap["matrix"] == {
         "arms": list(campaign.ARM_ROSTER),
-        "seeds": [0, 1, 2, 3, 4],
+        "seeds": list(campaign.CHEAP_SCREEN_SEEDS),
         "shard_count": 55,
         "ordering": "seed_major_then_arm_roster",
         "execution": "one_shard_per_fresh_python_process",
@@ -179,6 +180,12 @@ def test_both_plans_freeze_full_11_by_5_matrix_without_horizon_shrink(
     full_gate = cast(dict[str, object], full["execution_gate"])
     assert full_gate["mode"] == "conditional_on_retained_cheap_screen"
     assert full_gate["complete_matrix_if_authorized"] is True
+    assert full_gate["execution_authorized"] is False
+    assert campaign.QUARANTINED_CHEAP_SEEDS == (0, 1, 2, 3, 4)
+    assert campaign.QUARANTINED_FULL_SEEDS == (156_610, 156_611, 156_612, 156_613, 156_614)
+    assert set(campaign.ALL_SEEDS).isdisjoint(
+        campaign.QUARANTINED_CHEAP_SEEDS + campaign.QUARANTINED_FULL_SEEDS
+    )
     assert campaign.validate_plan(copy.deepcopy(cheap), data_x=data[0], data_y=data[1]) == cheap
 
 
@@ -264,13 +271,15 @@ def test_plan_rejects_resigned_horizon_dataset_and_runtime_forgery(
             campaign.validate_plan(forged, data_x=data[0], data_y=data[1])
 
 
-def test_shard_preserves_v1_and_cross_validates_wrapper_plan_and_resources(
+def test_shard_uses_external_seed_v2_and_cross_validates_wrapper_plan_and_resources(
     cheap_plan: dict[str, object], data: tuple[np.ndarray, np.ndarray]
 ) -> None:
-    shard = _shard(cheap_plan, data, "aid", 2)
+    shard = _shard(cheap_plan, data, "aid", campaign.CHEAP_SCREEN_SEEDS[2])
     receipt = cast(dict[str, object], shard["result"])
-    assert receipt["schema"] == activation.RESULT_SCHEMA
-    assert activation.validate_activation_feature_result(copy.deepcopy(receipt)) == receipt
+    assert receipt["schema"] == activation.CAMPAIGN_RESULT_SCHEMA
+    assert activation.validate_activation_feature_campaign_result(
+        copy.deepcopy(receipt), development_seeds=campaign.CHEAP_SCREEN_SEEDS
+    ) == receipt
 
     wrong_arm = copy.deepcopy(shard)
     wrong_arm["arm"] = "smooth_leaky"
@@ -391,7 +400,7 @@ def test_full_gate_runs_before_any_arm_execution(
         raise AssertionError("arm execution must remain gated")
 
     monkeypatch.setattr(campaign, "run_activation_feature_arm", forbidden)
-    with pytest.raises(ValueError, match="requires the retained cheap-screen"):
+    with pytest.raises(RuntimeError, match="not authorized"):
         campaign.build_shard(
             full_plan,
             *data,
@@ -411,11 +420,55 @@ def test_execution_failure_is_not_misrepresented_as_a_retained_result_shard(
 
     monkeypatch.setattr(campaign, "run_activation_feature_arm", failed_execution)
     with pytest.raises(RuntimeError, match="simulated execution failure"):
-        campaign.build_shard(cheap_plan, *data, arm="aid", seed=0)
+        campaign._build_shard_authorized(
+            cheap_plan,
+            *data,
+            arm="aid",
+            seed=campaign.CHEAP_SCREEN_SEEDS[0],
+            _capability=campaign._EXECUTION_CAPABILITY,
+        )
 
     policy = cast(dict[str, object], cheap_plan["policy"])
     assert policy["execution_failure_receipts_retained"] is False
     assert policy["completed_shard_negative_results_retained"] is True
+
+def test_public_builder_and_cli_fail_before_dataset_or_arm_execution(
+    cheap_plan: dict[str, object],
+    data: tuple[np.ndarray, np.ndarray],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"dataset": 0, "arm": 0}
+
+    def forbidden_dataset(*args: object, **kwargs: object) -> object:
+        calls["dataset"] += 1
+        raise AssertionError("dataset load must remain gated")
+
+    def forbidden_arm(*args: object, **kwargs: object) -> object:
+        calls["arm"] += 1
+        raise AssertionError("arm execution must remain gated")
+
+    monkeypatch.setattr(campaign, "load_mnist_train", forbidden_dataset)
+    monkeypatch.setattr(campaign, "run_activation_feature_arm", forbidden_arm)
+    with pytest.raises(RuntimeError, match="not authorized"):
+        campaign.build_shard(
+            cheap_plan,
+            *data,
+            arm="aid",
+            seed=campaign.CHEAP_SCREEN_SEEDS[0],
+        )
+    with pytest.raises(RuntimeError, match="not authorized"):
+        campaign.main(
+            [
+                "run-shard",
+                "--stage",
+                "cheap_screen",
+                "--arm",
+                "aid",
+                "--seed",
+                str(campaign.CHEAP_SCREEN_SEEDS[0]),
+            ]
+        )
+    assert calls == {"dataset": 0, "arm": 0}
 
 
 def test_aggregate_rejects_missing_duplicate_and_self_consistent_statistic_forgery(
@@ -533,3 +586,32 @@ def test_reserved_publication_resists_parent_swap_and_occupied_race(tmp_path: Pa
         with pytest.raises(FileExistsError, match="refusing to replace"):
             campaign._publish_reserved_json(target, {"value": 2})
     assert occupied.read_text(encoding="utf-8") == "do not replace"
+
+
+@pytest.mark.skipif(
+    not all(hasattr(os, name) for name in ("O_NOFOLLOW", "O_TMPFILE")),
+    reason="descriptor-pinned publication requires Linux",
+)
+def test_reservation_is_exclusive_before_work_and_publication_strictly_rereads(
+    cheap_plan: dict[str, object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "plan.json"
+    with campaign._reserved_new_output(destination) as target:
+        with pytest.raises(FileExistsError, match="reserved"):
+            with campaign._reserved_new_output(destination):
+                raise AssertionError("reservation collision entered protected work")
+
+        calls = 0
+        real_validate = campaign.validate_plan
+
+        def counted_validate(value: object, **kwargs: object) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            return real_validate(value, **kwargs)
+
+        monkeypatch.setattr(campaign, "validate_plan", counted_validate)
+        campaign._publish_reserved_json(target, cheap_plan)
+    assert calls >= 1
+    assert campaign.load_json_strict(
+        destination, max_bytes=campaign._MAX_SHARD_BYTES
+    ) == cheap_plan
