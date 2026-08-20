@@ -23,3 +23,23 @@ def test_rejects_oversized_power_iterations(value: int) -> None:
             control_interval=2,
             power_iterations=value,
         )
+
+
+def test_rejects_oversized_total_controller_power_work() -> None:
+    with pytest.raises(ValueError, match="noise-curvature controller budget"):
+        NoiseCurvatureConfig(
+            mode="fixed",
+            total_steps=1_000_001,
+            control_interval=1,
+            power_iterations=1,
+        )
+
+
+def test_rejects_combination_that_bypasses_individual_limits() -> None:
+    with pytest.raises(ValueError, match="step-units exceed"):
+        NoiseCurvatureConfig(
+            mode="fixed",
+            total_steps=1_000_000,
+            control_interval=1,
+            power_iterations=2,
+        )
