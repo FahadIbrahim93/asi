@@ -64,6 +64,13 @@ _MAX_PERSISTENT_BYTES: Final = 256 * 1024 * 1024
 _MAX_DATASET_BYTES: Final = 256 * 1024 * 1024
 _MAX_SCHEDULE_BYTES: Final = 256 * 1024 * 1024
 _MAX_COMBINED_NUMERIC_BYTES: Final = 256 * 1024 * 1024
+_MAX_RESULT_BYTES: Final = 16 * 1024 * 1024
+_MAX_JSON_NODES: Final = 100_000
+_MAX_JSON_DEPTH: Final = 16
+_MAX_JSON_STRING_BYTES: Final = 16_384
+_MAX_JSON_KEY_BYTES: Final = 256
+_MAX_PATH_BYTES: Final = 4096
+_MAX_PATH_COMPONENT_BYTES: Final = 240
 _REVIEWED_EXECUTION_TRANSITION: Final = False
 _EXECUTION_AUTHORIZED: Final = False
 _EXECUTION_CAPABILITY: Final = object()
@@ -75,6 +82,30 @@ OUTPUT_PATH: Final = (
 )
 
 
+def _frozen_dataset_provenance() -> dict[str, object]:
+    return {
+        "schema": "alberta.ipmnist_screening.dataset_provenance.v1",
+        "source": {
+            "provider": "openml",
+            "name": "mnist_784",
+            "version": 1,
+            "row_start": 0,
+            "row_stop_exclusive": 60_000,
+        },
+        "materialization": "alberta.ipmnist.float32-neg1-pos1-int32-labels.v1",
+        "x": {
+            "dtype": "<f4",
+            "shape": [60_000, 784],
+            "sha256": "b8078cd833f53d89828a5e28d728517be9add34076f13fe973399f1f16381313",
+        },
+        "y": {
+            "dtype": "<i4",
+            "shape": [60_000],
+            "sha256": "4f1dd9551f104f8153409e0add59f0a71568f7bad5a5f8e2274480c186fe219a",
+        },
+    }
+
+
 def frozen_plan() -> dict[str, object]:
     config = CAMPAIGN_CONFIG
     return {
@@ -84,16 +115,7 @@ def frozen_plan() -> dict[str, object]:
         "seeds": list(CAMPAIGN_SEEDS),
         "arms": list(ARMS),
         "config": _config_payload(config),
-        "dataset": {
-            "schema": "alberta.ipmnist_screening.dataset_provenance.v1",
-            "source": {"provider": "openml", "name": "mnist_784", "version": 1,
-                       "row_start": 0, "row_stop_exclusive": 60_000},
-            "materialization": "alberta.ipmnist.float32-neg1-pos1-int32-labels.v1",
-            "x": {"dtype": "<f4", "shape": [60_000, 784],
-                  "sha256": "b8078cd833f53d89828a5e28d728517be9add34076f13fe973399f1f16381313"},
-            "y": {"dtype": "<i4", "shape": [60_000],
-                  "sha256": "4f1dd9551f104f8153409e0add59f0a71568f7bad5a5f8e2274480c186fe219a"},
-        },
+        "dataset": _frozen_dataset_provenance(),
         "source_identity": _source_identity(),
         "runtime_identity": _runtime_identity(),
         "per_arm_resources": {
@@ -106,6 +128,14 @@ def frozen_plan() -> dict[str, object]:
         "numeric_resource_envelope": _numeric_resource_envelope(
             config=config, dataset_rows=60_000
         ),
+        "numeric_resource_scope": (
+            "one caller-owned C-contiguous host dataset, one materialized schedule, and "
+            "learner parameters plus persistent learner state; backend copies, compiler "
+            "state, gradients, and transient execution buffers are excluded"
+        ),
+        "transaction_resource_accounting": _transaction_resource_accounting(
+            config=config, seeds=CAMPAIGN_SEEDS
+        ),
         "matched_axes": ["seed", "observations", "updates", "example_schedule",
                          "allowed_boundary_information", "allowed_task_information"],
         "decision_rule": {
@@ -117,6 +147,11 @@ def frozen_plan() -> dict[str, object]:
             "campaign_supported": "at least one candidate is supported",
             "campaign_rejected": "both candidates are rejected",
             "otherwise": "inconclusive",
+        },
+        "seed_policy": {
+            "campaign_roster_status": "reserved_unconsumed",
+            "test_only_seeds": list(TEST_ONLY_SEEDS),
+            "campaign_and_test_rosters_disjoint": True,
         },
         # These are immutable properties of this reviewed plan. A future source
         # transition must not rewrite the historical plan that preceded it.
@@ -143,21 +178,42 @@ def _json_preflight(value: object) -> None:
     pending: list[tuple[object, int]] = [(value, 0)]
     seen: set[int] = set()
     nodes = 0
+    scalar_bytes = 0
     while pending:
         current, depth = pending.pop()
         actual_type = type(current)
         nodes += 1
-        if nodes > 100_000 or depth > 16:
+        if nodes > _MAX_JSON_NODES or depth > _MAX_JSON_DEPTH:
             raise ValueError("matched result exceeds its JSON structure bound")
-        if current is None or actual_type is bool or actual_type is int:
+        scalar_bytes += 8
+        if scalar_bytes > _MAX_RESULT_BYTES:
+            raise ValueError("matched result exceeds its JSON byte bound")
+        if current is None or actual_type is bool:
+            continue
+        if actual_type is int:
+            if not -(1 << 63) <= cast(int, current) <= (1 << 63) - 1:
+                raise ValueError("matched result contains an out-of-range integer")
+            scalar_bytes += 24
+            if scalar_bytes > _MAX_RESULT_BYTES:
+                raise ValueError("matched result exceeds its JSON byte bound")
             continue
         if actual_type is float:
             if not math.isfinite(cast(float, current)):
                 raise ValueError("matched result contains a non-finite float")
+            scalar_bytes += 32
+            if scalar_bytes > _MAX_RESULT_BYTES:
+                raise ValueError("matched result exceeds its JSON byte bound")
             continue
         if actual_type is str:
-            if len(cast(str, current).encode("utf-8")) > 16_384:
+            try:
+                string_bytes = len(cast(str, current).encode("utf-8"))
+            except UnicodeEncodeError as error:
+                raise ValueError("matched result contains invalid Unicode") from error
+            if string_bytes > _MAX_JSON_STRING_BYTES:
                 raise ValueError("matched result contains an oversized string")
+            scalar_bytes += 6 * string_bytes
+            if scalar_bytes > _MAX_RESULT_BYTES:
+                raise ValueError("matched result exceeds its JSON byte bound")
             continue
         if actual_type is not dict and actual_type is not list:
             raise ValueError("matched result must contain only exact JSON values")
@@ -169,6 +225,15 @@ def _json_preflight(value: object) -> None:
             mapping = cast(dict[object, object], current)
             if len(mapping) > 4096 or any(type(key) is not str for key in mapping):
                 raise ValueError("matched result object exceeds its field bound")
+            try:
+                encoded_keys = [cast(str, key).encode("utf-8") for key in mapping]
+            except UnicodeEncodeError as error:
+                raise ValueError("matched result contains an invalid Unicode field") from error
+            if any(len(key) > _MAX_JSON_KEY_BYTES for key in encoded_keys):
+                raise ValueError("matched result contains an oversized field name")
+            scalar_bytes += 6 * sum(map(len, encoded_keys))
+            if scalar_bytes > _MAX_RESULT_BYTES:
+                raise ValueError("matched result exceeds its JSON byte bound")
             pending.extend((item, depth + 1) for item in mapping.values())
         else:
             sequence = cast(list[object], current)
@@ -296,7 +361,7 @@ def _numeric_resource_envelope(
     *, config: IPMNISTConfig, dataset_rows: int
 ) -> dict[str, int]:
     dataset_bytes = dataset_rows * (config.input_dim * 4 + 4)
-    schedule_bytes = config.n_tasks * (dataset_rows + config.input_dim) * 4
+    schedule_bytes = config.n_tasks * (config.task_length + config.input_dim) * 4
     peak_persistent_bytes = max(
         bounded_elastic_resource_expectations(
             arm=arm,
@@ -312,8 +377,29 @@ def _numeric_resource_envelope(
         "dataset_bytes": dataset_bytes,
         "schedule_bytes": schedule_bytes,
         "peak_persistent_bytes_budget": peak_persistent_bytes,
-        "combined_numeric_bytes": dataset_bytes + schedule_bytes + peak_persistent_bytes,
-        "combined_numeric_bytes_limit": _MAX_COMBINED_NUMERIC_BYTES,
+        "static_accounted_numeric_bytes": (
+            dataset_bytes + schedule_bytes + peak_persistent_bytes
+        ),
+        "static_accounted_numeric_bytes_limit": _MAX_COMBINED_NUMERIC_BYTES,
+    }
+
+
+def _transaction_resource_accounting(
+    *, config: IPMNISTConfig, seeds: tuple[int, ...]
+) -> dict[str, int]:
+    rows = len(seeds) * len(ARMS)
+    observations_per_dispatch = config.n_tasks * config.task_length
+    runner_dispatches = 2 * rows
+    return {
+        "campaign_rows": rows,
+        "initial_runner_dispatches": rows,
+        "strict_reexecution_dispatches": rows,
+        "total_runner_dispatches": runner_dispatches,
+        "total_observations": runner_dispatches * observations_per_dispatch,
+        "total_optimizer_updates": runner_dispatches * observations_per_dispatch,
+        "total_data_steps": runner_dispatches * observations_per_dispatch,
+        "total_environment_steps": 0,
+        "total_model_queries": 2 * runner_dispatches * observations_per_dispatch,
     }
 
 
@@ -332,20 +418,22 @@ def _validated_arrays(
         or data_x.shape[1] != config.input_dim
     ):
         raise ValueError("dataset shape does not match the campaign config")
+    if not data_x.flags.c_contiguous or not data_y.flags.c_contiguous:
+        raise ValueError("dataset arrays must be C-contiguous to avoid an unaccounted copy")
     dataset_bytes = data_x.nbytes + data_y.nbytes
     if dataset_bytes > _MAX_DATASET_BYTES:
         raise ValueError("dataset exceeds the campaign's 256 MiB byte bound")
-    schedule_bytes = config.n_tasks * (data_x.shape[0] + config.input_dim) * 4
+    schedule_bytes = config.n_tasks * (config.task_length + config.input_dim) * 4
     if schedule_bytes > _MAX_SCHEDULE_BYTES:
         raise ValueError("schedule exceeds the campaign's 256 MiB byte bound")
     envelope = _numeric_resource_envelope(config=config, dataset_rows=data_x.shape[0])
-    if envelope["combined_numeric_bytes"] > _MAX_COMBINED_NUMERIC_BYTES:
-        raise ValueError("campaign exceeds its combined 256 MiB numeric allocation bound")
+    if envelope["static_accounted_numeric_bytes"] > _MAX_COMBINED_NUMERIC_BYTES:
+        raise ValueError("campaign exceeds its static 256 MiB numeric accounting bound")
     if not np.isfinite(data_x).all():
         raise ValueError("data_x must be finite")
     if np.any(data_y < 0) or np.any(data_y >= config.n_classes):
         raise ValueError("data_y is outside the configured class range")
-    return np.array(data_x, copy=True, order="C"), np.array(data_y, copy=True, order="C")
+    return data_x, data_y
 
 
 def _dataset_sha256(data_x: np.ndarray, data_y: np.ndarray) -> str:
@@ -391,6 +479,42 @@ def _config_payload(config: IPMNISTConfig) -> dict[str, int]:
         name: getattr(config, name)
         for name in ("n_tasks", "task_length", "input_dim", "hidden1", "hidden2", "n_classes")
     }
+
+
+def _result_identity(data_x: np.ndarray, data_y: np.ndarray) -> dict[str, object]:
+    return {
+        "dataset_sha256": _dataset_sha256(data_x, data_y),
+        "source_sha256": _source_identity(),
+        "runtime": _runtime_identity(),
+        "consistency_not_attestation": True,
+    }
+
+
+def _seed_roster_matches(value: object, expected: tuple[int, ...]) -> bool:
+    return (
+        type(value) is tuple
+        and len(cast(tuple[object, ...], value)) == len(expected)
+        and all(
+            type(item) is int and item == expected_item
+            for item, expected_item in zip(cast(tuple[object, ...], value), expected, strict=True)
+        )
+    )
+
+
+def _require_capability_roster(
+    seeds: object, capability: object, *, operation: str
+) -> tuple[int, ...]:
+    if capability is _EXECUTION_CAPABILITY:
+        if _REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True:
+            raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
+        expected = CAMPAIGN_SEEDS
+    elif capability is _TEST_EXECUTION_CAPABILITY:
+        expected = TEST_ONLY_SEEDS
+    else:
+        raise RuntimeError(f"private bounded-elastic {operation} capability is invalid")
+    if not _seed_roster_matches(seeds, expected):
+        raise RuntimeError(f"private bounded-elastic {operation} seed roster is invalid")
+    return expected
 
 
 def _aggregate(rows: list[dict[str, object]]) -> dict[str, object]:
@@ -471,29 +595,22 @@ def _run_bounded_elastic_matched_authorized(
     _on_first_dispatch: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     """Capability-private full runner used by tests or an authorized campaign."""
-    expected_seeds = (
-        CAMPAIGN_SEEDS if _capability is _EXECUTION_CAPABILITY
-        else TEST_ONLY_SEEDS if _capability is _TEST_EXECUTION_CAPABILITY
-        else None
+    checked_seeds = _require_capability_roster(
+        seeds, _capability, operation="execution"
     )
-    if expected_seeds is None or type(seeds) is not tuple or seeds != expected_seeds:
-        raise RuntimeError("private bounded-elastic execution capability or seeds are invalid")
-    if _capability is _EXECUTION_CAPABILITY and (
-        _REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True
-    ):
-        raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
     checked_config = _checked_config(config)
     x, y = _validated_arrays(data_x, data_y, checked_config)
-    execution_source = _source_identity()
-    execution_runtime = _runtime_identity()
+    execution_identity = _result_identity(x, y)
+    execution_source = execution_identity["source_sha256"]
+    execution_runtime = execution_identity["runtime"]
     if _capability is _EXECUTION_CAPABILITY:
         if checked_config != CAMPAIGN_CONFIG:
             raise ValueError("campaign config differs from the frozen reviewed plan")
-        if _screening_dataset_provenance(x, y) != frozen_plan()["dataset"]:
+        if _screening_dataset_provenance(x, y) != _frozen_dataset_provenance():
             raise ValueError("campaign dataset differs from the frozen reviewed identity")
     rows: list[dict[str, object]] = []
-    for seed in seeds:
-        execution_identity = _execution_identity(seed, checked_config, x.shape[0])
+    for seed in checked_seeds:
+        row_execution_identity = _execution_identity(seed, checked_config, x.shape[0])
         for arm in ARMS:
             spec = screening_spec(arm)
             if not rows and _on_first_dispatch is not None:
@@ -505,31 +622,32 @@ def _run_bounded_elastic_matched_authorized(
                 {
                     "seed": seed,
                     "arm": arm,
-                    "execution_identity": dict(execution_identity),
+                    "execution_identity": dict(row_execution_identity),
                     "result": bounded_elastic_development_result_payload(
                         arm_result, outcome="inconclusive"
                     ),
                 }
             )
+    if _result_identity(x, y) != execution_identity:
+        raise RuntimeError("source, runtime, or dataset changed during matched execution")
+    if _capability is _EXECUTION_CAPABILITY and (
+        _screening_dataset_provenance(x, y) != _frozen_dataset_provenance()
+    ):
+        raise RuntimeError("campaign dataset changed during matched execution")
     campaign: dict[str, object] = {
         "schema": RESULT_SCHEMA,
         "status": "complete",
         "config": _config_payload(checked_config),
-        "development_seeds": list(seeds),
+        "development_seeds": list(checked_seeds),
         "arms": list(ARMS),
-        "identity": {
-            "dataset_sha256": _dataset_sha256(x, y),
-            "source_sha256": execution_source,
-            "runtime": execution_runtime,
-            "consistency_not_attestation": True,
-        },
+        "identity": execution_identity,
         "policy": dict(_POLICY),
         "rows": rows,
         "aggregate": _aggregate(rows),
     }
     campaign["result_sha256"] = hashlib.sha256(_canonical(campaign)).hexdigest()
     _validate_bounded_elastic_matched(
-        campaign, x, y, config=checked_config, seeds=seeds, reexecute=False
+        campaign, x, y, config=checked_config, seeds=checked_seeds, reexecute=False
     )
     return campaign
 
@@ -548,19 +666,11 @@ def _validate_bounded_elastic_matched_authorized(
     value: object, data_x: object, data_y: object, *, config: IPMNISTConfig,
     seeds: tuple[int, ...], _capability: object,
 ) -> None:
-    expected_seeds = (
-        CAMPAIGN_SEEDS if _capability is _EXECUTION_CAPABILITY
-        else TEST_ONLY_SEEDS if _capability is _TEST_EXECUTION_CAPABILITY
-        else None
+    checked_seeds = _require_capability_roster(
+        seeds, _capability, operation="validation"
     )
-    if expected_seeds is None or type(seeds) is not tuple or seeds != expected_seeds:
-        raise RuntimeError("private bounded-elastic validation capability or seeds are invalid")
-    if _capability is _EXECUTION_CAPABILITY and (
-        _REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True
-    ):
-        raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
     _validate_bounded_elastic_matched(
-        value, data_x, data_y, config=config, seeds=seeds, reexecute=True
+        value, data_x, data_y, config=config, seeds=checked_seeds, reexecute=True
     )
 
 
@@ -574,6 +684,17 @@ def _validate_bounded_elastic_matched(
     reexecute: bool,
 ) -> None:
     """Validate the full roster, identities, and optionally current execution."""
+    if type(reexecute) is not bool:
+        raise TypeError("reexecute must be an exact bool")
+    if not (
+        _seed_roster_matches(seeds, TEST_ONLY_SEEDS)
+        or _seed_roster_matches(seeds, CAMPAIGN_SEEDS)
+    ):
+        raise RuntimeError("matched validation seed roster is invalid")
+    if reexecute and _seed_roster_matches(seeds, CAMPAIGN_SEEDS) and (
+        _REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True
+    ):
+        raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
     _json_preflight(value)
     root = _exact_object(
         value,
@@ -595,16 +716,16 @@ def _validate_bounded_elastic_matched(
         raise ValueError("matched result identity drifted")
     checked_config = _checked_config(config)
     x, y = _validated_arrays(data_x, data_y, checked_config)
+    if _seed_roster_matches(seeds, CAMPAIGN_SEEDS) and (
+        checked_config != CAMPAIGN_CONFIG
+        or _screening_dataset_provenance(x, y) != _frozen_dataset_provenance()
+    ):
+        raise ValueError("campaign inputs differ from the frozen reviewed plan")
     if root["config"] != _config_payload(checked_config):
         raise ValueError("matched result config drifted")
     if root["development_seeds"] != list(seeds) or root["arms"] != list(ARMS):
         raise ValueError("matched result protocol roster drifted")
-    expected_identity = {
-        "dataset_sha256": _dataset_sha256(x, y),
-        "source_sha256": _source_identity(),
-        "runtime": _runtime_identity(),
-        "consistency_not_attestation": True,
-    }
+    expected_identity = _result_identity(x, y)
     if root["identity"] != expected_identity:
         raise ValueError("matched result identity drifted")
     if root["policy"] != _POLICY:
@@ -673,6 +794,8 @@ def _validate_bounded_elastic_matched(
             expected_resources["timing_seconds"] = claimed_resources["timing_seconds"]
             if expected_payload != claimed_payload:
                 raise ValueError("matched row disagrees with strict current-source reexecution")
+        if _result_identity(x, y) != expected_identity:
+            raise RuntimeError("source, runtime, or dataset changed during strict reexecution")
 
 
 def write_bounded_elastic_matched(
@@ -690,9 +813,25 @@ def write_bounded_elastic_matched(
     )
 
 
+def _validated_output_path(path: object) -> Path:
+    if type(path) is not type(Path()):
+        raise TypeError("destination must be an exact Path")
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    if len(os.fsencode(absolute)) > _MAX_PATH_BYTES:
+        raise ValueError("output path exceeds its byte bound")
+    components = absolute.parts[1:]
+    if any(
+        component in {"", ".", ".."}
+        or len(os.fsencode(component)) > _MAX_PATH_COMPONENT_BYTES
+        for component in components
+    ):
+        raise ValueError("output path contains an unsafe or oversized component")
+    return absolute
+
+
 def _open_output_parent(path: Path) -> int:
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-    absolute = Path(os.path.abspath(os.fspath(path)))
+    absolute = _validated_output_path(path)
     descriptor = os.open(os.path.sep, flags)
     try:
         for component in absolute.parent.parts[1:]:
@@ -735,24 +874,24 @@ def _reserve_output(path: Path, *, _capability: object) -> OutputReservation:
             raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
     elif _capability is not _TEST_EXECUTION_CAPABILITY:
         raise RuntimeError("private bounded-elastic reservation capability is invalid")
-    if type(path) is not type(Path()):
-        raise TypeError("destination must be an exact Path")
+    absolute = _validated_output_path(path)
+    output_absolute = _validated_output_path(OUTPUT_PATH)
     if not all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_TMPFILE")):
         raise OSError("immutable output publication requires Linux descriptor support")
     if (
-        path.name in {"", ".", ".."}
-        or (_capability is _EXECUTION_CAPABILITY and path.absolute() != OUTPUT_PATH.absolute())
-        or (_capability is _TEST_EXECUTION_CAPABILITY and path.absolute() == OUTPUT_PATH.absolute())
+        path != absolute
+        or (_capability is _EXECUTION_CAPABILITY and absolute != output_absolute)
+        or (_capability is _TEST_EXECUTION_CAPABILITY and absolute == output_absolute)
     ):
         raise ValueError(f"output must be the exact reserved NEW path {OUTPUT_PATH}")
-    directory_fd = _open_output_parent(path)
-    reservation_name = f".{path.name}.reservation"
+    directory_fd = _open_output_parent(absolute)
+    reservation_name = f".{absolute.name}.reservation"
     marker_fd = -1
     acquired = False
     marker_identity: tuple[int, int] | None = None
     try:
         try:
-            os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
+            os.stat(absolute.name, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
             pass
         else:
@@ -775,10 +914,10 @@ def _reserve_output(path: Path, *, _capability: object) -> OutputReservation:
         metadata = os.fstat(marker_fd)
         marker_identity = (metadata.st_dev, metadata.st_ino)
         os.fsync(directory_fd)
-        _require_live_output_parent(path, directory_fd)
+        _require_live_output_parent(absolute, directory_fd)
         return (
             directory_fd,
-            path.name,
+            absolute.name,
             reservation_name,
             marker_fd,
             metadata.st_dev,
@@ -861,6 +1000,51 @@ def _link_unnamed_file(file_fd: int, directory_fd: int, name: str) -> None:
         raise OSError(error_number, os.strerror(error_number), name)
 
 
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, item in pairs:
+        if key in result:
+            raise ValueError("prepared output contains a duplicate JSON key")
+        result[key] = item
+    return result
+
+
+def _strict_reread_prepared_output(
+    descriptor: int,
+    encoded: bytes,
+    data_x: object,
+    data_y: object,
+    *,
+    config: IPMNISTConfig,
+    seeds: tuple[int, ...],
+) -> tuple[int, int]:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    before = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 0
+        or before.st_size != len(encoded)
+    ):
+        raise ValueError("prepared output must be one unnamed regular file")
+    actual = os.read(descriptor, len(encoded) + 1)
+    after = os.fstat(descriptor)
+    if actual != encoded or (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    ) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+        raise ValueError("prepared output changed during strict reread")
+    try:
+        reread = json.loads(actual.decode("utf-8"), object_pairs_hook=_strict_json_object)
+    except (UnicodeDecodeError, ValueError, RecursionError) as error:
+        raise ValueError("prepared output is not bounded strict JSON") from error
+    _validate_bounded_elastic_matched(
+        reread, data_x, data_y, config=config, seeds=seeds, reexecute=False
+    )
+    return before.st_dev, before.st_ino
+
+
 def _write_bounded_elastic_matched_authorized(
     destination: Path, value: object, data_x: object, data_y: object, *,
     config: IPMNISTConfig, seeds: tuple[int, ...], _capability: object,
@@ -870,9 +1054,12 @@ def _write_bounded_elastic_matched_authorized(
         raise RuntimeError(
             "campaign publication requires the reservation-first transaction"
         )
-    if type(seeds) is not tuple or seeds != TEST_ONLY_SEEDS:
-        raise RuntimeError("private bounded-elastic publication capability is invalid")
+    checked_seeds = _require_capability_roster(
+        seeds, _capability, operation="publication"
+    )
+    _json_preflight(value)
     reservation = _reserve_output(destination, _capability=_capability)
+    published = False
     try:
         _publish_bounded_elastic_matched_reserved(
             reservation,
@@ -881,11 +1068,15 @@ def _write_bounded_elastic_matched_authorized(
             data_x,
             data_y,
             config=config,
-            seeds=seeds,
+            seeds=checked_seeds,
             _capability=_capability,
         )
+        published = True
     finally:
-        _release_output(reservation)
+        if published:
+            _release_output(reservation)
+        else:
+            _retain_consumed_output(reservation)
 
 
 def _publish_bounded_elastic_matched_reserved(
@@ -899,18 +1090,9 @@ def _publish_bounded_elastic_matched_reserved(
     seeds: tuple[int, ...],
     _capability: object,
 ) -> None:
-    if _capability is _EXECUTION_CAPABILITY:
-        if _REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True:
-            raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
-    elif _capability is not _TEST_EXECUTION_CAPABILITY:
-        raise RuntimeError("private bounded-elastic publication capability is invalid")
-    expected_seeds = (
-        CAMPAIGN_SEEDS if _capability is _EXECUTION_CAPABILITY
-        else TEST_ONLY_SEEDS if _capability is _TEST_EXECUTION_CAPABILITY
-        else None
+    checked_seeds = _require_capability_roster(
+        seeds, _capability, operation="publication"
     )
-    if expected_seeds is None or type(seeds) is not tuple or seeds != expected_seeds:
-        raise RuntimeError("private bounded-elastic publication capability is invalid")
     directory_fd, destination_name, _marker, _marker_fd, _device, _inode = reservation
     descriptor = -1
     published_identity: tuple[int, int] | None = None
@@ -918,13 +1100,15 @@ def _publish_bounded_elastic_matched_reserved(
         _require_live_output_parent(destination, directory_fd)
         _require_owned_reservation(reservation)
         _validate_bounded_elastic_matched(
-            value, data_x, data_y, config=config, seeds=seeds, reexecute=True
+            value, data_x, data_y, config=config, seeds=checked_seeds, reexecute=True
         )
         _require_owned_reservation(reservation)
         encoded = _canonical(value) + b"\n"
+        if len(encoded) > _MAX_RESULT_BYTES:
+            raise ValueError("encoded matched result exceeds its byte bound")
         descriptor = os.open(
             ".",
-            os.O_WRONLY | os.O_TMPFILE | os.O_CLOEXEC,
+            os.O_RDWR | os.O_TMPFILE | os.O_CLOEXEC,
             0o600,
             dir_fd=directory_fd,
         )
@@ -937,49 +1121,45 @@ def _publish_bounded_elastic_matched_reserved(
         os.fsync(descriptor)
         os.fchmod(descriptor, 0o400)
         os.fsync(descriptor)
+        prepared_identity = _strict_reread_prepared_output(
+            descriptor,
+            encoded,
+            data_x,
+            data_y,
+            config=config,
+            seeds=checked_seeds,
+        )
         _require_live_output_parent(destination, directory_fd)
         _require_owned_reservation(reservation)
+        # Arm rollback before linkat: an asynchronous exception can arrive after
+        # linkat succeeds but before Python resumes at the following statement.
+        published_identity = prepared_identity
         try:
             _link_unnamed_file(descriptor, directory_fd, destination_name)
         except FileExistsError as error:
             raise FileExistsError(
                 "refusing to replace immutable bounded-elastic output"
             ) from error
-        prepared = os.fstat(descriptor)
-        published_identity = (prepared.st_dev, prepared.st_ino)
+        visible = os.stat(destination_name, dir_fd=directory_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(visible.st_mode)
+            or visible.st_nlink != 1
+            or visible.st_size != len(encoded)
+            or (visible.st_dev, visible.st_ino) != prepared_identity
+        ):
+            raise ValueError("published output is not the strictly checked prepared inode")
         os.fsync(directory_fd)
-        read_fd = os.open(destination_name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                          dir_fd=directory_fd)
-        try:
-            metadata = os.fstat(read_fd)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
-                raise ValueError("published output must be one unique regular file")
-            actual = os.read(read_fd, len(encoded) + 1)
-            final = os.fstat(read_fd)
-            if actual != encoded or metadata.st_size != len(encoded) or (
-                metadata.st_dev, metadata.st_ino, metadata.st_size, metadata.st_mtime_ns
-            ) != (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns):
-                raise ValueError("published output changed during strict reread")
-            def exact_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-                result: dict[str, object] = {}
-                for key, item in pairs:
-                    if key in result:
-                        raise ValueError("published output contains a duplicate JSON key")
-                    result[key] = item
-                return result
-
-            try:
-                reread = json.loads(
-                    actual.decode("utf-8"), object_pairs_hook=exact_object
-                )
-            except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
-                raise ValueError("published output is not bounded strict JSON") from error
-            _validate_bounded_elastic_matched(
-                reread, data_x, data_y, config=config, seeds=seeds, reexecute=False
-            )
-        finally:
-            os.close(read_fd)
         _require_live_output_parent(destination, directory_fd)
+        final_visible = os.stat(
+            destination_name, dir_fd=directory_fd, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISREG(final_visible.st_mode)
+            or final_visible.st_nlink != 1
+            or final_visible.st_size != len(encoded)
+            or (final_visible.st_dev, final_visible.st_ino) != prepared_identity
+        ):
+            raise ValueError("published output name changed after directory synchronization")
     except BaseException:
         if published_identity is not None:
             try:
@@ -1023,22 +1203,11 @@ def _run_and_publish_bounded_elastic_matched_authorized(
     seeds: tuple[int, ...],
     _capability: object,
 ) -> dict[str, object]:
-    expected_seeds = (
-        CAMPAIGN_SEEDS if _capability is _EXECUTION_CAPABILITY
-        else TEST_ONLY_SEEDS if _capability is _TEST_EXECUTION_CAPABILITY
-        else None
+    checked_seeds = _require_capability_roster(
+        seeds, _capability, operation="transaction"
     )
-    if (
-        expected_seeds is None
-        or type(seeds) is not tuple
-        or seeds != expected_seeds
-        or type(data_home) is not type(Path())
-    ):
+    if type(data_home) is not type(Path()):
         raise RuntimeError("private bounded-elastic transaction capability is invalid")
-    if _capability is _EXECUTION_CAPABILITY and (
-        _REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True
-    ):
-        raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
     reservation = _reserve_output(destination, _capability=_capability)
     consumer_started = False
     published = False
@@ -1055,7 +1224,7 @@ def _run_and_publish_bounded_elastic_matched_authorized(
             data_x,
             data_y,
             config=config,
-            seeds=seeds,
+            seeds=checked_seeds,
             _capability=_capability,
             _on_first_dispatch=note_first_dispatch,
         )
@@ -1067,7 +1236,7 @@ def _run_and_publish_bounded_elastic_matched_authorized(
             data_x,
             data_y,
             config=config,
-            seeds=seeds,
+            seeds=checked_seeds,
             _capability=_capability,
         )
         published = True

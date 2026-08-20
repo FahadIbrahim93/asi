@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import stat
 from pathlib import Path
 from typing import Any, cast
 
@@ -42,6 +43,12 @@ def test_plan_is_prospective_and_public_execution_is_hard_disabled(
     assert plan["pre_dispatch_failure_receipts_retained"] is False
     assert plan["post_dispatch_failure_tombstone_retained"] is True
     assert plan["post_dispatch_retry_prevention"] is True
+    assert plan["seed_policy"] == {
+        "campaign_roster_status": "reserved_unconsumed",
+        "test_only_seeds": [201, 202, 203, 204, 205],
+        "campaign_and_test_rosters_disjoint": True,
+    }
+    assert set(runner.CAMPAIGN_SEEDS).isdisjoint(runner.TEST_ONLY_SEEDS)
     monkeypatch.setattr(runner, "_REVIEWED_EXECUTION_TRANSITION", True)
     monkeypatch.setattr(runner, "_EXECUTION_AUTHORIZED", True)
     assert runner.frozen_plan() == plan
@@ -71,6 +78,28 @@ def test_plan_is_prospective_and_public_execution_is_hard_disabled(
             config=SMALL,
             seeds=runner.CAMPAIGN_SEEDS,
             _capability=runner._EXECUTION_CAPABILITY,
+        )
+    assert calls == 0
+
+
+def test_direct_internal_reexecution_cannot_bypass_campaign_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("campaign dispatch bypassed authorization")
+
+    monkeypatch.setattr(runner, "run_screening_config", forbidden)
+    with pytest.raises(RuntimeError, match="not authorized"):
+        runner._validate_bounded_elastic_matched(
+            {},
+            *_data(),
+            config=SMALL,
+            seeds=runner.CAMPAIGN_SEEDS,
+            reexecute=True,
         )
     assert calls == 0
 
@@ -154,6 +183,45 @@ def test_campaign_rejects_source_drift_during_execution(
     with pytest.raises(RuntimeError, match="changed during matched execution"):
         _run_for_test(*_data(), config=SMALL)
     assert calls == 1
+
+
+def test_campaign_and_reexecution_reject_dataset_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x, y = _data()
+    calls = 0
+
+    def mutate_once(
+        data_x: np.ndarray,
+        data_y: np.ndarray,
+        spec: object,
+        seed: int,
+        config: IPMNISTConfig,
+    ) -> ScreeningRunResult:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            data_x[0, 0] += np.float32(0.25)
+        return _fake_run(data_x, data_y, spec, seed, config)
+
+    monkeypatch.setattr(runner, "run_screening_config", mutate_once)
+    with pytest.raises(RuntimeError, match="dataset changed during matched execution"):
+        _run_for_test(x, y, config=SMALL)
+
+    monkeypatch.setattr(runner, "run_screening_config", _fake_run)
+    clean_x, clean_y = _data()
+    result = _run_for_test(clean_x, clean_y, config=SMALL)
+    calls = 0
+    monkeypatch.setattr(runner, "run_screening_config", mutate_once)
+    with pytest.raises(RuntimeError, match="dataset changed during strict reexecution"):
+        runner._validate_bounded_elastic_matched_authorized(
+            result,
+            clean_x,
+            clean_y,
+            config=SMALL,
+            seeds=runner.TEST_ONLY_SEEDS,
+            _capability=runner._TEST_EXECUTION_CAPABILITY,
+        )
 
 
 def test_validator_rejects_identity_resource_and_roster_forgery(
@@ -243,6 +311,127 @@ def test_writer_is_create_only_and_retains_negative_outcomes(
             destination, result, *_data(), config=SMALL, seeds=runner.TEST_ONLY_SEEDS,
             _capability=runner._TEST_EXECUTION_CAPABILITY,
         )
+    assert not destination.with_name(f".{destination.name}.reservation").exists()
+
+
+def test_writer_strictly_rereads_before_link_and_retains_failed_attempt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(runner, "run_screening_config", _fake_run)
+    result = _run_for_test(*_data(), config=SMALL)
+    destination = tmp_path / "bounded-elastic.json"
+    marker = destination.with_name(f".{destination.name}.reservation")
+
+    def fail_strict_stage(*_args: object, **_kwargs: object) -> tuple[int, int]:
+        raise ValueError("strict stage failed")
+
+    monkeypatch.setattr(runner, "_strict_reread_prepared_output", fail_strict_stage)
+
+    with pytest.raises(ValueError, match="strict stage failed"):
+        runner._write_bounded_elastic_matched_authorized(
+            destination,
+            result,
+            *_data(),
+            config=SMALL,
+            seeds=runner.TEST_ONLY_SEEDS,
+            _capability=runner._TEST_EXECUTION_CAPABILITY,
+        )
+    assert not destination.exists()
+    assert marker.read_bytes() == b"asi-bounded-elastic-consumed-without-result-v1\n"
+
+
+def test_writer_retains_reservation_after_reexecution_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(runner, "run_screening_config", _fake_run)
+    result = _run_for_test(*_data(), config=SMALL)
+    destination = tmp_path / "bounded-elastic.json"
+    marker = destination.with_name(f".{destination.name}.reservation")
+
+    def fail_dispatch(*_args: object, **_kwargs: object) -> ScreeningRunResult:
+        raise RuntimeError("dispatch failed")
+
+    monkeypatch.setattr(runner, "run_screening_config", fail_dispatch)
+
+    with pytest.raises(RuntimeError, match="dispatch failed"):
+        runner._write_bounded_elastic_matched_authorized(
+            destination,
+            result,
+            *_data(),
+            config=SMALL,
+            seeds=runner.TEST_ONLY_SEEDS,
+            _capability=runner._TEST_EXECUTION_CAPABILITY,
+        )
+    assert not destination.exists()
+    assert marker.read_bytes() == b"asi-bounded-elastic-consumed-without-result-v1\n"
+
+
+@pytest.mark.parametrize("replace_linked_inode", [False, True])
+def test_post_link_failure_rolls_back_only_the_exact_published_inode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    replace_linked_inode: bool,
+) -> None:
+    monkeypatch.setattr(runner, "run_screening_config", _fake_run)
+    result = _run_for_test(*_data(), config=SMALL)
+    destination = tmp_path / "bounded-elastic.json"
+    marker = destination.with_name(f".{destination.name}.reservation")
+    original_fsync = runner.os.fsync
+    directory_fsyncs = 0
+
+    def fail_after_link(descriptor: int) -> None:
+        nonlocal directory_fsyncs
+        if stat.S_ISDIR(runner.os.fstat(descriptor).st_mode):
+            directory_fsyncs += 1
+            if directory_fsyncs == 2:
+                if replace_linked_inode:
+                    destination.unlink()
+                    destination.write_bytes(b"foreign replacement")
+                raise OSError("post-link directory fsync failed")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(runner.os, "fsync", fail_after_link)
+    with pytest.raises(OSError, match="post-link"):
+        runner._write_bounded_elastic_matched_authorized(
+            destination,
+            result,
+            *_data(),
+            config=SMALL,
+            seeds=runner.TEST_ONLY_SEEDS,
+            _capability=runner._TEST_EXECUTION_CAPABILITY,
+        )
+    if replace_linked_inode:
+        assert destination.read_bytes() == b"foreign replacement"
+    else:
+        assert not destination.exists()
+    assert marker.read_bytes() == b"asi-bounded-elastic-consumed-without-result-v1\n"
+
+
+def test_link_success_followed_by_exception_rolls_back_exact_inode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(runner, "run_screening_config", _fake_run)
+    result = _run_for_test(*_data(), config=SMALL)
+    destination = tmp_path / "bounded-elastic.json"
+    original_link = runner._link_unnamed_file
+
+    def link_then_interrupt(file_fd: int, directory_fd: int, name: str) -> None:
+        original_link(file_fd, directory_fd, name)
+        raise KeyboardInterrupt("interrupted after link")
+
+    monkeypatch.setattr(runner, "_link_unnamed_file", link_then_interrupt)
+    with pytest.raises(KeyboardInterrupt, match="interrupted after link"):
+        runner._write_bounded_elastic_matched_authorized(
+            destination,
+            result,
+            *_data(),
+            config=SMALL,
+            seeds=runner.TEST_ONLY_SEEDS,
+            _capability=runner._TEST_EXECUTION_CAPABILITY,
+        )
+    assert not destination.exists()
+    marker = destination.with_name(f".{destination.name}.reservation")
+    assert marker.read_bytes() == b"asi-bounded-elastic-consumed-without-result-v1\n"
 
 
 def test_writer_rejects_replaced_visible_reservation_before_publication(
@@ -485,7 +674,7 @@ def test_preflight_rejects_unbounded_or_wrong_dataset_before_execution(
     assert calls == 0
 
 
-def test_combined_numeric_preflight_precedes_copy_schedule_and_initialization(
+def test_static_numeric_preflight_precedes_schedule_and_initialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     x, y = _data()
@@ -497,12 +686,48 @@ def test_combined_numeric_preflight_precedes_copy_schedule_and_initialization(
         calls += 1
         raise AssertionError("allocation or execution preceded aggregate preflight")
 
-    monkeypatch.setattr(runner.np, "array", forbidden)
     monkeypatch.setattr(runner, "build_schedule", forbidden)
     monkeypatch.setattr(runner, "init_mlp_params", forbidden)
     monkeypatch.setattr(runner, "run_screening_config", forbidden)
-    with pytest.raises(ValueError, match="combined 256 MiB numeric allocation"):
+    with pytest.raises(ValueError, match="static 256 MiB numeric accounting"):
         _run_for_test(x, y, config=SMALL)
+    assert calls == 0
+
+
+def test_resource_envelope_uses_task_length_and_rejects_unaccounted_dataset_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    envelope = runner._numeric_resource_envelope(config=SMALL, dataset_rows=5000)
+    assert envelope["schedule_bytes"] == SMALL.n_tasks * (
+        SMALL.task_length + SMALL.input_dim
+    ) * 4
+    assert "combined_numeric_bytes" not in envelope
+    plan = runner.frozen_plan()
+    assert "backend copies" in cast(str, plan["numeric_resource_scope"])
+    transaction = cast(dict[str, int], plan["transaction_resource_accounting"])
+    assert transaction == {
+        "campaign_rows": 20,
+        "initial_runner_dispatches": 20,
+        "strict_reexecution_dispatches": 20,
+        "total_runner_dispatches": 40,
+        "total_observations": 1_600_000,
+        "total_optimizer_updates": 1_600_000,
+        "total_data_steps": 1_600_000,
+        "total_environment_steps": 0,
+        "total_model_queries": 3_200_000,
+    }
+
+    x, y = _data()
+    calls = 0
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("noncontiguous dataset reached execution")
+
+    monkeypatch.setattr(runner, "run_screening_config", forbidden)
+    with pytest.raises(ValueError, match="C-contiguous"):
+        _run_for_test(x[:, ::-1], y, config=SMALL)
     assert calls == 0
 
 
@@ -529,6 +754,53 @@ def test_json_preflight_rejects_nested_hostile_type_without_dispatching_hooks() 
     assert calls == 0
 
 
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ({"field": 1 << 80}, "out-of-range integer"),
+        ({"x" * 257: 1}, "oversized field name"),
+        ({"field": "\ud800"}, "invalid Unicode"),
+    ],
+)
+def test_json_preflight_rejects_hostile_scalar_bounds(
+    value: object, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        runner._json_preflight(value)
+
+
+def test_seed_roster_validation_does_not_dispatch_hostile_equality(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class HostileInt(int):
+        def __eq__(self, other: object) -> bool:
+            del other
+            nonlocal calls
+            calls += 1
+            raise AssertionError("hostile seed equality dispatched")
+
+    hostile = (HostileInt(201), *runner.TEST_ONLY_SEEDS[1:])
+    with pytest.raises(RuntimeError, match="seed roster"):
+        runner._run_bounded_elastic_matched_authorized(
+            *_data(),
+            config=SMALL,
+            seeds=cast(Any, hostile),
+            _capability=runner._TEST_EXECUTION_CAPABILITY,
+        )
+    assert calls == 0
+
+
+def test_output_path_bounds_fail_before_directory_creation(tmp_path: Path) -> None:
+    destination = tmp_path / "never" / ("x" * 241) / "report.json"
+    with pytest.raises(ValueError, match="oversized component"):
+        runner._reserve_output(
+            destination, _capability=runner._TEST_EXECUTION_CAPABILITY
+        )
+    assert not (tmp_path / "never").exists()
+
+
 def test_registered_controls_are_exact() -> None:
     for arm in runner.ARMS:
         assert screening_spec(arm).hyperparameters == registered_bounded_elastic_hyperparameters(
@@ -536,7 +808,7 @@ def test_registered_controls_are_exact() -> None:
         )
 
 
-def test_source_identity_uses_only_installed_package_files() -> None:
+def test_source_identity_uses_exact_audited_sources_and_dependency_inputs() -> None:
     assert set(runner._source_identity()) == {
         "alberta_framework/_seed_validation.py",
         "alberta_framework/benchmarks/ipmnist_screening.py",

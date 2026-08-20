@@ -9,12 +9,18 @@ differences. It is not a paper reproduction.
 
 The prospective plan binds the canonical materialized OpenML MNIST training-array digests,
 current source/runtime identity, exact `pyproject.toml` and `uv.lock` bytes, an exact 8-task by
-5,000-example configuration, all four arms, and five globally searched campaign seeds. Tests use
-a separate test-only capability and seed roster, so they never execute the campaign schedule.
+5,000-example configuration, all four arms, and five repository-history-checked campaign seeds.
+The catalog records the distinct test-only roster; the two literal rosters are disjoint, and the
+authorization gate rejects the campaign roster even through private helpers while authorization
+remains false.
 Each result retains observations, updates, data and environment steps, model queries, persistent
-bytes, peak-persistent budget, active final size, structural events, and telemetry-only timing. One aggregate
-256 MiB numeric envelope covers retained dataset, schedule, and peak persistent bytes and is
-checked before dataset copying, schedule construction, parameter initialization, or execution.
+bytes, peak budget, active final size, structural events, and telemetry-only timing. One static
+256 MiB accounting envelope covers one caller-owned C-contiguous host dataset, the exact
+task-length schedule, and peak learner-persistent bytes. It is checked before schedule
+construction, parameter initialization, or execution; backend copies, compiler state, gradients,
+and transient execution buffers are explicitly outside that arithmetic envelope. The plan also
+charges the transaction's 20 initial runner dispatches and 20 strict reexecution dispatches:
+1,600,000 observations, optimizer updates, and data steps plus 3,200,000 model queries in total.
 
 The preregistered primary comparison is paired whole-stream mean online accuracy for
 `bounded_growth` and `bounded_elastic` against `bounded_fixed_cbp`. A candidate is supported only
@@ -28,13 +34,16 @@ run-and-publish transaction remains hard-disabled until both a separately review
 and runtime authorization become exact `true`. The reviewed plan records both authorization fields
 as literal `false`; a later transition cannot retroactively change that plan identity. The future
 output path is NEW. Before any dataset load or runner dispatch, the transaction reserves the path
-through per-segment no-follow directory descriptors. A failure after the first runner dispatch
-permanently retains the inode-owned marker as a consumed-without-result tombstone, so the five-seed
-roster cannot be retried. A failure before the first dispatch has no structured receipt and releases
+through per-segment no-follow directory descriptors. It strictly rereads and validates an unnamed
+staged inode before linking it into the output namespace. Post-link failure removes only that exact
+inode. A failure after the first runner dispatch permanently retains the inode-owned marker as a
+consumed-without-result tombstone, so the five-seed roster cannot be retried; a successful linked
+output is itself the immutable retention barrier before the marker is released. Publication is
+create-only and fsynced. A failure before the first dispatch has no structured receipt and releases
 the reservation. Process death leaves the owned reservation marker in place and also prevents an
-implicit retry. Publication is create-only, fsynced, uniquely linked, bounded-reread,
-duplicate-key rejected, and strictly revalidated. Every result is development-only, permanently
-nonpromoting, and retains negative or inconclusive outcomes.
+implicit retry. Source, runtime, and dataset identities are checked again after both initial
+execution and strict reexecution. Every result is development-only and permanently nonpromoting;
+negative, inconclusive, supported, and rejected development outcomes remain subject to retention.
 
 The read-only catalog is available without loading MNIST:
 
