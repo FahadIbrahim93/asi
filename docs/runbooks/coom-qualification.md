@@ -71,17 +71,25 @@ plumbing and are never summarized as performance.
 Use `asi-coom-qualification-smoke --catalog-only` to print the setup catalog or
 run the default bounded contract smoke. No option launches COOM.
 
+The separate `external_runtimes/coom/` directory now supplies a digest-pinned,
+hash-locked Linux qualification image. Its fixed-action smoke executes the real
+ViZDoom engine for two steps in each official CO8 task, verifies the pinned
+source/license/WAD/config identity, and reports an unattested, nonpromoting
+runtime receipt. Two clean executions at seed 1582000 produced the same trace
+SHA-256 `c74968494ccebaaeac4bc1e0c0f1db7546ac5091b831c05a4c0c727266da696f`;
+timing remains telemetry-only. This closes the bounded engine-load/reset/step
+determinism prerequisite, not the full benchmark or learner qualification.
+
 ## Gates still open
 
-- retrieve and hash the exact pinned source tree, WAD/config assets, and any
-  separately downloaded Doom data;
-- lock a Linux ViZDoom/Gymnasium environment and a separate TensorFlow baseline
-  environment, including OS libraries, Doom engine, Python, CUDA, and driver;
+- qualify any separately downloaded Doom data beyond the 33 WAD/config assets
+  already bound by the source archive;
+- lock the separate TensorFlow baseline environment, including CUDA and driver;
 - verify exact CD/CO/COC/MIXED sequence enums, action spaces, observation
   preprocessing, reward normalization, termination/truncation, frame skip,
   seeds, evaluation cadence, task-ID visibility, and metric formulas at the pin;
-- establish deterministic reset/step traces in the real engine—the synthetic
-  hash is not a substitute;
+- expand the bounded deterministic real-engine trace beyond the fixed-action
+  CO8 qualification slice;
 - freeze matched environment steps, gradient updates, replay bytes, evaluation
   queries, network bytes, accelerator memory, and timing;
 - reproduce from-scratch SAC controls required for forward transfer and retain
