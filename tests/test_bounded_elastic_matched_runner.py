@@ -237,6 +237,50 @@ def test_preflight_rejects_unbounded_or_wrong_dataset_before_execution(
     assert calls == 0
 
 
+def test_combined_numeric_preflight_precedes_copy_schedule_and_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    x, y = _data()
+    monkeypatch.setattr(runner, "_MAX_COMBINED_NUMERIC_BYTES", 1_000)
+    calls = 0
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("allocation or execution preceded aggregate preflight")
+
+    monkeypatch.setattr(runner.np, "array", forbidden)
+    monkeypatch.setattr(runner, "build_schedule", forbidden)
+    monkeypatch.setattr(runner, "init_mlp_params", forbidden)
+    monkeypatch.setattr(runner, "run_screening_config", forbidden)
+    with pytest.raises(ValueError, match="combined 256 MiB numeric allocation"):
+        _run_for_test(x, y, config=SMALL)
+    assert calls == 0
+
+
+def test_json_preflight_rejects_nested_hostile_type_without_dispatching_hooks() -> None:
+    calls = 0
+
+    class HostileMeta(type):
+        def __hash__(cls) -> int:
+            nonlocal calls
+            calls += 1
+            raise AssertionError("hostile type was hashed")
+
+        def __eq__(cls, other: object) -> bool:
+            del other
+            nonlocal calls
+            calls += 1
+            raise AssertionError("hostile type was compared")
+
+    class Hostile(metaclass=HostileMeta):
+        pass
+
+    with pytest.raises(ValueError, match="exact JSON values"):
+        runner._json_preflight({"outer": [{"inner": Hostile()}]})
+    assert calls == 0
+
+
 def test_registered_controls_are_exact() -> None:
     for arm in runner.ARMS:
         assert screening_spec(arm).hyperparameters == registered_bounded_elastic_hyperparameters(
@@ -251,4 +295,29 @@ def test_source_identity_uses_only_installed_package_files() -> None:
         "alberta_framework/benchmarks/upgd_ipmnist.py",
         "alberta_framework/evaluation/bounded_elastic_ipmnist_nonpromoting.py",
         "alberta_framework/evaluation/bounded_elastic_matched_runner.py",
+        "pyproject.toml",
+        "uv.lock",
     }
+
+
+@pytest.mark.parametrize("dependency_input", ["pyproject.toml", "uv.lock"])
+def test_source_identity_detects_dependency_input_mutation(
+    monkeypatch: pytest.MonkeyPatch, dependency_input: str
+) -> None:
+    original = runner._source_identity()
+    read_bytes = Path.read_bytes
+
+    def mutated(path: Path) -> bytes:
+        payload = read_bytes(path)
+        if path.name == dependency_input:
+            return payload + b"\nprospective-mutation"
+        return payload
+
+    monkeypatch.setattr(Path, "read_bytes", mutated)
+    changed = runner._source_identity()
+    assert changed[dependency_input] != original[dependency_input]
+    assert all(
+        changed[path] == digest
+        for path, digest in original.items()
+        if path != dependency_input
+    )

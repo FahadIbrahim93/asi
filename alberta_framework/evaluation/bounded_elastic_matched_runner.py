@@ -56,6 +56,7 @@ _MAX_STEPS: Final = 2_000_000
 _MAX_PERSISTENT_BYTES: Final = 256 * 1024 * 1024
 _MAX_DATASET_BYTES: Final = 256 * 1024 * 1024
 _MAX_SCHEDULE_BYTES: Final = 256 * 1024 * 1024
+_MAX_COMBINED_NUMERIC_BYTES: Final = 256 * 1024 * 1024
 _REVIEWED_EXECUTION_TRANSITION: Final = False
 _EXECUTION_AUTHORIZED: Final = False
 _EXECUTION_CAPABILITY: Final = object()
@@ -95,6 +96,9 @@ def frozen_plan() -> dict[str, object]:
             )
             for arm in ARMS
         },
+        "numeric_resource_envelope": _numeric_resource_envelope(
+            config=config, dataset_rows=60_000
+        ),
         "matched_axes": ["seed", "observations", "updates", "example_schedule",
                          "allowed_boundary_information", "allowed_task_information"],
         "reviewed_execution_transition": _REVIEWED_EXECUTION_TRANSITION,
@@ -118,26 +122,27 @@ def _json_preflight(value: object) -> None:
     nodes = 0
     while pending:
         current, depth = pending.pop()
+        actual_type = type(current)
         nodes += 1
         if nodes > 100_000 or depth > 16:
             raise ValueError("matched result exceeds its JSON structure bound")
-        if current is None or type(current) in {bool, int}:
+        if current is None or actual_type is bool or actual_type is int:
             continue
-        if type(current) is float:
-            if not math.isfinite(current):
+        if actual_type is float:
+            if not math.isfinite(cast(float, current)):
                 raise ValueError("matched result contains a non-finite float")
             continue
-        if type(current) is str:
-            if len(current.encode("utf-8")) > 16_384:
+        if actual_type is str:
+            if len(cast(str, current).encode("utf-8")) > 16_384:
                 raise ValueError("matched result contains an oversized string")
             continue
-        if type(current) not in {dict, list}:
+        if actual_type is not dict and actual_type is not list:
             raise ValueError("matched result must contain only exact JSON values")
         identity = id(current)
         if identity in seen:
             raise ValueError("matched result contains an aliased or cyclic container")
         seen.add(identity)
-        if type(current) is dict:
+        if actual_type is dict:
             mapping = cast(dict[object, object], current)
             if len(mapping) > 4096 or any(type(key) is not str for key in mapping):
                 raise ValueError("matched result object exceeds its field bound")
@@ -163,6 +168,8 @@ def _source_identity() -> dict[str, str]:
         "alberta_framework/benchmarks/upgd_ipmnist.py",
         "alberta_framework/evaluation/bounded_elastic_ipmnist_nonpromoting.py",
         "alberta_framework/evaluation/bounded_elastic_matched_runner.py",
+        "pyproject.toml",
+        "uv.lock",
     )
     return {
         relative: hashlib.sha256((root / relative).read_bytes()).hexdigest()
@@ -191,7 +198,16 @@ def _runtime_identity() -> dict[str, object]:
         "machine": platform.machine(),
         "packages": {
             name: importlib.metadata.version(name)
-            for name in ("chex", "jax", "jaxlib", "numpy", "scikit-learn")
+            for name in (
+                "chex",
+                "jax",
+                "jaxlib",
+                "jaxtyping",
+                "numpy",
+                "orbax-checkpoint",
+                "scikit-learn",
+                "scipy",
+            )
         },
         "backend": jax.default_backend(),
         "devices": [
@@ -253,6 +269,31 @@ def _checked_config(value: object) -> IPMNISTConfig:
     return config
 
 
+def _numeric_resource_envelope(
+    *, config: IPMNISTConfig, dataset_rows: int
+) -> dict[str, int]:
+    dataset_bytes = dataset_rows * (config.input_dim * 4 + 4)
+    schedule_bytes = config.n_tasks * (dataset_rows + config.input_dim) * 4
+    peak_persistent_bytes = max(
+        bounded_elastic_resource_expectations(
+            arm=arm,
+            n_tasks=config.n_tasks,
+            input_dim=config.input_dim,
+            hidden1=config.hidden1,
+            hidden2=config.hidden2,
+            n_classes=config.n_classes,
+        )["peak_persistent_bytes_budget"]
+        for arm in ARMS
+    )
+    return {
+        "dataset_bytes": dataset_bytes,
+        "schedule_bytes": schedule_bytes,
+        "peak_persistent_bytes_budget": peak_persistent_bytes,
+        "combined_numeric_bytes": dataset_bytes + schedule_bytes + peak_persistent_bytes,
+        "combined_numeric_bytes_limit": _MAX_COMBINED_NUMERIC_BYTES,
+    }
+
+
 def _validated_arrays(
     data_x: object, data_y: object, config: IPMNISTConfig
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -268,11 +309,15 @@ def _validated_arrays(
         or data_x.shape[1] != config.input_dim
     ):
         raise ValueError("dataset shape does not match the campaign config")
-    if data_x.nbytes + data_y.nbytes > _MAX_DATASET_BYTES:
+    dataset_bytes = data_x.nbytes + data_y.nbytes
+    if dataset_bytes > _MAX_DATASET_BYTES:
         raise ValueError("dataset exceeds the campaign's 256 MiB byte bound")
     schedule_bytes = config.n_tasks * (data_x.shape[0] + config.input_dim) * 4
     if schedule_bytes > _MAX_SCHEDULE_BYTES:
         raise ValueError("schedule exceeds the campaign's 256 MiB byte bound")
+    envelope = _numeric_resource_envelope(config=config, dataset_rows=data_x.shape[0])
+    if envelope["combined_numeric_bytes"] > _MAX_COMBINED_NUMERIC_BYTES:
+        raise ValueError("campaign exceeds its combined 256 MiB numeric allocation bound")
     if not np.isfinite(data_x).all():
         raise ValueError("data_x must be finite")
     if np.any(data_y < 0) or np.any(data_y >= config.n_classes):
