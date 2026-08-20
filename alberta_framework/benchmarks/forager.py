@@ -37,6 +37,7 @@ import numpy as np
 from jax import Array
 from scipy.signal import lfilter
 
+from alberta_framework._scan_resources import ScanBudget, require_scan_steps
 from alberta_framework.core.horde import HordeLearner
 from alberta_framework.core.horde_actor_critic import (
     NonlinearHordeActorCriticAgent,
@@ -69,6 +70,7 @@ FORAGAX_INSTALL_TREE_SHA256 = "3d79040c87a0d91d4b084da0f661b08e5c23be3769914655a
 ForagerPreset = Literal["relearning", "field_of_view", "unending"]
 ObservationType = Literal["color", "rgb", "object"]
 ForagerBatchMode = Literal["vmap", "strict"]
+_FORAGER_CHUNK_BUDGET = ScanBudget("Forager JAX chunk", 10_000)
 
 
 @runtime_checkable
@@ -1704,11 +1706,14 @@ class ForagerBenchmarkConfig:
             name="final_window",
             minimum=1,
         )
-        jax_chunk_size = _require_builtin_int(
-            self.jax_chunk_size,
-            name="jax_chunk_size",
-            minimum=1,
-            maximum=10_000,
+        jax_chunk_size = require_scan_steps(
+            "jax_chunk_size",
+            _require_builtin_int(
+                self.jax_chunk_size,
+                name="jax_chunk_size",
+                minimum=1,
+            ),
+            _FORAGER_CHUNK_BUDGET,
         )
         # A padded scan longer than the entire requested lifetime can only
         # waste compile memory/time; normalize it to the exact effective size.
