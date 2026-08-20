@@ -887,7 +887,7 @@ def _mapping(
 
 
 def _finite_number(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if type(value) is bool or (type(value) is not int and type(value) is not float):
         return None
     numeric = float(value)
     return numeric if math.isfinite(numeric) else None
@@ -908,7 +908,7 @@ def _validate_source_provenance(
         errors.append("scientific_payload.source_provenance repository is invalid")
     provenance_head = provenance.get("git_head")
     if (
-        not isinstance(provenance_head, str)
+        type(provenance_head) is not str
         or len(provenance_head) != 40
         or any(character not in "0123456789abcdef" for character in provenance_head)
     ):
@@ -941,7 +941,7 @@ def _extract_seed_metrics(
         if set(raw_summary) != {"seed", "retained", "no_retention"}:
             errors.append(f"{location} keys do not match the v1 schema")
         seed = raw_summary.get("seed")
-        if isinstance(seed, bool) or not isinstance(seed, int):
+        if type(seed) is bool or type(seed) is not int:
             errors.append(f"{location}.seed must be an integer")
             continue
         seeds.append(seed)
@@ -1416,7 +1416,7 @@ def _validate_checks(
         }:
             errors.append(f"{location} keys do not match the v1 schema")
         name = raw_check.get("name")
-        if not isinstance(name, str) or not name:
+        if type(name) is not str or not name:
             errors.append(f"{location}.name must be a non-empty string")
             all_passed = False
             continue
@@ -1431,7 +1431,7 @@ def _validate_checks(
         comparator = raw_check.get("comparator")
         declared = raw_check.get("passed")
         detail = raw_check.get("detail")
-        if not isinstance(detail, str) or not detail:
+        if type(detail) is not str or not detail:
             errors.append(f"{location}.detail must be a non-empty string")
         expected_actual = expected_actuals.get(name)
         if expected_actual is not None and actual != expected_actual:
@@ -1900,7 +1900,7 @@ def validate_recurring_feature_artifact(
             errors.append("scientific_digest canonicalization is invalid")
         recorded = digest.get("sha256")
         if (
-            not isinstance(recorded, str)
+            type(recorded) is not str
             or len(recorded) != 64
             or any(character not in "0123456789abcdef" for character in recorded)
         ):

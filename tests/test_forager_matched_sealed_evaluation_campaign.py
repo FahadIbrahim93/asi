@@ -401,13 +401,13 @@ def test_exact_six_by_thirty_manifest_and_initial_inventory(tmp_path: Path) -> N
             "6a9315cb996fe5698e4c1580d30da9b0524e9875ce085d1399bb975cc5b510a8"
         ),
         "execution-plan.json": (
-            "29517b5739c150efff9dfabe09720686520f38ec9f9715cc6b5c50ebf95e26a3"
+            "46b49e624bc8b14b6ddeaddaba3acf234cbb341c0b13f6a59b66e2d215133137"
         ),
         "source-manifest.json": (
             "a1d727703b24ef6f96dc93b4fc306b9426ad2cfd054ba371aa84ac4c14dd7a68"
         ),
         "executor-manifest.json": (
-            "e27cf3e16832c903435ef4da15e7e32afa834cab950faaceb6c08d2f9cf15462"
+            "9aa6f35c83d1c6ebec994453b9fb510273c44143d4c7f16ab22c3b07ed87d8ef"
         ),
         "qualification-manifest.json": (
             "d54fb71f96641d8cbe1eb3b78a3ac9aef3e680b4ea4efba14181dd74a5c1332f"
@@ -416,10 +416,10 @@ def test_exact_six_by_thirty_manifest_and_initial_inventory(tmp_path: Path) -> N
             "2859d85fbc9d44960e1b37fedf26589e2f3c5155b9356083ba7b5a427443f58f"
         ),
         "live-runtime.json": (
-            "bd88fbfa40b57023836d05525df429601864686be7446dc8b5116c88594c0421"
+            "44156427f81b315fe165467167f0044b350d805cf6085a00f8311f09cfb34c7c"
         ),
         "campaign.json": (
-            "c563582c1c40176af9eadf3a98475e99ea2851a36a8aad6ab14571f5198b1cd1"
+            "fbe4fe942d497358ea41ee0940408c5c05bde3a7d4170ab60ebc9586b042916f"
         ),
     }
     if not HAS_RENAMEAT2:
@@ -825,7 +825,7 @@ def test_false_authority_completion_summary_is_rejected_before_persistence(
     )
     assert summary["qualification_manifest_sha256"] == qualification_digest
     assert hashlib.sha256(campaign.canonical_json_bytes(summary)).hexdigest() == (
-        "23a9c7a3e936fcaaf87cc40cea11a05c236a078022541f057f2ab1a8b05514ae"
+        "51a47b1e0c5a22a12d70f74f39de37d2727a026ad06df0d49dfab9b63b051ed9"
     )
     legacy = dict(summary)
     legacy["schema_version"] = "alberta.forager_matched_sealed_evaluation_completion.v1"

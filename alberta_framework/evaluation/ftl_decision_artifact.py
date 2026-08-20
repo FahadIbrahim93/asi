@@ -173,7 +173,7 @@ def _finite_float(value: float) -> float | None:
 
 
 def _finite_number(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if type(value) is bool or (type(value) is not int and type(value) is not float):
         return None
     numeric = float(value)
     return numeric if math.isfinite(numeric) else None
@@ -976,11 +976,11 @@ def _compare_structure(
         if type(actual) is not type(expected) or actual != expected:
             errors.append(f"{location} does not match the v1 value")
         return
-    if isinstance(expected, int):
-        if isinstance(actual, bool) or not isinstance(actual, int) or actual != expected:
+    if type(expected) is int:
+        if type(actual) is not int or actual != expected:
             errors.append(f"{location} does not match the v1 integer value")
         return
-    if isinstance(expected, float):
+    if type(expected) is float:
         if not _numbers_match(actual, expected):
             errors.append(f"{location} does not match reconstructed evidence")
         return
@@ -1049,7 +1049,7 @@ def _validate_and_extract_seed_vectors(
         if set(summary) != {"seed", "conditions"}:
             errors.append(f"{location} keys do not match the v1 schema")
         seed = summary.get("seed")
-        if isinstance(seed, bool) or not isinstance(seed, int):
+        if type(seed) is bool or type(seed) is not int:
             errors.append(f"{location}.seed must be an integer")
         else:
             observed_seeds.append(seed)
@@ -1252,7 +1252,7 @@ def _validate_operational(
             errors.append("operational_metadata.git_worktree.dirty must be boolean")
         recorded_head = git_worktree.get("head")
         if (
-            not isinstance(recorded_head, str)
+            type(recorded_head) is not str
             or len(recorded_head) != 40
             or any(character not in "0123456789abcdef" for character in recorded_head)
         ):
@@ -1386,7 +1386,7 @@ def validate_ftl_decision_artifact(
             errors.append("scientific_digest canonicalization is unsupported")
         recorded = digest.get("sha256")
         if (
-            not isinstance(recorded, str)
+            type(recorded) is not str
             or len(recorded) != 64
             or any(character not in "0123456789abcdef" for character in recorded)
         ):

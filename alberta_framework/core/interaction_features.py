@@ -692,11 +692,22 @@ class FixedBudgetInteractionLearner:
             candidate_count=candidate_count,
             scale_robust=scale_robust,
         )
-        if candidate_strategy not in {"random", "all_pairs"}:
+        if type(candidate_strategy) is not str or candidate_strategy not in {
+            "random",
+            "all_pairs",
+        }:
             raise ValueError("candidate_strategy must be 'random' or 'all_pairs'")
-        if utility_aggregation not in {"mean", "max", "topk"}:
+        if type(utility_aggregation) is not str or utility_aggregation not in {
+            "mean",
+            "max",
+            "topk",
+        }:
             raise ValueError("utility_aggregation must be 'mean', 'max', or 'topk'")
-        if utility_task_balancing not in {"none", "active", "active_inverse_frequency"}:
+        if type(utility_task_balancing) is not str or utility_task_balancing not in {
+            "none",
+            "active",
+            "active_inverse_frequency",
+        }:
             raise ValueError(
                 "utility_task_balancing must be 'none', 'active', or 'active_inverse_frequency'"
             )
@@ -772,7 +783,7 @@ class FixedBudgetInteractionLearner:
         if not isinstance(independent_relevance_probe, bool):
             raise ValueError("independent_relevance_probe must be boolean")
         if (
-            not isinstance(relevance_probe_mode, str)
+            type(relevance_probe_mode) is not str
             or relevance_probe_mode not in RELEVANCE_PROBE_MODES
         ):
             raise ValueError("relevance_probe_mode must be 'conditional_v1' or 'target_only_v1'")
@@ -3814,8 +3825,7 @@ def save_interaction_feature_checkpoint(
     feature_dim: int,
 ) -> None:
     """Persist state with its explicit probe semantics and resource contract."""
-    if isinstance(feature_dim, bool) or not isinstance(feature_dim, int) or feature_dim < 1:
-        raise ValueError("feature_dim must be a positive integer")
+    feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
     learner._require_state_contract(state, feature_dim=feature_dim)
     if not bool(_lifetime_counter_valid(state.step_words, state.step_count)):
         raise ValueError("interaction-feature checkpoint lifetime counter is invalid")
@@ -3861,9 +3871,10 @@ def load_interaction_feature_checkpoint(
     if not isinstance(config, dict):
         raise ValueError("interaction-feature checkpoint is missing learner_config")
     learner = FixedBudgetInteractionLearner.from_config(config)
-    feature_dim = metadata.get("feature_dim")
-    if isinstance(feature_dim, bool) or not isinstance(feature_dim, int) or feature_dim < 1:
-        raise ValueError("interaction-feature checkpoint feature_dim is invalid")
+    try:
+        feature_dim = _require_int32("feature_dim", metadata.get("feature_dim"), minimum=1)
+    except ValueError as error:
+        raise ValueError("interaction-feature checkpoint feature_dim is invalid") from error
     template = learner.init(feature_dim=feature_dim, key=jr.key(0))
     restored, restored_metadata = load_checkpoint(template, path)
     if restored_metadata != metadata:

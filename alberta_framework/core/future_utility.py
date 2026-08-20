@@ -63,6 +63,14 @@ def canonical_float32_ema_decay(name: str, value: object) -> float:
     return narrowed
 
 
+def _require_exact_mode(value: object) -> str:
+    """Return a trusted mode identity before any hashing or equality dispatch."""
+
+    if type(value) is not str:
+        raise ValueError("mode must be an exact string")
+    return value
+
+
 class FutureUtilityEstimate(NamedTuple):
     """One-step utility estimate with an explicit transaction verdict."""
 
@@ -479,7 +487,7 @@ def normalize_future_utility_signal(
         _skip_zero_scale(decay, second_moment) + (1.0 - decay) * signal**2
     )
     normalized = signal
-
+    mode = _require_exact_mode(mode)
     if mode in {"uncertainty", "uncertainty_age"}:
         normalized = normalized / jnp.sqrt(new_second_moment + 1e-6)
 
@@ -501,6 +509,7 @@ def bias_correct_future_utility(
     checkpoint schemas.  Age-zero slots have no observations and retain their
     raw value (normally zero).
     """
+    mode = _require_exact_mode(mode)
     if mode not in {"age", "uncertainty_age"}:
         return utilities
 

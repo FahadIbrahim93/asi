@@ -693,7 +693,7 @@ def _required_mapping(
 
 
 def _finite_number(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if type(value) is bool or (type(value) is not int and type(value) is not float):
         return None
     numeric = float(value)
     return numeric if np.isfinite(numeric) else None
@@ -817,7 +817,7 @@ def _validate_seed_and_aggregate_consistency(
             errors.append(f"{location} must be an object")
             continue
         seed = raw_seed.get("seed")
-        if isinstance(seed, bool) or not isinstance(seed, int):
+        if type(seed) is not int:
             errors.append(f"{location}.seed must be an integer")
         else:
             observed_seeds.append(seed)
@@ -859,7 +859,7 @@ def _validate_seed_and_aggregate_consistency(
                 prequential[condition].append(reward)
             if condition == "joint_adaptive":
                 recovery = result.get("recurrence_recovery_steps")
-                if isinstance(recovery, bool) or not isinstance(recovery, int):
+                if type(recovery) is not int:
                     errors.append(
                         f"{result_location}.recurrence_recovery_steps "
                         "must be an integer"
@@ -1178,7 +1178,7 @@ def _validate_checks(
             errors.append(f"{check_location} keys do not match the v1 schema")
             all_passed = False
         name = raw_check.get("name")
-        if not isinstance(name, str) or not name:
+        if type(name) is not str or not name:
             errors.append(f"{check_location}.name must be a non-empty string")
             all_passed = False
             continue
