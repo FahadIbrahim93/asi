@@ -890,6 +890,38 @@ class TestCollectTrajectoryValueMode:
         assert jnp.allclose(plain, with_estimator)
 
 
+class _TwoStepEpisodeEnv:
+    """Deterministic reset boundary for trajectory-target tests."""
+
+    observation_space = gymnasium.spaces.Box(
+        low=-1_000.0,
+        high=1_000.0,
+        shape=(2,),
+        dtype=np.float32,
+    )
+    action_space = gymnasium.spaces.Discrete(2)
+
+    def __init__(self) -> None:
+        self._episode = -1
+        self._step = 0
+
+    def reset(self, *, seed: int | None = None) -> tuple[np.ndarray, dict[str, object]]:
+        del seed
+        self._episode += 1
+        self._step = 0
+        value = float(100 * self._episode)
+        return np.asarray((value, -value), dtype=np.float32), {}
+
+    def step(
+        self, action: int
+    ) -> tuple[np.ndarray, float, bool, bool, dict[str, object]]:
+        del action
+        self._step += 1
+        value = float(100 * self._episode + self._step)
+        observation = np.asarray((value, -value), dtype=np.float32)
+        return observation, 0.0, self._step == 2, False, {}
+
+
 class TestCollectTrajectoryNextStateMode:
     """collect_trajectory NEXT_STATE targets.
 
@@ -904,76 +936,53 @@ class TestCollectTrajectoryNextStateMode:
         Independent of include_action_in_features (which only changes
         the feature width).
         """
-        env = gymnasium.make("CartPole-v1")
-        try:
-            observations, targets = collect_trajectory(
-                env,
-                None,
-                num_steps=15,
-                mode=PredictionMode.NEXT_STATE,
-                include_action_in_features=True,
-                seed=1,
-            )
-        finally:
-            env.close()
-        assert observations.shape == (15, 5)  # obs(4) + action(1)
-        assert targets.shape == (15, 4)  # observation_dim, not feature_dim
+        observations, targets = collect_trajectory(
+            _TwoStepEpisodeEnv(),  # type: ignore[arg-type]
+            lambda _observation: 0,
+            num_steps=3,
+            mode=PredictionMode.NEXT_STATE,
+            include_action_in_features=True,
+            seed=1,
+        )
+        assert observations.shape == (3, 3)  # obs(2) + action(1)
+        assert targets.shape == (3, 2)  # observation_dim, not feature_dim
 
     def test_target_equals_next_observation_within_episode(self) -> None:
         """Within an episode (no reset), target[i] equals features[i + 1].
 
-        Compared over the shared 4-dim observation half of the feature row.
+        Compared over the shared two-dimensional observation part of each
+        feature row.
         """
-        env = gymnasium.make("CartPole-v1")
-        try:
-            observations, targets = collect_trajectory(
-                env,
-                None,
-                num_steps=40,
-                mode=PredictionMode.NEXT_STATE,
-                include_action_in_features=True,
-                seed=42,
-            )
-        finally:
-            env.close()
-        matches = jnp.all(jnp.isclose(observations[1:, :4], targets[:-1]), axis=1)
-        # CartPole-v1 caps episodes at 500 steps but seed=42 terminates
-        # early; some rows must match (no reset) and some must not
-        # (reset overwrote current_obs after a terminal target was recorded).
-        assert bool(jnp.any(matches))
-        assert bool(jnp.any(~matches))
+        observations, targets = collect_trajectory(
+            _TwoStepEpisodeEnv(),  # type: ignore[arg-type]
+            lambda _observation: 0,
+            num_steps=4,
+            mode=PredictionMode.NEXT_STATE,
+            include_action_in_features=True,
+            seed=42,
+        )
+        matches = jnp.all(jnp.isclose(observations[1:, :2], targets[:-1]), axis=1)
+        # Step 1 continues, step 2 terminates and resets, step 3 continues.
+        np.testing.assert_array_equal(
+            np.asarray(matches), np.asarray((True, False, True))
+        )
 
     def test_target_is_true_terminal_observation_not_the_reset(self) -> None:
         """At a terminal step, target[i] is the real post-step observation.
 
-        It is the observation the episode ended on (satisfying CartPole's
-        own termination bounds), not clobbered by the reset that seeds the
-        following row's features.
+        It is the observation the episode ended on, not clobbered by the reset
+        that seeds the following row's features.
         """
-        env = gymnasium.make("CartPole-v1")
-        try:
-            observations, targets = collect_trajectory(
-                env,
-                None,
-                num_steps=40,
-                mode=PredictionMode.NEXT_STATE,
-                include_action_in_features=False,
-                seed=42,
-            )
-        finally:
-            env.close()
-        mismatches = [
-            i
-            for i in range(len(observations) - 1)
-            if not jnp.allclose(observations[i + 1], targets[i])
-        ]
-        assert mismatches  # seed=42 must terminate at least once inside 40 steps
-
-        x_threshold = 2.4
-        theta_threshold = 12 * 2 * jnp.pi / 360
-        for i in mismatches:
-            x, _x_dot, theta, _theta_dot = (float(v) for v in targets[i])
-            assert abs(x) > x_threshold or abs(theta) > theta_threshold, (
-                f"row {i}: target is neither continuous with the next row "
-                "nor a genuine CartPole termination state"
-            )
+        observations, targets = collect_trajectory(
+            _TwoStepEpisodeEnv(),  # type: ignore[arg-type]
+            lambda _observation: 0,
+            num_steps=3,
+            mode=PredictionMode.NEXT_STATE,
+            include_action_in_features=False,
+            seed=42,
+        )
+        # Row 1 terminates at [2, -2]. Row 2 begins after reset at [100, -100].
+        np.testing.assert_array_equal(np.asarray(targets[1]), np.asarray((2.0, -2.0)))
+        np.testing.assert_array_equal(
+            np.asarray(observations[2]), np.asarray((100.0, -100.0))
+        )
