@@ -41,7 +41,9 @@ def _control(
     )
 
 
-def test_plan_is_fresh_prospective_and_permanently_nonpromoting() -> None:
+def test_plan_is_fresh_prospective_and_permanently_nonpromoting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     plan = lane.frozen_plan()
     assert plan["seeds"] == [41_562_001, 41_562_002, 41_562_003, 41_562_004]
     assert lane.QUARANTINED_SEEDS == (31_561_001, 31_561_002, 31_561_003, 31_561_004)
@@ -59,6 +61,9 @@ def test_plan_is_fresh_prospective_and_permanently_nonpromoting() -> None:
     assert plan["dataset"]["y"]["sha256"] == (
         "4f1dd9551f104f8153409e0add59f0a71568f7bad5a5f8e2274480c186fe219a"
     )
+    monkeypatch.setattr(lane, "_REVIEWED_EXECUTION_TRANSITION", True)
+    monkeypatch.setattr(lane, "_EXECUTION_AUTHORIZED", True)
+    assert lane.frozen_plan() == plan
 
 
 def test_catalog_cli_is_read_only_and_execution_stays_closed(
@@ -104,6 +109,24 @@ def test_each_control_arm_runs_end_to_end_with_exact_resources(arm: str) -> None
     assert record["resources"]["timing_is_selection_metric"] is False
     assert type(record["resources"]["timing_telemetry_ns"]) is int
     assert record["policy"]["scientific_promotion_allowed"] is False
+
+
+@pytest.mark.parametrize(
+    ("arm", "expected_bytes"),
+    [
+        ("fixed_td0", 16),
+        ("intentional_td0", 36),
+        ("fixed_trace", 16),
+        ("intentional_trace", 36),
+        ("fixed_q_lambda", 40),
+        ("intentional_q_lambda", 68),
+    ],
+)
+def test_control_persistent_numeric_bytes_are_exact(
+    arm: str, expected_bytes: int
+) -> None:
+    record = _control(arm, seed=lane.SEEDS[0], horizon=8, phase_length=2)
+    assert record["resources"]["persistent_numeric_bytes"] == expected_bytes
 
 
 def test_prediction_and_control_information_and_rng_are_explicit() -> None:

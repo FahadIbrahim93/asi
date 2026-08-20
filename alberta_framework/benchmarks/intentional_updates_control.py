@@ -120,8 +120,19 @@ def frozen_plan() -> dict[str, object]:
         "plan_id": PLAN_ID,
         "paper_revision": PAPER_REVISION,
         "official_code_revision": OFFICIAL_CODE_REVISION,
-        "source_identity": _source_identity(),
-        "runtime_identity": _runtime_identity(),
+        "source_identity_policy": {
+            "binding": "execution-time Git/source hashes retained in every report",
+            "hashed_files": [
+                "alberta_framework/benchmarks/intentional_updates_control.py",
+                "alberta_framework/benchmarks/ipmnist_screening.py",
+                "alberta_framework/benchmarks/plasticity_comparators.py",
+                "alberta_framework/benchmarks/upgd_ipmnist.py",
+            ],
+        },
+        "runtime_identity_policy": (
+            "retain the exact execution Python, platform, package, JAX backend, "
+            "device, and configuration identity in every report"
+        ),
         "seeds": list(CAMPAIGN_SEEDS),
         "quarantined_test_consumed_seeds": list(QUARANTINED_SEEDS),
         "protocol_families": ["supervised_ipmnist", "td_control"],
@@ -153,15 +164,22 @@ def frozen_plan() -> dict[str, object]:
             "trace_decay": 0.8,
             "epsilon_greedy": 0.1,
         },
-        "matched_axes": [
-            "seed",
-            "initial_parameters",
-            "observations",
-            "updates",
-            "allowed_boundary_and_task_information",
-            "environment_definition",
-            "exogenous_exploration_rng",
-        ],
+        "matched_axes": {
+            "all_families": [
+                "seed",
+                "initial_parameters",
+                "observations",
+                "updates",
+                "allowed_boundary_and_task_information",
+            ],
+            "supervised_ipmnist": ["example_schedule"],
+            "td_prediction": ["transition_schedule"],
+            "q_lambda_control": [
+                "environment_dynamics",
+                "agent_rng_root_and_index_schedule",
+                "policy-dependent realized trajectories are not matched",
+            ],
+        },
         "boundary_information": [],
         "task_information": [],
         "paired_metrics": {
@@ -184,14 +202,12 @@ def frozen_plan() -> dict[str, object]:
             "RNG operations, optimizer solves, persistent bytes, and timing per shard"
         ),
         "output_path": "outputs/intentional_updates_matched_development/report.v1.json",
-        "execution_authorized": _EXECUTION_AUTHORIZED,
-        "reviewed_execution_transition": _REVIEWED_EXECUTION_TRANSITION,
-        "execution_status": (
-            "authorized_after_separate_review"
-            if _REVIEWED_EXECUTION_TRANSITION is True
-            and _EXECUTION_AUTHORIZED is True
-            else "blocked_pending_independent_plan_audit"
-        ),
+        # These are historical properties of the plan at freeze time.  A later,
+        # independently reviewed code-only authorization must not mutate the plan
+        # that was reviewed before any retained execution.
+        "execution_authorized": False,
+        "reviewed_execution_transition": False,
+        "execution_status": "blocked_pending_independent_plan_audit",
         "development_only": True,
         "scientific_promotion_allowed": False,
         "negative_outcomes_retained": True,
@@ -426,7 +442,7 @@ def _run(
     if intentional:
         numeric_bytes += int(
             second.nbytes
-            + 3 * np.dtype(np.float32).itemsize
+            + 2 * np.dtype(np.float32).itemsize
             + np.dtype(np.int32).itemsize
         )
     if root is not None:

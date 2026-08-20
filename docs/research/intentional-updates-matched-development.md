@@ -20,9 +20,11 @@ counts within each pair, and asks four two-sided paired questions with a Bonferr
 bytes, data/environment steps, updates, model/action queries, RNG operations, and optimizer solves
 are explicit in every child record.
 
-Prediction pairs share their prescribed transition schedule. Q(lambda) pairs share the
-environment, seed, and exogenous exploration variates; their learned policies may produce
-different actions and transitions.
+The supervised pair shares its example schedule and the prediction pairs share their realized
+transition schedule. The Q(lambda) pair instead shares the environment dynamics plus the agent RNG
+root/index schedule: learned policies can choose different actions and therefore produce different
+realized trajectories. Those policy-dependent trajectories are deliberately not described as a
+matched axis.
 
 The earlier draft roster was consumed by contract tests and is explicitly quarantined. Contract
 tests use a distinct test-only capability and roster. Execution and public publication are
