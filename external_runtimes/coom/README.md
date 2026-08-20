@@ -12,6 +12,13 @@ subset. The one-line patch replaces an
 undeclared legacy `gym.RewardWrapper` import with the declared
 `gymnasium.RewardWrapper`; no environment logic or asset is changed.
 
+`qualification-manifest.json` binds the base image, Dockerfile, dependency
+lock, patch, and smoke-validator bytes. Before emitting a receipt, the smoke
+reconstructs the upstream Git tree (reversing exactly that one import patch),
+rehashes the license and all assets, enforces the locked package versions, and
+strictly validates the ordered task/step trace, safe empty info subsets,
+resources, claims, and independently repeated trace golden.
+
 Build and execute from this directory:
 
 ```bash
