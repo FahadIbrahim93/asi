@@ -100,3 +100,24 @@ def test_pair_counters_reject_hostile_nested_values_before_comparison() -> None:
         count_relevant_context_pairs(pairs)
     with pytest.raises(ValueError, match="must contain integers"):
         count_relevant_context_pairs_by_task(pairs)
+
+
+@pytest.mark.parametrize(
+    "counter", [count_relevant_context_pairs, count_relevant_context_pairs_by_task]
+)
+@pytest.mark.parametrize("name", ["relevant_dim", "input_dim"])
+def test_pair_counters_reject_hostile_dimensions_without_comparison_hooks(
+    counter: object, name: str
+) -> None:
+    class HostileInt(int):
+        calls = 0
+
+        def __lt__(self, other: object) -> bool:
+            del other
+            type(self).calls += 1
+            raise AssertionError("hostile comparison must not run")
+
+    arguments = {name: HostileInt(8 if name == "relevant_dim" else 12)}
+    with pytest.raises(TypeError, match=rf"{name} must be an exact int"):
+        counter((_PAIR,), **arguments)  # type: ignore[operator]
+    assert HostileInt.calls == 0

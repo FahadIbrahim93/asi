@@ -264,6 +264,22 @@ def _integer_pairs(
     return tuple(pairs)
 
 
+def _pair_counter_dimensions(*, relevant_dim: object, input_dim: object) -> tuple[int, int]:
+    """Admit exact nonnegative dimensions before pair comparisons."""
+
+    if type(relevant_dim) is not int:
+        raise TypeError("relevant_dim must be an exact int")
+    if type(input_dim) is not int:
+        raise TypeError("input_dim must be an exact int")
+    normalized_relevant_dim = relevant_dim
+    normalized_input_dim = input_dim
+    if normalized_relevant_dim < 0:
+        raise ValueError("relevant_dim must be nonnegative")
+    if normalized_input_dim < normalized_relevant_dim:
+        raise ValueError("input_dim must be at least relevant_dim")
+    return normalized_relevant_dim, normalized_input_dim
+
+
 def _resource_accounting_map(value: object) -> dict[str, dict[str, int | bool]]:
     if type(value) is not dict:
         raise TypeError("memory_by_condition must be an exact dictionary")
@@ -525,6 +541,9 @@ def count_relevant_context_pairs(
 ) -> int:
     """Count unique canonical context products over relevant input channels."""
 
+    relevant_dim, input_dim = _pair_counter_dimensions(
+        relevant_dim=relevant_dim, input_dim=input_dim
+    )
     normalized_pairs = _integer_pairs(pairs, name="pairs", allow_list=True)
     relevant_pairs = {
         (min(left, right), max(left, right))
@@ -542,6 +561,9 @@ def count_relevant_context_pairs_by_task(
 ) -> tuple[int, int]:
     """Count unique relevant products for the supplied C and D cues separately."""
 
+    relevant_dim, input_dim = _pair_counter_dimensions(
+        relevant_dim=relevant_dim, input_dim=input_dim
+    )
     normalized_pairs = _integer_pairs(pairs, name="pairs", allow_list=True)
     canonical_pairs = {(min(left, right), max(left, right)) for left, right in normalized_pairs}
     counts = tuple(
