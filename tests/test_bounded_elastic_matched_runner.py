@@ -72,7 +72,9 @@ def _fake_run(
 ) -> ScreeningRunResult:
     del data_x, data_y
     resolved = cast(Any, spec)
-    value = float(seed + tuple(runner.ARMS).index(resolved.name)) / 100.0
+    value = 0.5 + float(
+        runner.TEST_ONLY_SEEDS.index(seed) + tuple(runner.ARMS).index(resolved.name)
+    ) / 100.0
     return ScreeningRunResult(
         config_name=resolved.name,
         base_learner="upgd_w",
@@ -176,6 +178,7 @@ def test_writer_is_create_only_and_retains_negative_outcomes(
     monkeypatch.setattr(runner, "run_screening_config", _fake_run)
     result = _run_for_test(*_data(), config=SMALL)
     destination = tmp_path / "bounded-elastic.json"
+    monkeypatch.setattr(runner, "OUTPUT_PATH", destination)
     runner._write_bounded_elastic_matched_authorized(
         destination, result, *_data(), config=SMALL, seeds=runner.TEST_ONLY_SEEDS,
         _capability=runner._TEST_EXECUTION_CAPABILITY,
