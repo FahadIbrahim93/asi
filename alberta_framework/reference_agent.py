@@ -44,6 +44,8 @@ _MAX_LIFECYCLE_ID_LENGTH = _MAX_ID_LENGTH - len(
 )
 _MAX_CONFIG_BYTES = 1 << 20
 _MAX_JSON_NESTING_DEPTH = 64
+# Frozen manifests are tiny. Cap nodes before walking toward the 1 MiB encoding cap.
+_MAX_JSON_VALUES = 1_000_000
 _MAX_ARRAY_RANK = 8
 _MAX_ARRAY_ELEMENTS = 1 << 20
 _SUPPORTED_DTYPES = frozenset(
@@ -119,26 +121,41 @@ def _load_manifest_config_json(raw: str) -> Any:
         raise ValueError("manifest config must be canonical JSON") from exc
 
 
-def _validate_json_value(value: Any, *, path: str, depth: int = 0) -> None:
+def _validate_json_value(
+    value: Any, *, path: str, depth: int = 0, nodes: int = 0
+) -> int:
+    nodes += 1
+    if nodes > _MAX_JSON_VALUES:
+        raise ValueError(f"{path} exceeds the canonical JSON value resource limit")
     if depth > _MAX_JSON_NESTING_DEPTH:
         raise ValueError(f"{path} exceeds the maximum canonical JSON nesting depth")
     value_type = type(value)
     if value is None or value_type is str or value_type is bool or value_type is int:
-        return
+        return nodes
     if value_type is float:
         if not math.isfinite(value):
             raise ValueError(f"{path} must contain only finite JSON numbers")
-        return
+        return nodes
     if isinstance(value, list):
+        extra = len(value)
+        if nodes + extra > _MAX_JSON_VALUES:
+            raise ValueError(f"{path} exceeds the canonical JSON value resource limit")
         for index, item in enumerate(value):
-            _validate_json_value(item, path=f"{path}[{index}]", depth=depth + 1)
-        return
+            nodes = _validate_json_value(
+                item, path=f"{path}[{index}]", depth=depth + 1, nodes=nodes
+            )
+        return nodes
     if isinstance(value, Mapping):
+        extra = len(value)
+        if nodes + extra > _MAX_JSON_VALUES:
+            raise ValueError(f"{path} exceeds the canonical JSON value resource limit")
         for key, item in value.items():
             if type(key) is not str:
                 raise ValueError(f"{path} JSON object keys must be strings")
-            _validate_json_value(item, path=f"{path}.{key}", depth=depth + 1)
-        return
+            nodes = _validate_json_value(
+                item, path=f"{path}.{key}", depth=depth + 1, nodes=nodes
+            )
+        return nodes
     raise ValueError(f"{path} is not a canonical JSON value")
 
 
