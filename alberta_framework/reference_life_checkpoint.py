@@ -14,6 +14,7 @@ import importlib.metadata
 import json
 import os
 import platform
+import re
 import shutil
 import stat as stat_module
 import struct
@@ -106,8 +107,7 @@ _MAX_CHILD_FILE_BYTES = 128 * 1024 * 1024
 _MAX_CHILD_TOTAL_BYTES = 512 * 1024 * 1024
 _PROTOTYPE_EMPTY_ARRAY_CODEC = "alberta.prototype_agent.empty_array_projection.v1"
 _PROTOTYPE_SUPPORTED_PRNG_IMPLS = frozenset({"threefry2x32", "rbg"})
-# Delete lowercase hex so a nonempty remainder means a non-hex or uppercase glyph.
-_LOWER_HEX_DELETE = str.maketrans("", "", "0123456789abcdef")
+_LOWER_HEX_PATTERN = re.compile(r"[0-9a-f]*\Z", flags=re.ASCII)
 
 
 def _fail(message: str) -> NoReturn:
@@ -401,7 +401,9 @@ def _decode_hex_payload(payload_hex: str, *, path: str, expected_bytes: int) -> 
     expected_hex = expected_bytes * 2
     if len(payload_hex) != expected_hex:
         _fail(f"{path}.payload_hex length does not match shape and dtype")
-    if payload_hex.translate(_LOWER_HEX_DELETE):
+    # Keep this validation in the regex engine. ``str.translate`` would allocate
+    # another string as large as the already-bounded checkpoint payload.
+    if _LOWER_HEX_PATTERN.fullmatch(payload_hex) is None:
         _fail(f"{path}.payload_hex must be lowercase hexadecimal")
     try:
         raw = bytes.fromhex(payload_hex)

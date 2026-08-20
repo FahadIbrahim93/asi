@@ -8,13 +8,11 @@ float32 payload took 3.057s on origin/main.
 
 from __future__ import annotations
 
-import time
-
 import jax.numpy as jnp
 import pytest
 
+import alberta_framework.reference_life_checkpoint as checkpoint_module
 from alberta_framework.reference_life_checkpoint import (
-    _MAX_ARRAY_BYTES,
     _decode_array_value,
     _decode_jax_array,
 )
@@ -29,21 +27,23 @@ _SCALAR_FLOAT32 = {
 }
 
 
-def _at_cap_hex() -> str:
-    return "a" * (2 * _MAX_ARRAY_BYTES)
+class _ForbiddenPattern:
+    def fullmatch(self, _value: str) -> None:
+        raise AssertionError("payload characters were inspected before its length")
 
 
-def test_array_value_rejects_at_cap_hex_before_charset_walk() -> None:
+def test_array_value_rejects_mismatched_hex_before_charset_walk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     payload = {
         "semantic_id": "obs",
         "dtype": "float32",
         "shape": [1],
-        "payload_hex": _at_cap_hex(),
+        "payload_hex": "a" * 10_000,
     }
-    started = time.perf_counter()
+    monkeypatch.setattr(checkpoint_module, "_LOWER_HEX_PATTERN", _ForbiddenPattern())
     with pytest.raises(ValueError, match="payload_hex length does not match"):
         _decode_array_value(payload, path="observation")
-    assert time.perf_counter() - started < 0.5
 
 
 def test_array_value_accepts_matching_lowercase_hex() -> None:
@@ -72,13 +72,14 @@ def test_jax_array_accepts_matching_lowercase_hex() -> None:
     assert float(array[0]) == pytest.approx(1.0)
 
 
-def test_jax_array_rejects_at_cap_hex_before_charset_walk() -> None:
+def test_jax_array_rejects_mismatched_hex_before_charset_walk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     payload = {
         "dtype": "float32",
         "shape": [1],
-        "payload_hex": _at_cap_hex(),
+        "payload_hex": "a" * 10_000,
     }
-    started = time.perf_counter()
+    monkeypatch.setattr(checkpoint_module, "_LOWER_HEX_PATTERN", _ForbiddenPattern())
     with pytest.raises(ValueError, match="payload_hex length does not match"):
         _decode_jax_array(payload, path="state_index")
-    assert time.perf_counter() - started < 0.5
