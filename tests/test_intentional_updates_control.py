@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import copy
 import json
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator, Never
+from typing import Never
 
 import numpy as np
 import pytest

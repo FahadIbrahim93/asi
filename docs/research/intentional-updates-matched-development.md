@@ -12,14 +12,19 @@ adaptive error clipping, and update to a float32 linear learner. It is not the a
 benchmark and is not publication-equivalent. The supervised adapter remains a documented
 lambda-zero protocol extension rather than an RL reproduction.
 
-The literal plan reserves four globally searched seeds, binds the canonical materialized OpenML
+The literal plan reserves four globally searched campaign seeds that no test executes, binds the
+canonical materialized OpenML
 MNIST training-array digests already retained by ASI, requires equal observation and update
 schedules within each pair, and asks four two-sided paired questions with a Bonferroni-adjusted
 98.75% interval (`t(3) = 5.391949071934058`). Timing is retained as telemetry only. Persistent
 bytes, data/environment steps, updates, model/action queries, RNG operations, and optimizer solves
 are explicit in every child record.
 
-Execution is deliberately disabled in the initial merge. Inspecting the catalog is read-only:
+The earlier draft roster was consumed by contract tests and is explicitly quarantined. Contract
+tests use a distinct test-only capability and roster. Execution and public publication are
+deliberately disabled in the initial merge; both a literal reviewed-transition flag and a separate
+runtime authorization flag must become exact `true` before reservation, dataset loading, or a
+consumer call. Inspecting the catalog is read-only:
 
 ```bash
 .venv/bin/asi-intentional-updates-matched-development --catalog

@@ -47,7 +47,20 @@ PAPER_REVISION: Final[str] = "arXiv:2604.19033v1"
 OFFICIAL_CODE_REVISION: Final[str] = (
     "sharifnassab/Intentional_RL@e86e26fd8613ac212e9a52c3fed8a01d0a31f685"
 )
-SEEDS: Final[tuple[int, ...]] = (31_561_001, 31_561_002, 31_561_003, 31_561_004)
+QUARANTINED_SEEDS: Final[tuple[int, ...]] = (
+    31_561_001,
+    31_561_002,
+    31_561_003,
+    31_561_004,
+)
+CAMPAIGN_SEEDS: Final[tuple[int, ...]] = (
+    41_562_001,
+    41_562_002,
+    41_562_003,
+    41_562_004,
+)
+TEST_ONLY_SEEDS: Final[tuple[int, ...]] = (101, 102, 103, 104)
+SEEDS: tuple[int, ...] = CAMPAIGN_SEEDS
 CONTROL_ARMS: Final[tuple[str, ...]] = (
     "fixed_td0",
     "intentional_td0",
@@ -62,7 +75,9 @@ _OFF_ALIASES: Final[dict[str, str]] = {
     "intentional_q_lambda_off": "fixed_q_lambda",
 }
 _EXECUTION_AUTHORIZED: Final[bool] = False
+_REVIEWED_EXECUTION_TRANSITION: Final[bool] = False
 _EXECUTION_CAPABILITY: Final[object] = object()
+_TEST_EXECUTION_CAPABILITY: Final[object] = object()
 _MAX_HORIZON: Final[int] = 10_000
 _MAX_JSON_NODES: Final[int] = 200_000
 _MAX_STRING_BYTES: Final[int] = 2 * 1024 * 1024
@@ -107,7 +122,8 @@ def frozen_plan() -> dict[str, object]:
         "official_code_revision": OFFICIAL_CODE_REVISION,
         "source_identity": _source_identity(),
         "runtime_identity": _runtime_identity(),
-        "seeds": list(SEEDS),
+        "seeds": list(CAMPAIGN_SEEDS),
+        "quarantined_test_consumed_seeds": list(QUARANTINED_SEEDS),
         "protocol_families": ["supervised_ipmnist", "td_control"],
         "supervised_pair": ["intentional_updates_off", "intentional_updates_ipmnist"],
         "supervised_config": SUPERVISED_CONFIG.to_config(),
@@ -168,9 +184,11 @@ def frozen_plan() -> dict[str, object]:
         ),
         "output_path": "outputs/intentional_updates_matched_development/report.v1.json",
         "execution_authorized": _EXECUTION_AUTHORIZED,
+        "reviewed_execution_transition": _REVIEWED_EXECUTION_TRANSITION,
         "execution_status": (
             "authorized_after_separate_review"
-            if _EXECUTION_AUTHORIZED
+            if _REVIEWED_EXECUTION_TRANSITION is True
+            and _EXECUTION_AUTHORIZED is True
             else "blocked_pending_independent_plan_audit"
         ),
         "development_only": True,
@@ -438,7 +456,10 @@ def run_control_shard(
     arm: str, *, seed: int, horizon: int = 512, phase_length: int = 64
 ) -> dict[str, object]:
     """Fail closed until a separate reviewed transition authorizes execution."""
-    if _EXECUTION_AUTHORIZED is not True:
+    if (
+        _REVIEWED_EXECUTION_TRANSITION is not True
+        or _EXECUTION_AUTHORIZED is not True
+    ):
         raise RuntimeError("Intentional Updates matched-development execution is not authorized")
     return _run_control_shard_authorized(
         arm,
@@ -458,11 +479,15 @@ def _run_control_shard_authorized(
     _capability: object,
 ) -> dict[str, object]:
     """Private bounded executor used by contract tests and a future gated campaign."""
-    if _capability is not _EXECUTION_CAPABILITY:
+    if _capability is _EXECUTION_CAPABILITY:
+        allowed_seeds = CAMPAIGN_SEEDS
+    elif _capability is _TEST_EXECUTION_CAPABILITY:
+        allowed_seeds = TEST_ONLY_SEEDS
+    else:
         raise RuntimeError("private Intentional execution capability is invalid")
     if type(arm) is not str or (arm not in CONTROL_ARMS and arm not in _OFF_ALIASES):
         raise ValueError("arm must name one exact registered control arm")
-    if type(seed) is not int or seed not in SEEDS:
+    if type(seed) is not int or seed not in allowed_seeds:
         raise ValueError("seed must be one exact prospectively reserved seed")
     if type(horizon) is not int or not 1 <= horizon <= _MAX_HORIZON:
         raise ValueError("horizon must be an exact integer in [1, 10000]")
@@ -823,6 +848,8 @@ def build_report(
         "paired_comparisons": _comparisons(runs),
         "development_disposition": "four_separate_nonpromoting_outcomes",
         "policy": {
+            "reviewed_execution_transition": _REVIEWED_EXECUTION_TRANSITION,
+            "execution_authorized": _EXECUTION_AUTHORIZED,
             "development_only": True,
             "scientific_promotion_allowed": False,
             "negative_outcomes_retained": True,
@@ -895,12 +922,15 @@ def validate_report(value: object, *, require_current_source: bool = True) -> di
             {
                 "development_only", "scientific_promotion_allowed",
                 "negative_outcomes_retained", "timing_is_telemetry_only",
-                "cross_family_ranking_allowed",
+                "cross_family_ranking_allowed", "reviewed_execution_transition",
+                "execution_authorized",
             }
         ),
         context="report policy",
     )
     if policy != {
+        "reviewed_execution_transition": _REVIEWED_EXECUTION_TRANSITION,
+        "execution_authorized": _EXECUTION_AUTHORIZED,
         "development_only": True,
         "scientific_promotion_allowed": False,
         "negative_outcomes_retained": True,
@@ -1061,7 +1091,7 @@ def _strict_reread(reservation: _Reservation, expected: bytes) -> object:
             json.loads(actual.decode("utf-8"), object_pairs_hook=exact_object),
             context="published report",
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
         raise ValueError("published report is not strict JSON") from error
 
 
@@ -1096,6 +1126,14 @@ def _publish_reserved(reservation: _Reservation, report: dict[str, object]) -> N
             dst_dir_fd=reservation.directory_fd,
             follow_symlinks=False,
         )
+        os.unlink(temporary_name, dir_fd=reservation.directory_fd)
+        linked = os.stat(
+            reservation.destination_name,
+            dir_fd=reservation.directory_fd,
+            follow_symlinks=False,
+        )
+        if not stat.S_ISREG(linked.st_mode) or linked.st_nlink != 1:
+            raise ValueError("published report must have one unique regular-file link")
         os.fsync(reservation.directory_fd)
         reread = _strict_reread(reservation, encoded)
         if validate_report(reread, require_current_source=True) != report:
@@ -1111,7 +1149,26 @@ def _publish_reserved(reservation: _Reservation, report: dict[str, object]) -> N
 
 
 def publish_report(path: Path, report: object) -> Path:
-    """Reserve, validate, hard-link no-replace, fsync, and strictly reread."""
+    """Fail closed until both reviewed and runtime authorization are true."""
+    if (
+        _REVIEWED_EXECUTION_TRANSITION is not True
+        or _EXECUTION_AUTHORIZED is not True
+    ):
+        raise RuntimeError("Intentional Updates matched-development execution is not authorized")
+    return _publish_report_authorized(
+        path, report, _capability=_EXECUTION_CAPABILITY
+    )
+
+
+def _publish_report_authorized(
+    path: Path, report: object, *, _capability: object
+) -> Path:
+    """Capability-private immutable publisher used only after an outer gate."""
+    if (
+        _capability is not _EXECUTION_CAPABILITY
+        and _capability is not _TEST_EXECUTION_CAPABILITY
+    ):
+        raise RuntimeError("private Intentional publication capability is invalid")
     reservation = _reserve(path)
     try:
         validated = validate_report(report, require_current_source=True)
@@ -1134,7 +1191,10 @@ def _execution_commit() -> str:
 
 def run_campaign(dataset_path: Path, output_path: Path = OUTPUT_PATH) -> dict[str, object]:
     """Run both frozen subprotocols exactly once after separate authorization."""
-    if not _EXECUTION_AUTHORIZED:
+    if (
+        _REVIEWED_EXECUTION_TRANSITION is not True
+        or _EXECUTION_AUTHORIZED is not True
+    ):
         raise RuntimeError("Intentional Updates matched-development execution is not authorized")
     if type(dataset_path) is not type(Path()) or type(output_path) is not type(Path()):
         raise ValueError("dataset and output must be exact pathlib.Path values")
@@ -1156,14 +1216,14 @@ def run_campaign(dataset_path: Path, output_path: Path = OUTPUT_PATH) -> dict[st
                     SUPERVISED_CONFIG,
                 )
             )
-            for seed in SEEDS
+            for seed in CAMPAIGN_SEEDS
             for arm in ("intentional_updates_off", "intentional_updates_ipmnist")
         ]
         control_records = [
             _run_control_shard_authorized(
                 arm, seed=seed, _capability=_EXECUTION_CAPABILITY
             )
-            for seed in SEEDS
+            for seed in CAMPAIGN_SEEDS
             for arm in CONTROL_ARMS
         ]
         if source_before != _current_source():
