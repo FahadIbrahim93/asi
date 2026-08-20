@@ -21,7 +21,7 @@ import math
 import statistics
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
-from typing import Literal
+from typing import Final, Literal
 
 import jax
 import jax.numpy as jnp
@@ -60,6 +60,17 @@ PAIRWISE_PROBE_SCOPE = (
     "archive remains counted memory, and this does not establish general feature "
     "discovery, continual control, or Alberta Plan completion."
 )
+
+MAX_RECURRING_EVIDENCE_PAIRS: Final = 4096
+"""Largest pair tuple representable at a recurring-evidence boundary."""
+
+MAX_RECURRING_FEATURE_DIM: Final = (
+    1 + math.isqrt(1 + 8 * MAX_RECURRING_EVIDENCE_PAIRS)
+) // 2
+"""Largest dimension whose exhaustive ``C(n, 2)`` archive is representable."""
+
+FROZEN_RECURRING_FEATURE_DIM: Final = 6
+"""Input dimension fixed by the literal v1 recurring-feature protocol."""
 
 
 def _require_builtin_int(
@@ -109,7 +120,7 @@ def _require_recovery_steps(name: str, value: object) -> int | None:
 
 
 def _require_pairs(name: str, value: object) -> tuple[Pair, ...]:
-    if type(value) is not tuple or len(value) > 4096:
+    if type(value) is not tuple or len(value) > MAX_RECURRING_EVIDENCE_PAIRS:
         raise ValueError(f"{name} must be a bounded exact tuple of pairs")
     pairs: list[Pair] = []
     for index, raw_pair in enumerate(value):
@@ -178,9 +189,12 @@ class RecurringFeatureProtocol:
 
     def validate(self) -> None:
         """Reject malformed protocols before allocating experiment arrays."""
-        _require_builtin_int("feature_dim", self.feature_dim)
-        if self.feature_dim < 6:
-            raise ValueError("feature_dim must be at least 6 for the declared task pairs")
+        _require_builtin_int(
+            "feature_dim",
+            self.feature_dim,
+            minimum=FROZEN_RECURRING_FEATURE_DIM,
+            maximum=MAX_RECURRING_FEATURE_DIM,
+        )
         _require_builtin_int("output_heads", self.output_heads)
         if self.output_heads != len(TASK_NAMES):
             raise ValueError(f"output_heads must be {len(TASK_NAMES)}")
