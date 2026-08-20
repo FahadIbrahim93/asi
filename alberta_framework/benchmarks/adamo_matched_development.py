@@ -24,7 +24,7 @@ from alberta_framework.benchmarks.adamo_diagnostic import (
     OFFICIAL_CODE,
     OFFICIAL_CODE_SEARCH_DATE,
     PAPER_URL,
-    run_adamo_diagnostic,
+    _run_adamo_diagnostic_schedule,
     validate_adamo_diagnostic,
 )
 from alberta_framework.benchmarks.ipmnist_screening import (
@@ -369,7 +369,9 @@ def build_report(
     by_seed: dict[int, dict[str, object]] = {}
     ordered: list[dict[str, object]] = []
     for index, raw_receipt in enumerate(receipts):
-        receipt = validate_adamo_diagnostic(raw_receipt, require_current_identity=True)
+        receipt = validate_adamo_diagnostic(
+            raw_receipt, seed_schedule=SEEDS, require_current_identity=True
+        )
         seed = receipt["seed"]
         if type(seed) is not int or seed != SEEDS[index] or seed in by_seed:
             raise ValueError("receipts must use deterministic frozen seed ordering")
@@ -489,7 +491,9 @@ def validate_report(
     combined_dataset_identity: object | None = None
     for index, raw_run in enumerate(runs):
         run = validate_adamo_diagnostic(
-            raw_run, require_current_identity=require_current_execution_identity
+            raw_run,
+            seed_schedule=SEEDS,
+            require_current_identity=require_current_execution_identity,
         )
         seed = run["seed"]
         if type(seed) is not int or seed != SEEDS[index] or seed in by_seed:
@@ -724,7 +728,10 @@ def run_campaign(
         inputs, labels = load_mnist_train(data_home)
         dataset_before = _screening_dataset_provenance(inputs, labels)
         receipts = [
-            run_adamo_diagnostic(inputs, labels, profile=PROFILE, seed=seed) for seed in SEEDS
+            _run_adamo_diagnostic_schedule(
+                inputs, labels, profile=PROFILE, seed=seed, seed_schedule=SEEDS
+            )
+            for seed in SEEDS
         ]
         if source_before != _current_source_provenance():
             raise RuntimeError("source identity changed during matched execution")

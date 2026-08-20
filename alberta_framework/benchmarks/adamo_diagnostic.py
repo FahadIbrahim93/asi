@@ -43,6 +43,9 @@ OFFICIAL_CODE_SEARCH_DATE = "2026-08-17"
 ARMS = ("adamw_control", "adamo_inert", "adamo_l1e3", "adam_iso_joint_l1e3")
 FROZEN_DEVELOPMENT_SEEDS = (15600, 15601, 15602, 15603)
 FROZEN_MATCHED_DEVELOPMENT_SEEDS = (9156001, 9156002, 9156003, 9156004)
+_ALLOWED_SEED_SCHEDULES = frozenset(
+    {FROZEN_DEVELOPMENT_SEEDS, FROZEN_MATCHED_DEVELOPMENT_SEEDS}
+)
 _MAX_DATASET_BYTES = 256 * 1024 * 1024
 _HEX = frozenset("0123456789abcdef")
 _MAX_RECEIPT_NODES = 100_000
@@ -188,17 +191,37 @@ def _arm_payload(
 def run_adamo_diagnostic(
     inputs: np.ndarray, labels: np.ndarray, *, profile: str, seed: int,
 ) -> dict[str, object]:
-    """Run all four matched arms through the current IPMNIST screening runner."""
+    """Run the public diagnostic with the already-consumed qualification schedule."""
+    return _run_adamo_diagnostic_schedule(
+        inputs,
+        labels,
+        profile=profile,
+        seed=seed,
+        seed_schedule=FROZEN_DEVELOPMENT_SEEDS,
+    )
+
+
+def _run_adamo_diagnostic_schedule(
+    inputs: np.ndarray,
+    labels: np.ndarray,
+    *,
+    profile: str,
+    seed: int,
+    seed_schedule: tuple[int, ...],
+) -> dict[str, object]:
+    """Run all four matched arms under one exact registered seed schedule."""
     if type(profile) is not str or profile not in PROFILES:
         raise ValueError("profile must name one registered AdamO diagnostic profile")
+    if (
+        type(seed_schedule) is not tuple
+        or len(seed_schedule) != len(FROZEN_DEVELOPMENT_SEEDS)
+        or any(type(value) is not int for value in seed_schedule)
+        or seed_schedule not in _ALLOWED_SEED_SCHEDULES
+    ):
+        raise ValueError("seed_schedule is not an exact registered AdamO schedule")
     resolved_seed = require_jax_seed(seed, name="seed")
-    frozen_seeds = (
-        FROZEN_DEVELOPMENT_SEEDS
-        if profile == "contract-smoke"
-        else FROZEN_MATCHED_DEVELOPMENT_SEEDS
-    )
-    if resolved_seed not in frozen_seeds:
-        raise ValueError("seed is not in the frozen development schedule for this profile")
+    if resolved_seed not in seed_schedule:
+        raise ValueError("seed is not in the selected frozen development schedule")
     if type(inputs) is not np.ndarray or type(labels) is not np.ndarray:
         raise TypeError("inputs and labels must be exact numpy arrays")
     config = PROFILES[profile].config
@@ -250,7 +273,7 @@ def run_adamo_diagnostic(
         "official_parity_status": "blocked_no_author_maintained_code_located",
         "profile": profile,
         "seed": resolved_seed,
-        "frozen_development_seeds": list(frozen_seeds),
+        "frozen_development_seeds": list(seed_schedule),
         "config": asdict(config),
         "dataset": {
             "sha256": _sha256_arrays(inputs, labels),
@@ -377,9 +400,19 @@ def _exact_object(
 
 
 def validate_adamo_diagnostic(
-    payload: object, *, require_current_identity: bool = True
+    payload: object,
+    *,
+    seed_schedule: tuple[int, ...] = FROZEN_DEVELOPMENT_SEEDS,
+    require_current_identity: bool = True,
 ) -> dict[str, object]:
     """Fail closed on malformed, drifted, promoting, or unmatched receipts."""
+    if (
+        type(seed_schedule) is not tuple
+        or len(seed_schedule) != len(FROZEN_DEVELOPMENT_SEEDS)
+        or any(type(value) is not int for value in seed_schedule)
+        or seed_schedule not in _ALLOWED_SEED_SCHEDULES
+    ):
+        raise ValueError("seed_schedule is not an exact registered AdamO schedule")
     if type(require_current_identity) is not bool:
         raise ValueError("require_current_identity must be an exact bool")
     if type(payload) is not dict:
@@ -410,19 +443,14 @@ def validate_adamo_diagnostic(
     if type(profile) is not str or profile not in PROFILES:
         raise ValueError("unknown profile")
     seed = _exact_int(result["seed"], "seed")
-    expected_seeds = (
-        FROZEN_DEVELOPMENT_SEEDS
-        if profile == "contract-smoke"
-        else FROZEN_MATCHED_DEVELOPMENT_SEEDS
-    )
-    if seed not in expected_seeds:
+    if seed not in seed_schedule:
         raise ValueError("seed is outside the frozen development schedule")
     frozen_seeds = result["frozen_development_seeds"]
     if (
         type(frozen_seeds) is not list
-        or len(frozen_seeds) != len(expected_seeds)
+        or len(frozen_seeds) != len(seed_schedule)
         or any(type(value) is not int for value in frozen_seeds)
-        or tuple(frozen_seeds) != expected_seeds
+        or tuple(frozen_seeds) != seed_schedule
     ):
         raise ValueError("frozen seed schedule drift")
     config = PROFILES[profile].config
@@ -645,13 +673,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     if args.dataset is None:
         parser.error("--dataset is required unless --catalog is used")
-    seed = args.seed
-    if seed is None:
-        seed = (
-            FROZEN_DEVELOPMENT_SEEDS[0]
-            if args.profile == "contract-smoke"
-            else FROZEN_MATCHED_DEVELOPMENT_SEEDS[0]
-        )
+    seed = FROZEN_DEVELOPMENT_SEEDS[0] if args.seed is None else args.seed
     inputs, labels = _load_dataset(args.dataset)
     print(json.dumps(run_adamo_diagnostic(inputs, labels, profile=args.profile, seed=seed),
                      sort_keys=True, separators=(",", ":")))

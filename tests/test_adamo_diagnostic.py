@@ -115,6 +115,12 @@ def test_contract_and_matched_seed_schedules_are_disjoint(
             profile="contract-smoke",
             seed=FROZEN_MATCHED_DEVELOPMENT_SEEDS[0],
         )
+    with pytest.raises(ValueError, match="selected frozen"):
+        run_adamo_diagnostic(
+            *tiny_data,
+            profile="bounded-development",
+            seed=FROZEN_MATCHED_DEVELOPMENT_SEEDS[0],
+        )
 
 
 def test_retained_receipt_can_be_validated_offline(
