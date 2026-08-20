@@ -440,8 +440,18 @@ def test_load_context_rejects_literal_v1_open_campaign_manifest(
         )
 
 
-def test_open_campaign_v2_golden_byte_contract(tmp_path: Path) -> None:
+def test_open_campaign_v2_golden_byte_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Keep phase-neutral engine refactors byte-identical for open tuning."""
+
+    if not HAS_O_TMPFILE:
+        def portable_publish(path: Path, raw: bytes) -> str:
+            path.write_bytes(raw)
+            return hashlib.sha256(raw).hexdigest()
+
+        monkeypatch.setattr(campaign, "_publish_bytes", portable_publish)
 
     def digest(raw: bytes) -> str:
         return hashlib.sha256(raw).hexdigest()

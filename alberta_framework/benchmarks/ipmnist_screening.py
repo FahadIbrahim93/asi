@@ -143,7 +143,7 @@ import platform
 import subprocess
 import time
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from types import FunctionType, MappingProxyType
 from typing import Any, cast
@@ -157,6 +157,42 @@ from jax import Array
 
 from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework._strict_json import load_strict_json_object
+from alberta_framework.benchmarks.cchain_ipmnist import (
+    OFFICIAL_COMMIT as CCHAIN_OFFICIAL_COMMIT,
+)
+from alberta_framework.benchmarks.cchain_ipmnist import (
+    PAPER_REVISION as CCHAIN_PAPER_REVISION,
+)
+from alberta_framework.benchmarks.cchain_ipmnist import (
+    CChainState,
+    cchain_host_diagnostics,
+    cchain_hyperparameters,
+    make_cchain_learner,
+)
+from alberta_framework.benchmarks.noise_curvature_ipmnist import (
+    PAPER_REVISION as NOISE_CURVATURE_PAPER_REVISION,
+)
+from alberta_framework.benchmarks.noise_curvature_ipmnist import (
+    NoiseCurvatureConfig,
+    NoiseCurvatureState,
+    init_noise_curvature_state,
+    noise_curvature_persistent_bytes,
+    noise_curvature_step,
+)
+from alberta_framework.benchmarks.replay_frozen_ipmnist import (
+    PROL_COMMIT,
+    PROL_PAPER_REVISION,
+    RANDUMB_COMMIT,
+    RANDUMB_PAPER_REVISION,
+    RANPAC_COMMIT,
+    RANPAC_PAPER_REVISION,
+    REPLAY_OFFICIAL_CODE,
+    REPLAY_PAPER_REVISION,
+    frozen_hyperparameters,
+    make_frozen_feature_learner,
+    make_replay_context_learner,
+    replay_hyperparameters,
+)
 from alberta_framework.benchmarks.upgd_ipmnist import (
     _PLASTICITY_LOSS_FLOOR,
     ADAMW_PROTOCOL_HYPERPARAMETERS,
@@ -188,6 +224,41 @@ from alberta_framework.core.update_safety import (
     floating_tree_is_finite,
     select_transaction,
 )
+from alberta_framework.evaluation.bounded_elastic_ipmnist_nonpromoting import (
+    COMPARISON_ID as BOUNDED_ELASTIC_COMPARISON_ID,
+)
+from alberta_framework.evaluation.bounded_elastic_ipmnist_nonpromoting import (
+    PAPER_REVISION as BOUNDED_ELASTIC_PAPER_REVISION,
+)
+from alberta_framework.evaluation.bounded_elastic_ipmnist_nonpromoting import (
+    PAPER_SOURCE_SHA256 as BOUNDED_ELASTIC_PAPER_SOURCE_SHA256,
+)
+from alberta_framework.evaluation.bounded_elastic_ipmnist_nonpromoting import (
+    RESULT_SCHEMA as BOUNDED_ELASTIC_RESULT_SCHEMA,
+)
+from alberta_framework.evaluation.bounded_elastic_ipmnist_nonpromoting import (
+    bounded_elastic_resource_expectations,
+    registered_bounded_elastic_hyperparameters,
+    validate_bounded_elastic_development_result,
+)
+from alberta_framework.evaluation.cchain_ipmnist_nonpromoting import (
+    ADAPTATION_ID as CCHAIN_ADAPTATION_ID,
+)
+from alberta_framework.evaluation.cchain_ipmnist_nonpromoting import (
+    COMPARABILITY_GAPS as CCHAIN_COMPARABILITY_GAPS,
+)
+from alberta_framework.evaluation.cchain_ipmnist_nonpromoting import (
+    COMPARISON_ID as CCHAIN_COMPARISON_ID,
+)
+from alberta_framework.evaluation.cchain_ipmnist_nonpromoting import (
+    DEVELOPMENT_SEEDS as CCHAIN_DEVELOPMENT_SEEDS,
+)
+from alberta_framework.evaluation.cchain_ipmnist_nonpromoting import (
+    RESULT_SCHEMA as CCHAIN_RESULT_SCHEMA,
+)
+from alberta_framework.evaluation.cchain_ipmnist_nonpromoting import (
+    validate_cchain_development_result,
+)
 from alberta_framework.evaluation.l2er_ipmnist_nonpromoting import (
     COMPARISON_ID as L2ER_COMPARISON_ID,
 )
@@ -203,6 +274,33 @@ from alberta_framework.evaluation.l2er_ipmnist_nonpromoting import (
 from alberta_framework.evaluation.l2er_ipmnist_nonpromoting import (
     validate_l2er_development_result,
 )
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    COMPARISON_ID as NOISE_CURVATURE_COMPARISON_ID,
+)
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    DEVELOPMENT_SEEDS as NOISE_CURVATURE_DEVELOPMENT_SEEDS,
+)
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    LIVE_CONTROL as NOISE_CURVATURE_LIVE_CONTROL,
+)
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    OFFICIAL_CODE_STATUS as NOISE_CURVATURE_OFFICIAL_CODE_STATUS,
+)
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    PROTOCOL_DIFFERENCES as NOISE_CURVATURE_PROTOCOL_DIFFERENCES,
+)
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    RESULT_SCHEMA as NOISE_CURVATURE_RESULT_SCHEMA,
+)
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    registered_arms as noise_curvature_registered_arms,
+)
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    registered_hyperparameters as noise_curvature_registered_hyperparameters,
+)
+from alberta_framework.evaluation.noise_curvature_ipmnist_nonpromoting import (
+    validate_noise_curvature_development_result,
+)
 from alberta_framework.evaluation.recurring_ipmnist_retention import (
     RecurringIPMNISTPhase,
     RecurringIPMNISTProtocol,
@@ -211,6 +309,19 @@ from alberta_framework.evaluation.recurring_ipmnist_retention import (
     SentinelProbeBinding,
     SentinelProbeSnapshot,
     build_recurring_ipmnist_retention_report,
+)
+from alberta_framework.evaluation.replay_frozen_ipmnist_nonpromoting import (
+    COMPARISON_ID as REPLAY_FROZEN_COMPARISON_ID,
+)
+from alberta_framework.evaluation.replay_frozen_ipmnist_nonpromoting import (
+    PROTOCOL_GAPS as REPLAY_FROZEN_PROTOCOL_GAPS,
+)
+from alberta_framework.evaluation.replay_frozen_ipmnist_nonpromoting import (
+    RESULT_SCHEMA as REPLAY_FROZEN_RESULT_SCHEMA,
+)
+from alberta_framework.evaluation.replay_frozen_ipmnist_nonpromoting import (
+    expected_resources_for_result,
+    validate_replay_frozen_result,
 )
 
 logger = logging.getLogger(__name__)
@@ -224,6 +335,11 @@ VALIDATION_SCHEMA = "alberta.ipmnist_screening.proxy_validation.v2"
 SOURCE_PROVENANCE_SCHEMA = "alberta.ipmnist_screening.source_provenance.v1"
 DATASET_PROVENANCE_SCHEMA = "alberta.ipmnist_screening.dataset_provenance.v1"
 RUNTIME_SCHEMA = "alberta.ipmnist_screening.runtime.v1"
+PARTIAL_RESET_RECORD_SCHEMA = "asi.ipmnist.calibrated_partial_reset.development.v1"
+CPR_PAPER_REVISION = "arXiv:2607.24996v1"
+CPR_OFFICIAL_CODE_REVISION = (
+    "LucMc/continual-learning@6fc2af34783159f5dda50c6915dda32c2d443604"
+)
 INTENTIONAL_UPDATES_RECORD_SCHEMA = "asi.ipmnist.intentional_updates.development.v1"
 INTENTIONAL_UPDATES_PAPER_REVISION = "arXiv:2604.19033v1"
 INTENTIONAL_UPDATES_CODE_REVISION = (
@@ -737,6 +853,214 @@ def _make_l2er_learner(
         )
         new_params, new_state = l2er_update(params, state, grads, x, checked_hp)
         return new_params, new_state, _step_metrics(new_params, x, y, loss, logits)
+
+    return init_fn, full_step
+
+
+# =============================================================================
+# Bounded growing/elastic adaptation (Kong & Sutton, arXiv:2608.01475v1)
+# =============================================================================
+
+
+@chex.dataclass(frozen=True, mappable_dataclass=False)
+class BoundedStructureState:
+    """Preallocated hidden-1 activity, online activation evidence, and clock."""
+
+    active1: Array
+    activation_sum1: Array
+    step: Array
+
+
+def bounded_masked_logits(
+    params: dict[str, Array], x: Array, active1: Array
+) -> tuple[Array, Array]:
+    """Return logits and hidden-1 activations under the static capacity mask."""
+    hidden1 = jax.nn.relu(x @ params["w1"] + params["b1"]) * active1
+    hidden2 = jax.nn.relu(hidden1 @ params["w2"] + params["b2"])
+    return hidden2 @ params["w3"] + params["b3"], hidden1
+
+
+def bounded_masked_loss(
+    params: dict[str, Array], x: Array, y: Array, active1: Array
+) -> tuple[Array, tuple[Array, Array]]:
+    """Cross-entropy with auxiliary masked logits and activations."""
+    logits, hidden1 = bounded_masked_logits(params, x, active1)
+    return -jax.nn.log_softmax(logits)[y], (logits, hidden1)
+
+
+def _fresh_hidden1_slot(
+    params: dict[str, Array], index: Array, key: Array, apply: Array
+) -> dict[str, Array]:
+    """Freshly initialize one hidden-1 slot using the runner's MLP convention."""
+    key_in, key_bias, key_out = jr.split(key, 3)
+    in_bound = 1.0 / math.sqrt(params["w1"].shape[0])
+    out_bound = 1.0 / math.sqrt(params["w2"].shape[0])
+    fresh_in = jr.uniform(key_in, (params["w1"].shape[0],), jnp.float32, -in_bound, in_bound)
+    fresh_bias = jr.uniform(key_bias, (), jnp.float32, -in_bound, in_bound)
+    fresh_out = jr.uniform(key_out, (params["w2"].shape[1],), jnp.float32, -out_bound, out_bound)
+    result = dict(params)
+    result["w1"] = params["w1"].at[:, index].set(jnp.where(apply, fresh_in, params["w1"][:, index]))
+    result["b1"] = params["b1"].at[index].set(jnp.where(apply, fresh_bias, params["b1"][index]))
+    result["w2"] = params["w2"].at[index, :].set(
+        jnp.where(apply, fresh_out, params["w2"][index, :])
+    )
+    return result
+
+
+def bounded_structure_event(
+    params: dict[str, Array], state: BoundedStructureState, key: Array, hp: Mapping[str, float]
+) -> tuple[dict[str, Array], BoundedStructureState]:
+    """Apply one protocol boundary event: optional least-active prune, then growth."""
+    active = state.active1
+    if hp["pruning_enabled"] == 1.0:
+        prune_index = jnp.argmin(jnp.where(active, state.activation_sum1, jnp.inf))
+        can_prune = jnp.any(active)
+        active = active.at[prune_index].set(
+            jnp.where(can_prune, jnp.asarray(False), active[prune_index])
+        )
+    if hp["growth_enabled"] == 1.0:
+        inactive = jnp.logical_not(active)
+        grow_index = jnp.argmax(inactive).astype(jnp.int32)
+        can_grow = jnp.any(inactive)
+        params = _fresh_hidden1_slot(params, grow_index, key, can_grow)
+        active = active.at[grow_index].set(
+            jnp.where(can_grow, jnp.asarray(True), active[grow_index])
+        )
+    return params, BoundedStructureState(  # type: ignore[call-arg]
+        active1=active,
+        activation_sum1=jnp.zeros_like(state.activation_sum1),
+        step=state.step,
+    )
+
+
+def bounded_structure_update(
+    params: dict[str, Array],
+    state: BoundedStructureState,
+    grads: dict[str, Array],
+    hidden1: Array,
+    key: Array,
+    hp: Mapping[str, float],
+) -> tuple[dict[str, Array], BoundedStructureState]:
+    """One SGD update followed by the registered fixed-length boundary event."""
+    candidate = {name: value - hp["step_size"] * grads[name] for name, value in params.items()}
+    next_step = state.step + jnp.asarray(1, dtype=jnp.int32)
+    accumulated = BoundedStructureState(  # type: ignore[call-arg]
+        active1=state.active1,
+        activation_sum1=state.activation_sum1 + jnp.abs(hidden1),
+        step=next_step,
+    )
+    interval = int(hp["structure_interval"])
+    due = next_step % interval == 0
+    result = jax.lax.cond(
+        due,
+        lambda operand: bounded_structure_event(operand[0], operand[1], key, hp),
+        lambda operand: operand,
+        (candidate, accumulated),
+    )
+    return cast(tuple[dict[str, Array], BoundedStructureState], result)
+
+
+def _make_bounded_structure_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Build the masked, preallocated adaptation used by all structure arms."""
+    if dict(hp) not in (
+        registered_bounded_elastic_hyperparameters("bounded_structure_off"),
+        registered_bounded_elastic_hyperparameters("bounded_growth"),
+        registered_bounded_elastic_hyperparameters("bounded_elastic"),
+    ):
+        raise ValueError("bounded structure hyperparameters are not a registered arm")
+
+    def init_fn(params: dict[str, Array]) -> BoundedStructureState:
+        width = params["w1"].shape[1]
+        active_count = max(1, int(width * hp["initial_active_fraction"]))
+        active = jnp.arange(width, dtype=jnp.int32) < active_count
+        return BoundedStructureState(  # type: ignore[call-arg]
+            active1=active,
+            activation_sum1=jnp.zeros(width, dtype=jnp.float32),
+            step=jnp.asarray(0, dtype=jnp.int32),
+        )
+
+    def full_step(
+        params: dict[str, Array], state: BoundedStructureState, x: Array, y: Array, key: Array
+    ) -> tuple[dict[str, Array], BoundedStructureState, StepMetrics]:
+        (loss, (logits, hidden1)), grads = jax.value_and_grad(bounded_masked_loss, has_aux=True)(
+            params, x, y, state.active1
+        )
+        new_params, new_state = bounded_structure_update(params, state, grads, hidden1, key, hp)
+        loss_after, _ = bounded_masked_loss(new_params, x, y, new_state.active1)
+        accuracy = (jnp.argmax(logits) == y).astype(jnp.float32)
+        plasticity = jnp.clip(
+            1.0 - loss_after / jnp.maximum(loss, _PLASTICITY_LOSS_FLOOR), 0.0, 1.0
+        )
+        return new_params, new_state, (accuracy, loss, plasticity)
+
+    return init_fn, full_step
+
+
+_NOISE_CURVATURE_MODE_NAMES = {
+    0.0: "fixed",
+    1.0: "gradient_only",
+    2.0: "volatility_only",
+    3.0: "combined",
+}
+
+
+def _make_noise_curvature_learner(
+    hp: Mapping[str, float], *, total_steps: int = 1_000_000
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Adapt arXiv:2509.19698v3 to the current online IPMNIST MLP."""
+
+    if type(total_steps) is not int or not 1 <= total_steps <= (1 << 31) - 1:
+        raise ValueError("total_steps must be an exact positive signed-int32 integer")
+    if type(hp) is not dict:
+        raise ValueError("noise-curvature hyperparameters must be an exact object")
+    mode_value = hp.get("controller_mode")
+    if type(mode_value) is not float or mode_value not in _NOISE_CURVATURE_MODE_NAMES:
+        raise ValueError("controller_mode must identify one registered scheduler arm")
+    mode = _NOISE_CURVATURE_MODE_NAMES[mode_value]
+    arm = noise_curvature_registered_arms()[int(mode_value)]
+    expected = noise_curvature_registered_hyperparameters(arm)
+    if hp != expected or any(type(value) is not float for value in hp.values()):
+        raise ValueError("hyperparameters do not match the registered scheduler arm")
+    config = NoiseCurvatureConfig(
+        mode=mode,  # type: ignore[arg-type]
+        total_steps=total_steps,
+        control_interval=int(hp["control_interval"]),
+        power_iterations=int(hp["power_iterations"]),
+        base_step_size=hp["step_size"],
+        beta1=hp["beta1"],
+        beta2=hp["beta2"],
+        adam_epsilon=hp["eps"],
+        weight_decay=hp["weight_decay"],
+        ema_decay=hp["ema_decay"],
+        volatility_epsilon=hp["volatility_epsilon"],
+        volatility_inflation=hp["volatility_inflation"],
+        volatility_kappa=hp["volatility_kappa"],
+        safety_factor=hp["safety_factor"],
+        cool_rate=hp["cool_rate"],
+        warm_rate=hp["warm_rate"],
+        warm_fraction=hp["warm_fraction"],
+        timid_fraction=hp["timid_fraction"],
+        effective_step_floor=hp["effective_step_floor"],
+    )
+
+    def init_fn(params: dict[str, Array]) -> Any:
+        return init_noise_curvature_state(params, config)
+
+    def full_step(
+        params: dict[str, Array], state: Any, x: Array, y: Array, key: Array
+    ) -> tuple[dict[str, Array], Any, StepMetrics]:
+        del key
+        (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+            params, x, y
+        )
+        new_params, new_state = noise_curvature_step(
+            params, state, grads, x, y, cross_entropy_loss, config
+        )
+        return new_params, new_state, _step_metrics(new_params, x, y, loss, logits)
+
+    return init_fn, full_step
 
     return init_fn, full_step
 
@@ -2927,6 +3251,51 @@ def _cbp_update(
         accumulator=jnp.stack([acc0, acc1]),
     )
     return params, opt_arrays, new_cbp
+
+
+def _make_sgd_cbp_budget_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Paper-step-size SGD with current fixed-capacity CBP recycling."""
+    if dict(hp) != registered_bounded_elastic_hyperparameters("bounded_fixed_cbp"):
+        raise ValueError("fixed CBP hyperparameters are not the registered budget arm")
+
+    def init_fn(params: dict[str, Array]) -> CBPState:
+        return _init_cbp_state(params["w1"].shape[1], params["w2"].shape[1])
+
+    def full_step(
+        params: dict[str, Array], state: CBPState, x: Array, y: Array, key: Array
+    ) -> tuple[dict[str, Array], CBPState, StepMetrics]:
+        def loss_with_activations(
+            current: dict[str, Array], observation: Array, label: Array
+        ) -> tuple[Array, tuple[Array, Array, Array, Array]]:
+            logits, _, hidden1, z2, hidden2 = _forward_with_activations(
+                current, observation
+            )
+            loss = -jax.nn.log_softmax(logits)[label]
+            return loss, (logits, hidden1, z2, hidden2)
+
+        (loss, (logits, hidden1, z2, hidden2)), grads = jax.value_and_grad(
+            loss_with_activations, has_aux=True
+        )(params, x, y)
+        grad_hidden1, grad_hidden2 = _activation_loss_grads(params, logits, y, z2)
+        candidate = {
+            name: value - hp["step_size"] * grads[name] for name, value in params.items()
+        }
+        candidate, _, new_state = _cbp_update(
+            candidate,
+            None,
+            state,
+            hidden1,
+            grad_hidden1,
+            hidden2,
+            grad_hidden2,
+            key,
+            hp,
+        )
+        return candidate, new_state, _step_metrics(candidate, x, y, loss, logits)
+
+    return init_fn, full_step
 
 
 @chex.dataclass(frozen=True)
@@ -5839,6 +6208,114 @@ def _make_sigma0_gated_l2init_learner(
     return init_fn, full_step
 
 
+@chex.dataclass(frozen=True)
+class CPRIPMNISTState:
+    """Matched peak-state envelope for CPR and every registered control."""
+
+    utility: dict[str, Array]
+    init_params: dict[str, Array]
+    step: Array
+    norm: EMANormState
+
+
+def _make_cpr_ipmnist_learner(
+    hp: Mapping[str, float],
+) -> tuple[LearnerInitFn, ScreeningStepFn]:
+    """Calibrated partial reset and matched reduction family.
+
+    The paper defines per-neuron gradient utilities and periodic reset Eq. 7.
+    This batch-size-one IPMNIST port uses per-parameter absolute-gradient EMA
+    (a finer-grained utility) because the screening learner's state is
+    parameter-keyed.  It retains the paper's layer/tensor mean normalization,
+    Eq. 6 sigmoid shape (kappa=16), periodic pull, and reset-to-retained-init
+    operator.  This protocol difference is bound in the result receipt.
+    """
+    mode_code = int(hp["mode_code"])
+    if mode_code not in range(5):
+        raise ValueError("mode_code must select utility/hard/L2/uniform/off")
+    step_size = hp["step_size"]
+    utility_decay = hp["utility_decay"]
+    reset_fraction = hp["reset_fraction"]
+    reset_frequency = int(hp["reset_frequency"])
+    if reset_frequency < 1:
+        raise ValueError("reset_frequency must be positive")
+    kappa = hp["utility_sharpness"]
+    l2_strength = hp["l2_init_strength"]
+    norm_decay = hp["norm_decay"]
+    norm_epsilon = hp["norm_epsilon"]
+
+    def init_fn(params: dict[str, Array]) -> CPRIPMNISTState:
+        return CPRIPMNISTState(  # type: ignore[call-arg]
+            utility={name: jnp.ones_like(value) for name, value in params.items()},
+            init_params={name: value for name, value in params.items()},
+            step=jnp.asarray(0, dtype=jnp.int32),
+            norm=_init_input_norm_state(params),
+        )
+
+    def full_step(
+        params: dict[str, Array],
+        state: CPRIPMNISTState,
+        x: Array,
+        y: Array,
+        key: Array,
+    ) -> tuple[dict[str, Array], CPRIPMNISTState, StepMetrics]:
+        del key
+        x_norm, new_norm = ema_normalize(state.norm, x, norm_decay, norm_epsilon)
+        (loss, logits), grads = jax.value_and_grad(cross_entropy_loss, has_aux=True)(
+            params, x_norm, y
+        )
+        new_step = state.step + jnp.asarray(1, dtype=jnp.int32)
+        utility = {}
+        for name in params:
+            magnitude = jnp.abs(grads[name])
+            score = magnitude / (jnp.mean(magnitude) + norm_epsilon)
+            utility[name] = (
+                utility_decay * state.utility[name] + (1.0 - utility_decay) * score
+            )
+        sgd_params = {
+            name: params[name] - step_size * grads[name] for name in params
+        }
+        at_reset = jnp.equal(jnp.mod(new_step, reset_frequency), 0)
+        new_params: dict[str, Array] = {}
+        for name in params:
+            mean_utility = jnp.mean(utility[name])
+            normalized = utility[name] / jnp.maximum(mean_utility, norm_epsilon)
+            calibrated = jnp.minimum(
+                2.0 * jax.nn.sigmoid(-kappa * (normalized - 1.0)), 1.0
+            )
+            if mode_code == 0:  # CPR: periodic continuous utility-scaled pull
+                rate = jnp.where(at_reset, reset_fraction * calibrated, 0.0)
+            elif mode_code == 1:  # binary hard reset below tensor mean
+                rate = jnp.where(at_reset & (normalized <= 1.0), 1.0, 0.0)
+            elif mode_code == 2:  # L2-Init: uniform continuous regularization
+                rate = jnp.full_like(params[name], step_size * l2_strength)
+            elif mode_code == 3:  # utility-free periodic partial reset
+                rate = jnp.where(at_reset, reset_fraction, 0.0)
+            else:  # exact mechanism-off parameter path
+                rate = jnp.zeros_like(params[name])
+            pulled = sgd_params[name] + rate * (
+                state.init_params[name] - sgd_params[name]
+            )
+            new_params[name] = sgd_params[name] if mode_code == 4 else pulled
+        metrics = _step_metrics(new_params, x_norm, y, loss, logits)
+        recentered_utility = {
+            name: (
+                jnp.where(at_reset, jnp.ones_like(value), value)
+                if mode_code in (0, 1, 3)
+                else value
+            )
+            for name, value in utility.items()
+        }
+        return new_params, CPRIPMNISTState(  # type: ignore[call-arg]
+            utility=recentered_utility,
+            init_params=state.init_params,
+            step=new_step,
+            norm=new_norm,
+        ), metrics
+
+    return init_fn, full_step
+
+
 # =============================================================================
 # Config registry
 # =============================================================================
@@ -6655,6 +7132,54 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             ),
         )
     )
+    cpr_base = {
+        "mode_code": 0.0,
+        "step_size": 0.01,
+        "utility_decay": 0.99,
+        "reset_fraction": 0.01,
+        "reset_frequency": 100.0,
+        "utility_sharpness": 16.0,
+        "l2_init_strength": 0.01,
+        "norm_decay": 0.99,
+        "norm_epsilon": 1e-8,
+    }
+    cpr_arms = (
+        (
+            "cpr_ipmnist",
+            0.0,
+            "CPR Eq. 6/7 supervised port: periodic utility-scaled partial pull to init.",
+        ),
+        (
+            "cpr_hard_reset",
+            1.0,
+            "Binary below-mean hard-reset control in the matched CPR state envelope.",
+        ),
+        (
+            "cpr_l2_init",
+            2.0,
+            "Continuous uniform L2-Init pull control in the matched CPR state envelope.",
+        ),
+        (
+            "cpr_utility_free",
+            3.0,
+            "Periodic uniform partial-pull control without utility calibration.",
+        ),
+        (
+            "cpr_off",
+            4.0,
+            "Exact mechanism-off normalized-SGD control with matched allocated state.",
+        ),
+    )
+    for name, mode_code, description in cpr_arms:
+        specs.append(ScreeningSpec(
+            name=name,
+            base_learner="upgd_w",
+            mechanism="calibrated_partial_reset",
+            hyperparameters={**cpr_base, "mode_code": mode_code},
+            factory=_make_cpr_ipmnist_learner,
+            frozen_probe_input=_ema_frozen_probe_input,
+            description=description,
+        ))
     # --- Wave 8: update-rule family swaps under the sigma0_ndecay099 champion's
     # conditioning (EMA input normalizer decay 0.99 + the exact UPGD utility
     # gate, no perturbation).  Only the descent direction changes per arm.
@@ -7601,6 +8126,228 @@ def _build_registry() -> dict[str, ScreeningSpec]:
             frozen_probe_input=_ema_frozen_probe_input,
             description=description,
         ))
+    for arm, mechanism, description in (
+        (
+            "bounded_structure_off",
+            "bounded_structure_off",
+            "Mechanism-off masked SGD at the initial half-width; no growth or pruning.",
+        ),
+        (
+            "bounded_growth",
+            "bounded_growth",
+            "Preallocated adaptive growth by one freshly initialized hidden-1 unit per task.",
+        ),
+        (
+            "bounded_elastic",
+            "bounded_elastic",
+            "Boundary pruning of the least-active hidden-1 unit followed by fresh growth.",
+        ),
+    ):
+        specs.append(
+            ScreeningSpec(
+                name=arm,
+                base_learner="upgd_w",
+                mechanism=mechanism,
+                hyperparameters=registered_bounded_elastic_hyperparameters(arm),
+                factory=_make_bounded_structure_learner,
+                description=(
+                    description
+                    + " Bounded arXiv:2608.01475v1 adaptation; not paper/code parity."
+                ),
+            )
+        )
+    specs.append(
+        ScreeningSpec(
+            name="bounded_fixed_cbp",
+            base_learner="upgd_w",
+            mechanism="fixed_capacity_cbp",
+            hyperparameters=registered_bounded_elastic_hyperparameters("bounded_fixed_cbp"),
+            factory=_make_sgd_cbp_budget_learner,
+            description=(
+                "Fixed full-capacity SGD+CBP comparator under the same declared peak/final-size "
+                "budgets as the bounded growing and elastic adaptations."
+            ),
+        )
+    )
+    # C-CHAIN is adapted from the official ICML-2025 implementation at
+    # 2f8bedf: Adam plus a recent-policy cross-entropy on a prior-update reference
+    # ring, adaptive relative-loss scaling, and the paper's two gradient
+    # component ablations.  The online prior-example ring and all remaining
+    # comparability gaps are frozen into its dedicated receipt validator.
+    for (
+        arm_name,
+        churn_enabled,
+        adaptive_coefficient,
+        target_relative_loss_scale,
+        gradient_component,
+        arm_description,
+    ) in (
+        (
+            "cchain_mechanism_off",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            "Matched Adam control with all C-CHAIN reference and diagnostic overhead charged.",
+        ),
+        (
+            "cchain_full",
+            1.0,
+            1.0,
+            10_000.0,
+            0.0,
+            "Full C-CHAIN churn gradient with the official target relative-loss scale.",
+        ),
+        (
+            "cchain_orthogonal_only",
+            1.0,
+            1.0,
+            10_000.0,
+            1.0,
+            "Orthogonal churn-gradient component: the paper's NTK-decorrelation ablation.",
+        ),
+        (
+            "cchain_projective_only",
+            1.0,
+            1.0,
+            10_000.0,
+            2.0,
+            "Projective churn-gradient component: the paper's step-size ablation.",
+        ),
+    ):
+        specs.append(
+            ScreeningSpec(
+                name=arm_name,
+                base_learner="adamw",
+                mechanism="c_chain",
+                hyperparameters=cchain_hyperparameters(
+                    churn_enabled=churn_enabled,
+                    adaptive_coefficient=adaptive_coefficient,
+                    target_relative_loss_scale=target_relative_loss_scale,
+                    gradient_component=gradient_component,
+                ),
+                factory=make_cchain_learner,
+                description=(
+                    arm_description
+                    + " This is a permanently nonpromoting online-IPMNIST adaptation, "
+                    "not a reproduction of the paper's continual-RL protocols."
+                ),
+            )
+        )
+    for name, replay_update, context, description in (
+        (
+            "replay_context_mechanism_off",
+            0.0,
+            0.0,
+            "Charged Adam mechanism-off control for replay and label attention.",
+        ),
+        (
+            "replay_gradient_only",
+            1.0,
+            0.0,
+            "Prior-example replay-gradient ablation without contextual prediction.",
+        ),
+        (
+            "replay_context_only",
+            0.0,
+            1.0,
+            "Bounded label-attention prediction without replay-gradient influence.",
+        ),
+        (
+            "replay_context_full",
+            1.0,
+            1.0,
+            "Replay gradient plus bounded label-attention in-context proxy.",
+        ),
+    ):
+        specs.append(
+            ScreeningSpec(
+                name=name,
+                base_learner="adamw",
+                mechanism="replay_in_context",
+                hyperparameters=replay_hyperparameters(
+                    replay_update=replay_update, context=context
+                ),
+                factory=make_replay_context_learner,
+                description=(
+                    description
+                    + " Permanently nonpromoting; not a Transformer-paper reproduction."
+                ),
+            )
+        )
+    for name, method, mechanism_value, description in (
+        (
+            "randumb_random_features",
+            0.0,
+            1.0,
+            "RanDumb-inspired random Fourier extractor and online linear head.",
+        ),
+        (
+            "ranpac_random_projection",
+            1.0,
+            1.0,
+            "RanPAC-inspired random ReLU projection and recursive ridge readout.",
+        ),
+        (
+            "prol_prompt_mechanism_off",
+            2.0,
+            0.0,
+            "Charged frozen-extractor/head control with PROL proxy prompts disabled.",
+        ),
+        (
+            "prol_prompt_proxy",
+            2.0,
+            1.0,
+            "PROL architecture proxy with prompt/affine and hard-soft updates.",
+        ),
+    ):
+        specs.append(
+            ScreeningSpec(
+                name=name,
+                base_learner="upgd_w",
+                mechanism="frozen_feature_ceiling",
+                hyperparameters=frozen_hyperparameters(
+                    method=method, mechanism=mechanism_value
+                ),
+                factory=make_frozen_feature_learner,
+                frozen_probe_input=_rff_frozen_probe_input,
+                description=(
+                    description
+                    + " Zero imported pretraining is explicit; this is not a "
+                    "paper-level reproduction."
+                ),
+            )
+        )
+    noise_curvature_descriptions = {
+        "noise_curvature_fixed_adam_l2": (
+            "Mechanism-off AdamW+L2 conditioning control; all diagnostics remain "
+            "executed and charged but cannot change a layer learning rate."
+        ),
+        "noise_curvature_gradient_only": (
+            "Gradient-noise-only Eq. 2 ablation (curvature inflation beta=0)."
+        ),
+        "noise_curvature_volatility_only": (
+            "Curvature-volatility-only Eq. 1 inverse-bound ablation."
+        ),
+        "noise_curvature_combined": (
+            "Joint layerwise gradient-noise and curvature-volatility Eq. 2 scheduler."
+        ),
+    }
+    for arm_name in noise_curvature_registered_arms():
+        specs.append(
+            ScreeningSpec(
+                name=arm_name,
+                base_learner="adamw",
+                mechanism="noise_curvature_scheduler",
+                hyperparameters=noise_curvature_registered_hyperparameters(arm_name),
+                factory=_make_noise_curvature_learner,
+                description=(
+                    noise_curvature_descriptions[arm_name]
+                    + " Adapted from arXiv:2509.19698v3 to the current online "
+                    "IPMNIST runner with a charged rolling diagnostic minibatch."
+                ),
+            )
+        )
     return {spec.name: spec for spec in specs}
 
 
@@ -8613,6 +9360,7 @@ class ScreeningRunResult:
     wall_clock_seconds: float
     noise_mode: str = "step"
     noise_pool_steps: int | None = None
+    mechanism_diagnostics: dict[str, float] | None = None
 
     def __post_init__(self) -> None:
         for attr in ("config_name", "base_learner", "noise_mode"):
@@ -8664,6 +9412,20 @@ class ScreeningRunResult:
             "noise_pool_steps",
             _validated_screening_noise_pool_steps(self.noise_mode, self.noise_pool_steps),
         )
+        diagnostics = self.mechanism_diagnostics
+        if diagnostics is not None:
+            if type(diagnostics) is not dict or not diagnostics:
+                raise ValueError("mechanism_diagnostics must be a non-empty exact dict or None")
+            normalized_diagnostics: dict[str, float] = {}
+            for name, value in diagnostics.items():
+                if type(name) is not str or not name or "\x00" in name:
+                    raise ValueError("mechanism diagnostic names must be non-empty strings")
+                if type(value) is not float or not math.isfinite(value) or value < 0.0:
+                    raise ValueError(
+                        "mechanism diagnostic values must be finite nonnegative floats"
+                    )
+                normalized_diagnostics[name] = value
+            object.__setattr__(self, "mechanism_diagnostics", normalized_diagnostics)
 
 
 def l2er_development_result_payload(
@@ -8728,6 +9490,239 @@ def l2er_development_result_payload(
         "scientific_promotion_allowed": False,
     }
     return validate_l2er_development_result(payload)
+
+
+def _partial_reset_peak_numeric_bytes(config: IPMNISTConfig) -> int:
+    parameter_bytes = config.parameter_count * np.dtype(np.float32).itemsize
+    normalizer_bytes = (2 * config.input_dim + 1) * np.dtype(np.float32).itemsize
+    # Live params + retained init + utility EMA + int32 step + normalizer.
+    return 3 * parameter_bytes + normalizer_bytes + np.dtype(np.int32).itemsize
+
+
+def partial_reset_development_record(result: ScreeningRunResult) -> dict[str, Any]:
+    """Create a strict in-memory receipt for one real CPR-family run."""
+    if type(result) is not ScreeningRunResult:
+        raise TypeError("result must be an exact ScreeningRunResult")
+    spec = SCREENING_REGISTRY.get(result.config_name)
+    if spec is None or spec.mechanism != "calibrated_partial_reset":
+        raise ValueError("result must use a registered calibrated partial-reset arm")
+    if result.hyperparameters != spec.hyperparameters:
+        raise ValueError("result hyperparameters must match the registered arm")
+    steps = result.config.n_steps
+    peak_bytes = _partial_reset_peak_numeric_bytes(result.config)
+    return {
+        "schema": PARTIAL_RESET_RECORD_SCHEMA,
+        "references": {
+            "paper": CPR_PAPER_REVISION,
+            "official_code": CPR_OFFICIAL_CODE_REVISION,
+            "protocol_difference": (
+                "batch-size-one IPMNIST; per-parameter rather than per-neuron gradient "
+                "utility; retained initialization rather than fresh keyed draws; pulls all "
+                "parameters rather than hidden incoming weights plus outgoing decay; no "
+                "task-boundary information"
+            ),
+        },
+        "arm": result.config_name,
+        "seed": result.seed,
+        "config": result.config.to_config(),
+        "hyperparameters": dict(result.hyperparameters),
+        "matched_axes": [
+            "seed",
+            "example_schedule",
+            "observations",
+            "updates",
+            "allowed_boundary_information:none",
+            "peak_state_envelope",
+        ],
+        "policy": {
+            "development_only": True,
+            "scientific_promotion_allowed": False,
+            "publication_equivalent": False,
+            "retain_negative_outcome": True,
+        },
+        "resources": {
+            "persistent_bytes": peak_bytes,
+            "peak_numeric_bytes": peak_bytes,
+            "environment_or_data_steps": steps,
+            "observations": steps,
+            "updates": steps,
+            "model_queries": 2 * steps,
+            "timing_telemetry_seconds": float(result.wall_clock_seconds),
+            "timing_is_selection_metric": False,
+        },
+        "metrics": {
+            "per_task_accuracy": result.per_task_accuracy.tolist(),
+            "per_task_loss": result.per_task_loss.tolist(),
+            "per_task_plasticity": result.per_task_plasticity.tolist(),
+        },
+    }
+
+
+def _partial_reset_exact_object(
+    value: object, *, keys: frozenset[str], context: str
+) -> dict[str, Any]:
+    if type(value) is not dict or frozenset(value) != keys:
+        raise ValueError(f"{context} must be an exact object with the frozen keys")
+    return cast(dict[str, Any], value)
+
+
+def _partial_reset_curve(value: object, *, length: int, context: str) -> list[float]:
+    if (
+        type(value) is not list
+        or len(value) != length
+        or any(type(item) is not float or not math.isfinite(item) for item in value)
+    ):
+        raise ValueError(f"{context} must be a bounded finite float list")
+    return cast(list[float], value)
+
+
+def validate_partial_reset_development_record(record: object) -> dict[str, Any]:
+    """Fail closed over CPR-family identity, counters, metrics, and policy."""
+    payload = _partial_reset_exact_object(
+        record,
+        keys=frozenset(
+            {
+                "schema",
+                "references",
+                "arm",
+                "seed",
+                "config",
+                "hyperparameters",
+                "matched_axes",
+                "policy",
+                "resources",
+                "metrics",
+            }
+        ),
+        context="partial-reset record",
+    )
+    policy = _partial_reset_exact_object(
+        payload["policy"],
+        keys=frozenset(
+            {
+                "development_only",
+                "scientific_promotion_allowed",
+                "publication_equivalent",
+                "retain_negative_outcome",
+            }
+        ),
+        context="policy",
+    )
+    if policy != {
+        "development_only": True,
+        "scientific_promotion_allowed": False,
+        "publication_equivalent": False,
+        "retain_negative_outcome": True,
+    }:
+        raise ValueError("partial-reset records are permanently nonpromoting")
+    try:
+        config_raw = _partial_reset_exact_object(
+            payload["config"],
+            keys=frozenset(
+                {
+                    "n_tasks",
+                    "task_length",
+                    "input_dim",
+                    "hidden1",
+                    "hidden2",
+                    "n_classes",
+                }
+            ),
+            context="config",
+        )
+        config = IPMNISTConfig(**config_raw)
+        metrics = _partial_reset_exact_object(
+            payload["metrics"],
+            keys=frozenset(
+                {"per_task_accuracy", "per_task_loss", "per_task_plasticity"}
+            ),
+            context="metrics",
+        )
+        resources = _partial_reset_exact_object(
+            payload["resources"],
+            keys=frozenset(
+                {
+                    "persistent_bytes",
+                    "peak_numeric_bytes",
+                    "environment_or_data_steps",
+                    "observations",
+                    "updates",
+                    "model_queries",
+                    "timing_telemetry_seconds",
+                    "timing_is_selection_metric",
+                }
+            ),
+            context="resources",
+        )
+        arm = payload["arm"]
+        if type(arm) is not str:
+            raise ValueError("arm must be an exact string")
+        spec = screening_spec(arm)
+        hyperparameters = _partial_reset_exact_object(
+            payload["hyperparameters"],
+            keys=frozenset(spec.hyperparameters),
+            context="hyperparameters",
+        )
+        if any(
+            type(value) is not float or not math.isfinite(value)
+            for value in hyperparameters.values()
+        ):
+            raise ValueError("hyperparameters must contain exact finite floats")
+        references = _partial_reset_exact_object(
+            payload["references"],
+            keys=frozenset({"paper", "official_code", "protocol_difference"}),
+            context="references",
+        )
+        if any(type(value) is not str for value in references.values()):
+            raise ValueError("references must contain exact strings")
+        matched_axes = payload["matched_axes"]
+        if type(matched_axes) is not list or any(
+            type(value) is not str for value in matched_axes
+        ):
+            raise ValueError("matched_axes must be an exact string list")
+        timing = resources["timing_telemetry_seconds"]
+        if type(timing) is not float or not math.isfinite(timing) or timing < 0.0:
+            raise ValueError("timing telemetry must be one finite nonnegative float")
+        result = ScreeningRunResult(
+            config_name=arm,
+            base_learner=spec.base_learner,
+            hyperparameters=hyperparameters,
+            seed=require_jax_seed(payload["seed"], name="record seed"),
+            config=config,
+            per_task_accuracy=np.asarray(
+                _partial_reset_curve(
+                    metrics["per_task_accuracy"],
+                    length=config.n_tasks,
+                    context="per_task_accuracy",
+                ),
+                dtype=np.float64,
+            ),
+            per_task_loss=np.asarray(
+                _partial_reset_curve(
+                    metrics["per_task_loss"],
+                    length=config.n_tasks,
+                    context="per_task_loss",
+                ),
+                dtype=np.float64,
+            ),
+            per_task_plasticity=np.asarray(
+                _partial_reset_curve(
+                    metrics["per_task_plasticity"],
+                    length=config.n_tasks,
+                    context="per_task_plasticity",
+                ),
+                dtype=np.float64,
+            ),
+            wall_clock_seconds=timing,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("invalid partial-reset result fields") from error
+    expected = partial_reset_development_record(result)
+    if payload != expected:
+        if payload.get("resources") != expected["resources"]:
+            raise ValueError("partial-reset resource receipt does not match the run")
+        raise ValueError("partial-reset record does not match the frozen protocol")
+    return expected
 
 
 def _intentional_updates_persistent_numeric_bytes(
@@ -9063,6 +10058,315 @@ def validate_intentional_updates_development_record(
             raise ValueError("Intentional Updates resource counters do not match the run")
         raise ValueError("Intentional Updates record does not match the frozen protocol")
     return expected
+def bounded_elastic_development_result_payload(
+    result: ScreeningRunResult, *, outcome: str
+) -> dict[str, object]:
+    """Build and validate one exact development-only bounded-structure receipt."""
+    spec = screening_spec(result.config_name)
+    registered_arms = {
+        "bounded_structure_off",
+        "bounded_growth",
+        "bounded_elastic",
+        "bounded_fixed_cbp",
+    }
+    if result.config_name not in registered_arms or result.noise_mode != "step":
+        raise ValueError("receipt requires one exact-step registered bounded-structure arm")
+    if result.hyperparameters != spec.hyperparameters:
+        raise ValueError("result hyperparameters drift from the registered arm")
+    config = result.config
+    observations = config.n_tasks * config.task_length
+    structure_resources = bounded_elastic_resource_expectations(
+        arm=result.config_name,
+        n_tasks=config.n_tasks,
+        input_dim=config.input_dim,
+        hidden1=config.hidden1,
+        hidden2=config.hidden2,
+        n_classes=config.n_classes,
+    )
+    payload: dict[str, object] = {
+        "schema": BOUNDED_ELASTIC_RESULT_SCHEMA,
+        "comparison_id": BOUNDED_ELASTIC_COMPARISON_ID,
+        "paper_revision": BOUNDED_ELASTIC_PAPER_REVISION,
+        "paper_source_sha256": BOUNDED_ELASTIC_PAPER_SOURCE_SHA256,
+        "arm": result.config_name,
+        "seed": result.seed,
+        "n_tasks": config.n_tasks,
+        "task_length": config.task_length,
+        "input_dim": config.input_dim,
+        "hidden1": config.hidden1,
+        "hidden2": config.hidden2,
+        "n_classes": config.n_classes,
+        "observations": observations,
+        "updates": observations,
+        "allowed_boundary_information": ["known_fixed_length_task_boundary"],
+        "allowed_task_information": ["current_example_label"],
+        "hyperparameters": dict(spec.hyperparameters),
+        "metrics": {
+            "mean_online_accuracy": float(np.mean(result.per_task_accuracy)),
+            "mean_loss": float(np.mean(result.per_task_loss)),
+            "mean_plasticity": float(np.mean(result.per_task_plasticity)),
+        },
+        "resources": {
+            **structure_resources,
+            "environment_steps": 0,
+            "data_steps": observations,
+            "model_queries": 2 * observations,
+            "timing_seconds": float(result.wall_clock_seconds),
+            "timing_is_telemetry_only": True,
+        },
+        "outcome": outcome,
+        "outcome_retained": True,
+        "development_only": True,
+        "scientific_promotion_allowed": False,
+    }
+    return validate_bounded_elastic_development_result(payload)
+
+
+def cchain_development_result_payload(
+    result: ScreeningRunResult, *, outcome: str
+) -> dict[str, object]:
+    """Build and strictly validate one nonpromoting C-CHAIN result receipt."""
+    spec = screening_spec(result.config_name)
+    if spec.mechanism != "c_chain" or result.noise_mode != "step":
+        raise ValueError("a C-CHAIN receipt requires an exact-step registered C-CHAIN arm")
+    if result.hyperparameters != spec.hyperparameters:
+        raise ValueError("result hyperparameters drift from the registered C-CHAIN arm")
+    diagnostics = result.mechanism_diagnostics
+    if type(diagnostics) is not dict:
+        raise ValueError("a C-CHAIN receipt requires measured mechanism diagnostics")
+    required_diagnostics = {
+        "mean_probability_kl",
+        "mean_logit_mse",
+        "final_coefficient",
+        "diagnostic_updates",
+        "ntk_threshold_rank",
+        "ntk_off_diagonal_abs_mean",
+        "ntk_diagonal_mean",
+        "ntk_examples",
+    }
+    if set(diagnostics) != required_diagnostics:
+        raise ValueError("C-CHAIN mechanism diagnostics have unexpected or missing fields")
+    config = result.config
+    observations = config.n_tasks * config.task_length
+    active_updates = max(observations - int(spec.hyperparameters["snapshot_warmup_updates"]), 0)
+    ntk_examples = int(diagnostics["ntk_examples"])
+    parameter_count = (
+        config.input_dim * config.hidden1
+        + config.hidden1
+        + config.hidden1 * config.hidden2
+        + config.hidden2
+        + config.hidden2 * config.n_classes
+        + config.n_classes
+    )
+    persistent_scalars = (
+        4 * parameter_count
+        + 5 * 6
+        + int(spec.hyperparameters["reference_capacity"]) * config.input_dim
+        + 2 * int(spec.hyperparameters["coefficient_window"])
+        + 9
+    )
+    ntk_rows = ntk_examples * config.n_classes
+    task_model_queries = 2 * observations
+    churn_model_queries = 2 * active_updates
+    ntk_model_queries = ntk_examples
+    payload: dict[str, object] = {
+        "schema": CCHAIN_RESULT_SCHEMA,
+        "comparison_id": CCHAIN_COMPARISON_ID,
+        "paper_revision": CCHAIN_PAPER_REVISION,
+        "official_commit": CCHAIN_OFFICIAL_COMMIT,
+        "adaptation_id": CCHAIN_ADAPTATION_ID,
+        "comparability_gaps": list(CCHAIN_COMPARABILITY_GAPS),
+        "arm": result.config_name,
+        "seed": result.seed,
+        "development_seed_protocol": list(CCHAIN_DEVELOPMENT_SEEDS),
+        "n_tasks": config.n_tasks,
+        "task_length": config.task_length,
+        "input_dim": config.input_dim,
+        "hidden1": config.hidden1,
+        "hidden2": config.hidden2,
+        "n_classes": config.n_classes,
+        "observations": observations,
+        "updates": observations,
+        "allowed_boundary_information": [],
+        "allowed_task_information": ["current_example_label"],
+        "hyperparameters": dict(spec.hyperparameters),
+        "metrics": {
+            "mean_online_accuracy": float(np.mean(result.per_task_accuracy)),
+            "mean_loss": float(np.mean(result.per_task_loss)),
+            "mean_plasticity": float(np.mean(result.per_task_plasticity)),
+            **diagnostics,
+        },
+        "resources": {
+            "persistent_bytes": 4 * persistent_scalars,
+            "ntk_jacobian_envelope_bytes": 2 * ntk_rows * parameter_count * 4,
+            "environment_steps": 0,
+            "data_steps": observations,
+            "optimizer_updates": observations,
+            "task_model_queries": task_model_queries,
+            "churn_reference_updates": active_updates,
+            "churn_model_queries": churn_model_queries,
+            "ntk_model_queries": ntk_model_queries,
+            "model_queries": (
+                task_model_queries + churn_model_queries + ntk_model_queries
+            ),
+            "timing_seconds": float(result.wall_clock_seconds),
+            "timing_is_telemetry_only": True,
+        },
+        "outcome": outcome,
+        "outcome_retained": True,
+        "development_only": True,
+        "scientific_promotion_allowed": False,
+    }
+    return validate_cchain_development_result(payload)
+
+
+def replay_frozen_development_result_payload(
+    result: ScreeningRunResult, *, outcome: str
+) -> dict[str, object]:
+    """Build one strict replay/frozen-feature development receipt."""
+    spec = screening_spec(result.config_name)
+    if spec.mechanism not in {"replay_in_context", "frozen_feature_ceiling"}:
+        raise ValueError("result is not a registered replay/frozen-feature arm")
+    if result.noise_mode != "step" or result.hyperparameters != spec.hyperparameters:
+        raise ValueError("replay/frozen receipt requires exact-step registered settings")
+    family = (
+        "replay"
+        if spec.mechanism == "replay_in_context"
+        else {
+            "randumb_random_features": "randumb",
+            "ranpac_random_projection": "ranpac",
+            "prol_prompt_mechanism_off": "prol",
+            "prol_prompt_proxy": "prol",
+        }[result.config_name]
+    )
+    config = result.config
+    observations = config.n_tasks * config.task_length
+    resources = expected_resources_for_result(
+        family,
+        observations,
+        config.input_dim,
+        config.hidden1,
+        config.hidden2,
+        config.n_classes,
+    )
+    payload: dict[str, object] = {
+        "schema": REPLAY_FROZEN_RESULT_SCHEMA,
+        "comparison_id": REPLAY_FROZEN_COMPARISON_ID,
+        "paper_revisions": [
+            REPLAY_PAPER_REVISION,
+            RANDUMB_PAPER_REVISION,
+            RANPAC_PAPER_REVISION,
+            PROL_PAPER_REVISION,
+        ],
+        "official_commits": [
+            REPLAY_OFFICIAL_CODE,
+            RANDUMB_COMMIT,
+            RANPAC_COMMIT,
+            PROL_COMMIT,
+        ],
+        "protocol_gaps": list(REPLAY_FROZEN_PROTOCOL_GAPS),
+        "arm": result.config_name,
+        "family": family,
+        "seed": result.seed,
+        "n_tasks": config.n_tasks,
+        "task_length": config.task_length,
+        "input_dim": config.input_dim,
+        "hidden1": config.hidden1,
+        "hidden2": config.hidden2,
+        "n_classes": config.n_classes,
+        "observations": observations,
+        "allowed_boundary_information": [],
+        "allowed_task_information": ["current_example_label"],
+        "hyperparameters": dict(spec.hyperparameters),
+        "metrics": {
+            "mean_online_accuracy": float(np.mean(result.per_task_accuracy)),
+            "mean_loss": float(np.mean(result.per_task_loss)),
+            "mean_plasticity": float(np.mean(result.per_task_plasticity)),
+        },
+        "resources": {
+            **resources,
+            "timing_seconds": float(result.wall_clock_seconds),
+            "timing_is_telemetry_only": True,
+        },
+        "outcome": outcome,
+        "negative_outcome_retained": True,
+        "development_only": True,
+        "scientific_promotion_allowed": False,
+    }
+    return validate_replay_frozen_result(payload)
+
+
+def noise_curvature_development_result_payload(
+    result: ScreeningRunResult, *, outcome: str
+) -> dict[str, object]:
+    """Build and strictly validate one nonpromoting scheduler receipt."""
+
+    spec = screening_spec(result.config_name)
+    if spec.mechanism != "noise_curvature_scheduler" or result.noise_mode != "step":
+        raise ValueError(
+            "a noise-curvature receipt requires an exact-step registered scheduler arm"
+        )
+    if result.hyperparameters != spec.hyperparameters:
+        raise ValueError("result hyperparameters drift from the registered scheduler arm")
+    config = result.config
+    observations = config.n_tasks * config.task_length
+    interval = int(spec.hyperparameters["control_interval"])
+    power_iterations = int(spec.hyperparameters["power_iterations"])
+    if config.task_length % interval:
+        raise ValueError("task_length must be divisible by control_interval")
+    controller_events = observations // interval
+    first_order_queries = observations + controller_events * interval
+    loss_queries = observations
+    hvp_queries = controller_events * 3 * power_iterations
+    persistent_bytes = noise_curvature_persistent_bytes(
+        parameter_count=config.parameter_count,
+        input_dim=config.input_dim,
+        control_interval=interval,
+    )
+    payload: dict[str, object] = {
+        "schema": NOISE_CURVATURE_RESULT_SCHEMA,
+        "comparison_id": NOISE_CURVATURE_COMPARISON_ID,
+        "paper_revision": NOISE_CURVATURE_PAPER_REVISION,
+        "official_code_status": NOISE_CURVATURE_OFFICIAL_CODE_STATUS,
+        "protocol_differences": list(NOISE_CURVATURE_PROTOCOL_DIFFERENCES),
+        "live_control": NOISE_CURVATURE_LIVE_CONTROL,
+        "arm": result.config_name,
+        "seed": result.seed,
+        "development_seed_protocol": list(NOISE_CURVATURE_DEVELOPMENT_SEEDS),
+        "n_tasks": config.n_tasks,
+        "task_length": config.task_length,
+        "input_dim": config.input_dim,
+        "hidden1": config.hidden1,
+        "hidden2": config.hidden2,
+        "n_classes": config.n_classes,
+        "observations": observations,
+        "updates": observations,
+        "allowed_boundary_information": [],
+        "allowed_task_information": ["current_example_label"],
+        "hyperparameters": dict(spec.hyperparameters),
+        "metrics": {
+            "mean_online_accuracy": float(np.mean(result.per_task_accuracy)),
+            "mean_loss": float(np.mean(result.per_task_loss)),
+            "mean_plasticity": float(np.mean(result.per_task_plasticity)),
+        },
+        "resources": {
+            "persistent_bytes": persistent_bytes,
+            "environment_steps": 0,
+            "data_steps": observations,
+            "model_queries": first_order_queries + loss_queries + hvp_queries,
+            "first_order_gradient_queries": first_order_queries,
+            "loss_only_queries": loss_queries,
+            "hessian_vector_product_queries": hvp_queries,
+            "controller_events": controller_events,
+            "timing_seconds": float(result.wall_clock_seconds),
+            "timing_is_telemetry_only": True,
+        },
+        "outcome": outcome,
+        "outcome_retained": True,
+        "development_only": True,
+        "scientific_promotion_allowed": False,
+    }
+    return validate_noise_curvature_development_result(payload)
 
 
 def run_screening_config(
@@ -9074,6 +10378,8 @@ def run_screening_config(
     progress_every: int | None = None,
     noise_mode: str = "step",
     noise_pool_steps: int = 64,
+    *,
+    _task_observer: Callable[[int, Mapping[str, Array], Any], None] | None = None,
 ) -> ScreeningRunResult:
     """Run one screening configuration for one seed.
 
@@ -9095,6 +10401,8 @@ def run_screening_config(
         type(progress_every) is not int or progress_every <= 0
     ):
         raise ValueError("progress_every must be a positive integer or None")
+    if _task_observer is not None and type(_task_observer) is not FunctionType:
+        raise TypeError("_task_observer must be an exact Python function or None")
     resolved_seed = require_jax_seed(seed, name="seed")
     noise_mode = _validated_screening_noise_mode(noise_mode, spec)
     if spec.mechanism == "l2_effective_rank":
@@ -9110,6 +10418,15 @@ def run_screening_config(
             raise ValueError("Intentional Updates model-query budget exceeds signed int32")
         if persistent_bytes > _INTENTIONAL_MAX_PERSISTENT_BYTES:
             raise ValueError("Intentional Updates persistent state exceeds 256 MiB")
+    if spec.name.startswith("bounded_") and config.task_length != 5000:
+        raise ValueError("bounded structure arms require the registered task_length=5000")
+    if spec.mechanism == "noise_curvature_scheduler":
+        interval = int(spec.hyperparameters["control_interval"])
+        if config.task_length % interval:
+            raise ValueError(
+                "noise-curvature scheduling requires task_length divisible by "
+                "control_interval"
+            )
     effective_noise_pool_steps = _validated_screening_noise_pool_steps(
         noise_mode,
         noise_pool_steps if noise_mode == "pool" else None,
@@ -9125,7 +10442,12 @@ def run_screening_config(
     data_y = jnp.asarray(resolved_y, dtype=jnp.int32)
     n_train = int(data_x.shape[0])
 
-    init_fn, step_fn = spec.factory(spec.hyperparameters)
+    if spec.mechanism == "noise_curvature_scheduler":
+        init_fn, step_fn = _make_noise_curvature_learner(
+            spec.hyperparameters, total_steps=config.n_steps
+        )
+    else:
+        init_fn, step_fn = spec.factory(spec.hyperparameters)
 
     root = jr.key(jnp.uint32(resolved_seed))
     key_init, key_schedule, key_noise = jr.split(root, 3)
@@ -9217,9 +10539,21 @@ def run_screening_config(
         if spec.mechanism == "l2_effective_rank":
             if type(state) is not L2ERState or not bool(state.transaction_valid):
                 raise RuntimeError("L2-ER update transaction became invalid")
+        if spec.mechanism == "noise_curvature_scheduler":
+            if not isinstance(state, NoiseCurvatureState):
+                raise RuntimeError("noise-curvature learner returned an invalid state")
+            failures = int(jax.device_get(state.diagnostic_failures))
+            if failures:
+                raise RuntimeError(
+                    "noise-curvature diagnostics became non-finite; refusing a result"
+                )
         task_accuracy.append(float(jnp.mean(accuracies)))
         task_loss.append(float(jnp.mean(losses)))
         task_plasticity.append(float(jnp.mean(plasticities)))
+        if _task_observer is not None:
+            # Diagnostics are deliberately downstream of the complete task update.  The
+            # learner never receives this task boundary or anything returned by the observer.
+            _task_observer(task, MappingProxyType(dict(params)), state)
         if progress_every is not None and (task + 1) % progress_every == 0:
             elapsed = time.monotonic() - started
             logger.info(
@@ -9231,6 +10565,11 @@ def run_screening_config(
                 task_accuracy[-1],
                 elapsed,
             )
+    mechanism_diagnostics = (
+        cchain_host_diagnostics(params, state)
+        if type(state) is CChainState
+        else None
+    )
     return ScreeningRunResult(
         config_name=spec.name,
         base_learner=spec.base_learner,
@@ -9243,6 +10582,7 @@ def run_screening_config(
         wall_clock_seconds=time.monotonic() - started,
         noise_mode=noise_mode,
         noise_pool_steps=effective_noise_pool_steps,
+        mechanism_diagnostics=mechanism_diagnostics,
     )
 
 
@@ -9278,6 +10618,7 @@ _V2_SHARD_FIELDS = frozenset(
         "environment",
     }
 )
+_V2_MECHANISM_SHARD_FIELDS = _V2_SHARD_FIELDS | frozenset({"mechanism_receipt"})
 
 
 def _require_exact_keys(
@@ -9676,6 +11017,33 @@ def shard_payload(
         "dataset_provenance": dataset_binding,
         "environment": runtime_binding,
     }
+    if spec.mechanism in {
+        "c_chain",
+        "replay_in_context",
+        "frozen_feature_ceiling",
+    }:
+        persisted_result = replace(
+            result,
+            per_task_accuracy=np.asarray(payload["per_task_accuracy"], dtype=np.float64),
+            per_task_loss=np.asarray(payload["per_task_loss"], dtype=np.float64),
+            per_task_plasticity=np.asarray(
+                payload["per_task_plasticity"], dtype=np.float64
+            ),
+            wall_clock_seconds=cast(float, payload["wall_clock_seconds"]),
+        )
+        payload["mechanism_receipt"] = (
+            cchain_development_result_payload(
+                persisted_result, outcome="inconclusive"
+            )
+            if spec.mechanism == "c_chain"
+            else replay_frozen_development_result_payload(
+                persisted_result, outcome="inconclusive"
+            )
+        )
+    elif result.mechanism_diagnostics is not None:
+        raise ValueError(
+            "only a registered mechanism lane may persist mechanism diagnostics"
+        )
     try:
         json.dumps(payload, allow_nan=False)
     except (TypeError, ValueError) as exc:
@@ -9698,7 +11066,16 @@ def load_shard(
         )
     is_v2 = schema == SHARD_SCHEMA
     if is_v2:
-        _require_exact_keys(payload, _V2_SHARD_FIELDS, context=str(path))
+        config_name_value = payload.get("config_name")
+        expected_fields = (
+            _V2_MECHANISM_SHARD_FIELDS
+            if type(config_name_value) is str
+            and config_name_value in SCREENING_REGISTRY
+            and SCREENING_REGISTRY[config_name_value].mechanism
+            in {"c_chain", "replay_in_context", "frozen_feature_ceiling"}
+            else _V2_SHARD_FIELDS
+        )
+        _require_exact_keys(payload, expected_fields, context=str(path))
         payload["evidence_policy"] = _validated_nonpromoting_policy(
             payload["evidence_policy"], context=str(path)
         )
@@ -9771,6 +11148,81 @@ def load_shard(
         payload["hyperparameters"] = _validated_registered_hyperparameters(
             payload.get("hyperparameters"), spec, context=str(path)
         )
+        if spec.mechanism == "c_chain":
+            receipt = validate_cchain_development_result(payload["mechanism_receipt"])
+            expected_axes = {
+                "arm": config_name,
+                "seed": payload["seed"],
+                "n_tasks": config.n_tasks,
+                "task_length": config.task_length,
+                "input_dim": config.input_dim,
+                "hidden1": config.hidden1,
+                "hidden2": config.hidden2,
+                "n_classes": config.n_classes,
+                "hyperparameters": payload["hyperparameters"],
+            }
+            if any(receipt[name] != expected for name, expected in expected_axes.items()):
+                raise ValueError(f"{path}: C-CHAIN receipt drifts from its enclosing shard")
+            if receipt["outcome"] != "inconclusive":
+                raise ValueError(
+                    f"{path}: a single C-CHAIN shard must remain outcome-inconclusive"
+                )
+            receipt_metrics = cast(Mapping[str, float], receipt["metrics"])
+            expected_metrics = {
+                "mean_online_accuracy": float(np.mean(payload["per_task_accuracy"])),
+                "mean_loss": float(np.mean(payload["per_task_loss"])),
+                "mean_plasticity": float(np.mean(payload["per_task_plasticity"])),
+            }
+            if any(
+                receipt_metrics[name] != expected
+                for name, expected in expected_metrics.items()
+            ):
+                raise ValueError(
+                    f"{path}: C-CHAIN receipt metrics drift from persisted shard curves"
+                )
+            receipt_resources = cast(Mapping[str, object], receipt["resources"])
+            if receipt_resources["timing_seconds"] != payload["wall_clock_seconds"]:
+                raise ValueError(
+                    f"{path}: C-CHAIN receipt timing drifts from its enclosing shard"
+                )
+            payload["mechanism_receipt"] = receipt
+        elif spec.mechanism in {"replay_in_context", "frozen_feature_ceiling"}:
+            receipt = validate_replay_frozen_result(payload["mechanism_receipt"])
+            expected_axes = {
+                "arm": config_name,
+                "seed": payload["seed"],
+                "n_tasks": config.n_tasks,
+                "task_length": config.task_length,
+                "input_dim": config.input_dim,
+                "hidden1": config.hidden1,
+                "hidden2": config.hidden2,
+                "n_classes": config.n_classes,
+                "hyperparameters": payload["hyperparameters"],
+            }
+            if any(receipt[name] != expected for name, expected in expected_axes.items()):
+                raise ValueError(
+                    f"{path}: replay/frozen receipt drifts from its enclosing shard"
+                )
+            if receipt["outcome"] != "inconclusive":
+                raise ValueError(
+                    f"{path}: a single replay/frozen shard must remain outcome-inconclusive"
+                )
+            receipt_metrics = cast(Mapping[str, float], receipt["metrics"])
+            expected_metrics = {
+                "mean_online_accuracy": float(np.mean(payload["per_task_accuracy"])),
+                "mean_loss": float(np.mean(payload["per_task_loss"])),
+                "mean_plasticity": float(np.mean(payload["per_task_plasticity"])),
+            }
+            if receipt_metrics != expected_metrics:
+                raise ValueError(
+                    f"{path}: replay/frozen receipt metrics drift from shard curves"
+                )
+            receipt_resources = cast(Mapping[str, object], receipt["resources"])
+            if receipt_resources["timing_seconds"] != payload["wall_clock_seconds"]:
+                raise ValueError(
+                    f"{path}: replay/frozen receipt timing drifts from its shard"
+                )
+            payload["mechanism_receipt"] = receipt
     noise_mode = _validated_screening_noise_mode(
         payload.get("noise_mode", "step"), spec, context=path
     )

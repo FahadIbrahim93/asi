@@ -1,0 +1,100 @@
+{
+  "schema": "asi.new_directions.v5_model_side.amendment.v1",
+  "subject": {
+    "original_commit": "cd0bb80a641b5a92871f7d6073693f61516964dc",
+    "raw_json": {
+      "path": "outputs/new_directions/V5_model_side.json",
+      "sha256": "d42a49bc7d5c696bc310c4864c4fc37c1edd56c4097dfd0ab6bcbca9b393351d",
+      "size_bytes": 90159
+    },
+    "raw_report": {
+      "path": "outputs/new_directions/V5_model_side.md",
+      "sha256": "349e4bd6710f5cbfb097fdc054448d0bfb924d6687fbdc31f70daec3c66afd09",
+      "size_bytes": 5858
+    },
+    "raw_runner": {
+      "path": "outputs/new_directions/V5_model_side_runner.py",
+      "sha256": "6573d26f9246c5f57b76b15fcceac44ac141180a1d2a579d92c05688bdb130f9",
+      "size_bytes": 19054
+    }
+  },
+  "identity": {
+    "source": {
+      "base_commit": "cc877f78566675214e2f356bd797f0f3c5ec1bb0",
+      "runner_sha256": "6573d26f9246c5f57b76b15fcceac44ac141180a1d2a579d92c05688bdb130f9",
+      "upgd_ipmnist_sha256": "071d54c2a119fba72b7be79f4ea46cade53beb0202e0c80efcb6e3875fb00975",
+      "ipmnist_screening_sha256": "7222ee11175f352fb4233c0412888e94e0e15bef138f65307b38f143ad7baf76",
+      "binding_scope": "historical-content-consistency-not-execution-attestation"
+    },
+    "runtime": {
+      "status": "reported-in-retained-report-not-machine-attested",
+      "python": "3.12.14",
+      "jax": "0.11.0",
+      "numpy": "2.5.2",
+      "backend": "cpu",
+      "network": "isolated-container"
+    },
+    "dependencies": {
+      "jax": "0.11.0",
+      "numpy": "2.5.2",
+      "scipy": "version-not-recorded",
+      "scikit-learn": "version-not-recorded",
+      "complete_lock_identity": false
+    },
+    "dataset": {
+      "identifier": "OpenML mnist_784 version 1, train split through load_mnist_train",
+      "canonical_cache_reference_sha256": "fe4410d8dbb50f6db6482b187557c5cb8bccfbcec74eeb6abc47c858f4ffab78",
+      "original_cache_content_sha256_recorded": false,
+      "binding_scope": "canonical-post-hoc-reference-only-not-original-cache-attestation"
+    },
+    "invocation": {
+      "template": [
+        "python",
+        "outputs/new_directions/V5_model_side_runner.py",
+        "--data-home",
+        "<openml-cache>",
+        "--out",
+        "outputs/new_directions/V5_model_side.json"
+      ],
+      "exact_original_argv_available": false,
+      "default_seeds": [0, 1, 2],
+      "default_boundaries": [0, 1, 2]
+    }
+  },
+  "protocol": {
+    "seeds": [0, 1, 2],
+    "boundaries": [0, 1, 2],
+    "sample_checkpoints": [50, 200, 500, 2000],
+    "arms": ["F5a_weight_path", "F5b_gradient_affinity", "F5c_v1_data_side"],
+    "solvers": ["hungarian", "greedy"],
+    "failed_control_action": "abort-before-online-cells",
+    "maintained_decision": "development-screen-only-no-promotion-field"
+  },
+  "policy": {
+    "development_only": true,
+    "negative_outcomes_retained": true,
+    "scientific_promotion_allowed": false,
+    "status": "permanently-nonpromoting-development-audit"
+  },
+  "audit": {
+    "original_execution_deviation": "both model-side arms failed the preregistered control gate, but the raw runner continued through 216 online cells instead of aborting",
+    "failed_model_arms": ["F5a_weight_path", "F5b_gradient_affinity"],
+    "raw_online_cell_count": 216,
+    "valid_online_cell_count": 0,
+    "raw_auto_promotion_field_ignored": true,
+    "independent_aggregate_recomputation": "matched-24-of-24",
+    "dataset_binding_limitation": "the original cache bytes and exact argv were not recorded, so the canonical MNIST cache digest is only a post-hoc reference"
+  },
+  "outcome": {
+    "status": "invalid-preregistered-execution",
+    "scientific_claim_allowed": false,
+    "model_side_online_rows": "void",
+    "all_online_rows_under_literal_preregistration": "void-because-the-run-should-have-aborted",
+    "data_side_scope": "same-stack descriptive consistency check using the same MNIST, schedule, seeds, and a stronger hybrid batch estimator; not an independent replication",
+    "sample_floor_observation": 1978.504498810362,
+    "sample_floor_interpretation": "descriptive same-stack lower-bound consistency only",
+    "novel_permutation_scope": "the structural argument applies only to novel permutations",
+    "recurrence_scope": "not tested; repeat recognition can use stored whole-input signatures rather than per-pixel identification",
+    "entry_15_status": "open-model-side-family-untested"
+  }
+}

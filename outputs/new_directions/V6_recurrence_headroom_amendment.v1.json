@@ -1,0 +1,155 @@
+{
+  "schema": "asi.new_directions.v6_recurrence_headroom.amendment.v1",
+  "subject": {
+    "original_commit": "07034c49baad9ca9de07a602366ae0a4b5a9d948",
+    "raw_json": {
+      "path": "outputs/new_directions/V6_recurrence_headroom.json",
+      "sha256": "5235c8067561e07cd81b98dde2a25af783dc38abe094edfccf2593499547bf26",
+      "size_bytes": 6564
+    },
+    "raw_report": {
+      "path": "outputs/new_directions/V6_recurrence_headroom.md",
+      "sha256": "0abb02ce03e1f43082df59a266820fdff421d2c3ca8efd81e08d9d75366c3e84",
+      "size_bytes": 5132
+    },
+    "raw_runner": {
+      "path": "outputs/new_directions/V6_recurrence_headroom_runner.py",
+      "sha256": "237426a246851068c77689bce516b76e6ae036109a3e1ec01362ed12220a2f02",
+      "size_bytes": 6403
+    },
+    "bayes_source": {
+      "path": "outputs/micro_continual/ladder_m1/summary_input_permutation.json",
+      "sha256": "18148e29e1c40d30ae037274f6140d2b05366e7775c1ec94550b5451e311c038",
+      "size_bytes": 5564
+    }
+  },
+  "identity": {
+    "source": {
+      "base_commit": "cc877f78566675214e2f356bd797f0f3c5ec1bb0",
+      "runner_sha256": "237426a246851068c77689bce516b76e6ae036109a3e1ec01362ed12220a2f02",
+      "micro_continual_sha256": "e12c20c2590666ad8c683be9b04c55b631a2d014eb15100ae03117f3359623bc",
+      "binding_scope": "historical-content-consistency-not-execution-attestation"
+    },
+    "runtime": {
+      "status": "partly-reconstructed-from-retained-ladder-shards-and-report",
+      "python_reported_for_v6": "not-recorded",
+      "jax_retained_ladder": "0.11.0",
+      "numpy_retained_ladder": "2.5.1",
+      "platform_retained_ladder": "Linux-7.0.0-28-generic-x86_64-with-glibc2.39"
+    },
+    "dependencies": {
+      "jax": "0.11.0-in-retained-control-source",
+      "numpy": "2.5.1-in-retained-control-source",
+      "complete_v6_lock_identity": false
+    },
+    "dataset": {
+      "kind": "deterministic-synthetic-GaussianMicroStream",
+      "suite_version": "gauss-v1",
+      "config": {
+        "class_sparsity": 0.2,
+        "component_scale": 1.2,
+        "component_sparsity": 10,
+        "dim": 256,
+        "mean_separation": 0.4,
+        "n_classes": 10,
+        "n_components": 6,
+        "n_regimes": 100,
+        "noise_scale": 1.0,
+        "offset_scale": 1.0,
+        "recurrence_pool": 5,
+        "regime_length": 5000,
+        "scale_shift_max": 4.0,
+        "scale_shift_min": 0.25,
+        "spectrum_decades": 2.0
+      },
+      "family_axis": ["input_permutation", "recurrence"]
+    },
+    "invocation": {
+      "reconstructed_from_runner_defaults": [
+        "python",
+        "outputs/new_directions/V6_recurrence_headroom_runner.py",
+        "--out",
+        "outputs/new_directions/V6_recurrence_headroom.json"
+      ],
+      "exact_original_argv_available": false,
+      "default_seeds": [0, 1, 2]
+    }
+  },
+  "protocol": {
+    "seeds": [0, 1, 2],
+    "families": ["input_permutation", "recurrence"],
+    "arms": ["sgd_raw", "adamw", "upgd_raw", "sgd_norm", "gated_norm", "naive_bayes"],
+    "metric": "overall online accuracy",
+    "criterion": "mean paired gap greater than zero and every one of the three consumed-seed gaps positive",
+    "failed_control_action": "void-and-run-no-cells",
+    "controls_before_cells": "all exact seeds"
+  },
+  "policy": {
+    "development_only": true,
+    "negative_outcomes_retained": true,
+    "scientific_promotion_allowed": false,
+    "status": "permanently-nonpromoting-development-audit"
+  },
+  "controls": {
+    "family_separation": [
+      {
+        "seed": 0,
+        "input_permutation_distinct": 100,
+        "recurrence_distinct": 5,
+        "n_regimes": 100,
+        "recurrence_pool": 5,
+        "separated": true,
+        "schedule_sha256": "b9537292f050ffe81f6d72fe54dffbe455e9e6a45356122cab76d88f4f67939b"
+      },
+      {
+        "seed": 1,
+        "input_permutation_distinct": 100,
+        "recurrence_distinct": 5,
+        "n_regimes": 100,
+        "recurrence_pool": 5,
+        "separated": true,
+        "schedule_sha256": "6babe62ad5dce67586c34ced146bb63bb6c94936b1469a3e82cb64633b9c4774"
+      },
+      {
+        "seed": 2,
+        "input_permutation_distinct": 100,
+        "recurrence_distinct": 5,
+        "n_regimes": 100,
+        "recurrence_pool": 5,
+        "separated": true,
+        "schedule_sha256": "fb4509df7511710668559b25a6b5453a4a08de0fb34b642da24d218d94b98aaf"
+      }
+    ],
+    "bayes": {
+      "seeds": [0, 1, 2],
+      "n_samples": 200000,
+      "per_seed_bayes_accuracy": [0.98335, 0.98817, 0.981415],
+      "per_seed_mc_sem": [0.00028612, 0.00024176, 0.00030199],
+      "mean": 0.9843116666666667
+    }
+  },
+  "audit": {
+    "original_execution_deviation": "the original runner checked family separation for seed 0 only before executing 36 cells",
+    "controls_completed_for_all_seeds": true,
+    "family_controls_reconstructed_without_learner_execution": true,
+    "bayes_values_reused_from_bound_matching_default-config_summary": true,
+    "raw_run_count": 36,
+    "independent_all_arm_aggregate_recomputation": "matched-6-of-6",
+    "registered_all_arm_table_primary": true,
+    "post_hoc_7_9x_grouping": "not-retained-as-causal-or-primary",
+    "ipmnist_recurrence_scope": "the 200-task IPMNIST schedule contains no recurring permutation, so this result is not champion-lane headroom"
+  },
+  "outcome": {
+    "status": "amended-inconclusive-development-result",
+    "criterion_met_on_consumed_seeds": [0, 1, 2],
+    "arms_meeting_registered_criterion": ["sgd_raw", "adamw", "upgd_raw", "sgd_norm", "gated_norm", "naive_bayes"],
+    "claim_scope": "the registered descriptive criterion was met for all six arms on exactly three consumed development seeds",
+    "mechanism_claim": "none; a recurrence-family gain does not establish an explicit recurrence-indexing mechanism",
+    "matched_bayes_mean": 0.9843116666666667,
+    "best_m4_arm": "gated_norm",
+    "best_m4_mean": 0.738268,
+    "descriptive_bayes_minus_best_m4": 0.24604366666666666,
+    "scientific_claim_allowed": false,
+    "why_inconclusive": "complete original runtime/dependency/invocation identity was not recorded and the all-seed controls are an append-only reconstruction, not controls executed before the historical cells"
+  }
+}
