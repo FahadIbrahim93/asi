@@ -688,7 +688,7 @@ def run_stacked_horde_scan(
         ``(num_steps - 1, n_demons)``.
     """
     if type(horde) is not StackedLinearHorde:
-        raise TypeError("horde must be an actual StackedLinearHorde")
+        raise TypeError("horde must be an exact StackedLinearHorde")
     if type(state) is not StackedHordeState:
         raise TypeError("state must be an actual StackedHordeState")
 

@@ -207,7 +207,7 @@ class TestStackedHordeScanBounds:
         features = jnp.ones((5, 3), dtype=jnp.float32)
         sources = jnp.ones((5, 2), dtype=jnp.float32)
 
-        with pytest.raises(TypeError, match="horde must be an actual StackedLinearHorde"):
+        with pytest.raises(TypeError, match="horde must be an exact StackedLinearHorde"):
             run_stacked_horde_scan("not_a_horde", state, features, sources)  # type: ignore[arg-type]
 
         with pytest.raises(TypeError, match="state must be an actual StackedHordeState"):
