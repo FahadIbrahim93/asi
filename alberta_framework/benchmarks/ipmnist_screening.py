@@ -10369,6 +10369,12 @@ def noise_curvature_development_result_payload(
     return validate_noise_curvature_development_result(payload)
 
 
+def _screening_root_key(seed: int) -> Array:
+    """Return the explicit Threefry root shared by matched screening arms."""
+
+    return jr.key(jnp.uint32(seed), impl="threefry2x32")
+
+
 def run_screening_config(
     data_x: np.ndarray | Array,
     data_y: np.ndarray | Array,
@@ -10449,7 +10455,7 @@ def run_screening_config(
     else:
         init_fn, step_fn = spec.factory(spec.hyperparameters)
 
-    root = jr.key(jnp.uint32(resolved_seed))
+    root = _screening_root_key(resolved_seed)
     key_init, key_schedule, key_noise = jr.split(root, 3)
     params = init_mlp_params(key_init, config)
     schedule = build_schedule(key_schedule, config, n_train)

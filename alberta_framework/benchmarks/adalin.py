@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import platform
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -57,6 +58,22 @@ ADALIN_PROTOCOL = MappingProxyType(
 _MAX_ARRAY_ELEMENTS = 1_000_000
 _MAX_DATASET_ELEMENTS = 10_000_000
 _INT32_MAX = 2**31 - 1
+
+_COMPARISON_RESIDUAL_GAPS = (
+    "the pinned official commit contains no implementation or experiment config",
+    "the runner input is caller-supplied and does not bind official MNIST bytes "
+    "or the paper's unspecified sampled indices",
+    "the paper does not specify pixel/example permutation seeds or exact "
+    "dataloader order",
+    "one result is one consumed development seed rather than the paper's three "
+    "final evaluation seeds",
+    "ASI records whole-stream pre-update accuracy separately from the paper's "
+    "per-task train/test summaries",
+)
+_BOUNDARY_DIFFERENCE = (
+    "paper and this runner do not pass task identity or boundary events to the "
+    "learner; the runner uses boundaries only to transform/evaluate data"
+)
 
 
 def _trusted_float_array(value: object, *, name: str) -> Array:
@@ -181,6 +198,8 @@ class AdaLinConfig:
             raise ValueError("tasks cannot exceed the paper's 400-task horizon")
         if self.examples_per_task > 10_000:
             raise ValueError("examples_per_task cannot exceed the paper's 10000-example pool")
+        if self.classes < 2:
+            raise ValueError("classes must contain at least two labels")
         if self.epochs_per_task != 1:
             raise ValueError("this PMNIST lane supports the paper's one epoch per task")
         if self.examples_per_task % self.batch_size != 0:
@@ -253,7 +272,7 @@ def make_pmnist_schedule(config: AdaLinConfig, *, seed: int, input_dim: int) -> 
         raise ValueError("input_dim must be a positive bounded integer")
     if config.tasks * (input_dim + config.examples_per_task) > _MAX_DATASET_ELEMENTS:
         raise ValueError("schedule exceeds the 10000000-element allocation limit")
-    root = jr.key(resolved_seed)
+    root = jr.key(resolved_seed, impl="threefry2x32")
     pixel_root = jr.fold_in(root, 0x414441)
     example_root = jr.fold_in(root, 0x504D4E)
     pixels = jnp.stack(
@@ -294,7 +313,9 @@ def initialize_adalin_state(
     )
     if parameter_count > _MAX_DATASET_ELEMENTS:
         raise ValueError("model exceeds the 10000000-element allocation limit")
-    keys = jr.split(jr.fold_in(jr.key(seed), 0x494E49), 5)
+    keys = jr.split(
+        jr.fold_in(jr.key(seed, impl="threefry2x32"), 0x494E49), 5
+    )
     weight1 = jr.normal(keys[0], (input_dim, width1), dtype=jnp.float32) * math.sqrt(
         2.0 / input_dim
     )
@@ -472,10 +493,13 @@ def _require_dataset(
 
 
 def _hash_arrays(*arrays: np.ndarray) -> str:
-    digest = hashlib.sha256()
-    for array in arrays:
-        digest.update(str(array.dtype).encode())
-        digest.update(str(array.shape).encode())
+    digest = hashlib.sha256(b"asi-adalin-array-bundle-v1\0")
+    for index, array in enumerate(arrays):
+        digest.update(index.to_bytes(4, "little"))
+        digest.update(np.asarray(array.shape, dtype="<i8").tobytes())
+        dtype = array.dtype.str.encode("ascii")
+        digest.update(len(dtype).to_bytes(4, "little"))
+        digest.update(dtype)
         digest.update(array.tobytes(order="C"))
     return digest.hexdigest()
 
@@ -487,6 +511,23 @@ def _state_hash(state: AdaLinState) -> str:
 
 def _implementation_hash() -> str:
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def _runtime_identity() -> list[str]:
+    return [platform.python_version(), jax.__version__, np.__version__, jax.default_backend()]
+
+
+def _comparison_payload(config: AdaLinConfig) -> dict[str, object]:
+    return {
+        "paper_comparable": False,
+        "residual_gaps": list(_COMPARISON_RESIDUAL_GAPS),
+        "schedule_difference": (
+            "paper: 400x10000, batch16, one epoch; ASI campaign: 200x5000, "
+            f"batch1; this result uses {config.tasks}x{config.examples_per_task}, "
+            f"batch{config.batch_size}, one epoch"
+        ),
+        "boundary_difference": _BOUNDARY_DIFFERENCE,
+    }
 
 
 def _parameter_bytes(parameters: AdaLinParameters) -> int:
@@ -568,6 +609,7 @@ def run_adalin_development(
                 learning_rate=config.learning_rate,
                 mechanism_enabled=mechanism_enabled,
             )
+            model_forward_calls += 1
         task_online.append(task_correct / config.examples_per_task)
         test_correct, test_total = _accuracy(
             adalin_logits(
@@ -599,6 +641,12 @@ def run_adalin_development(
             "test_examples": int(test_x.shape[0]),
             "input_dim": int(train_x.shape[1]),
             "classes": config.classes,
+            "train_inputs_shape": [int(train_x.shape[0]), int(train_x.shape[1])],
+            "train_labels_shape": [int(train_y.shape[0])],
+            "test_inputs_shape": [int(test_x.shape[0]), int(test_x.shape[1])],
+            "test_labels_shape": [int(test_y.shape[0])],
+            "inputs_dtype": "float32",
+            "labels_dtype": "int32",
         },
         "provenance": {
             "paper": ADALIN_PAPER_URL,
@@ -609,6 +657,7 @@ def run_adalin_development(
             "schedule_sha256": schedule_hash,
             "initial_state_sha256": initial_hash,
             "final_state_sha256": _state_hash(state),
+            "runtime": _runtime_identity(),
         },
         "metrics": {
             "asi_whole_stream_preupdate_online_accuracy": online_correct / observations,
@@ -632,33 +681,18 @@ def run_adalin_development(
             "observations": observations,
             "label_queries": observations,
             "optimizer_updates": optimizer_updates,
-            "model_queries": observations + test_queries,
+            "preupdate_prediction_model_queries": observations,
+            "differentiated_training_model_queries": observations,
+            "postupdate_test_model_queries": test_queries,
+            "model_queries": 2 * observations + test_queries,
+            "preupdate_prediction_forward_calls": optimizer_updates,
+            "differentiated_training_forward_calls": optimizer_updates,
+            "postupdate_test_forward_calls": config.tasks,
             "model_forward_calls": model_forward_calls,
             "wall_clock_seconds_telemetry": wall_clock,
             "timing_qualified": False,
         },
-        "comparison": {
-            "paper_comparable": False,
-            "residual_gaps": [
-                "the pinned official commit contains no implementation or experiment config",
-                "the runner input is caller-supplied and does not bind official MNIST bytes "
-                "or the paper's unspecified sampled indices",
-                "the paper does not specify pixel/example permutation seeds or exact "
-                "dataloader order",
-                "one result is one consumed development seed rather than the paper's three "
-                "final evaluation seeds",
-                "ASI records whole-stream pre-update accuracy separately from the paper's "
-                "per-task train/test summaries",
-            ],
-            "schedule_difference": (
-                "paper: 400x10000, batch16, one epoch; ASI campaign: 200x5000, "
-                "batch1; this result uses its embedded config"
-            ),
-            "boundary_difference": (
-                "paper and this runner do not pass task identity or boundary events to the "
-                "learner; the runner uses boundaries only to transform/evaluate data"
-            ),
-        },
+        "comparison": _comparison_payload(config),
         "policy": {
             "status": "development-only-nonpromoting",
             "development_only": True,
@@ -769,7 +803,21 @@ def validate_adalin_result(value: object) -> None:
         raise ValueError("unexpected arm")
     dataset = _exact_dict(result["dataset"], "dataset")
     _require_keys(
-        dataset, {"sha256", "train_examples", "test_examples", "input_dim", "classes"}, "dataset"
+        dataset,
+        {
+            "sha256",
+            "train_examples",
+            "test_examples",
+            "input_dim",
+            "classes",
+            "train_inputs_shape",
+            "train_labels_shape",
+            "test_inputs_shape",
+            "test_labels_shape",
+            "inputs_dtype",
+            "labels_dtype",
+        },
+        "dataset",
     )
     for field in ("train_examples", "test_examples", "input_dim", "classes"):
         if type(dataset[field]) is not int or cast(int, dataset[field]) < 1:
@@ -777,8 +825,33 @@ def validate_adalin_result(value: object) -> None:
     if (
         dataset["train_examples"] != config.examples_per_task
         or dataset["classes"] != config.classes
+        or dataset["train_examples"] * cast(int, dataset["input_dim"])
+        > _MAX_DATASET_ELEMENTS
+        or cast(int, dataset["test_examples"]) * cast(int, dataset["input_dim"])
+        > _MAX_DATASET_ELEMENTS
+        or config.tasks
+        * (cast(int, dataset["input_dim"]) + config.examples_per_task)
+        > _MAX_DATASET_ELEMENTS
     ):
         raise ValueError("dataset metadata disagrees with config")
+    expected_shapes: dict[str, object] = {
+        "train_inputs_shape": [dataset["train_examples"], dataset["input_dim"]],
+        "train_labels_shape": [dataset["train_examples"]],
+        "test_inputs_shape": [dataset["test_examples"], dataset["input_dim"]],
+        "test_labels_shape": [dataset["test_examples"]],
+        "inputs_dtype": "float32",
+        "labels_dtype": "int32",
+    }
+    for field, expected in expected_shapes.items():
+        if type(dataset[field]) is not type(expected) or dataset[field] != expected:
+            raise ValueError(f"dataset metadata field {field} is not canonical")
+    dataset_digest = dataset["sha256"]
+    if (
+        type(dataset_digest) is not str
+        or len(dataset_digest) != 64
+        or any(character not in "0123456789abcdef" for character in dataset_digest)
+    ):
+        raise ValueError("dataset.sha256 must be a lowercase SHA-256 digest")
     provenance = _exact_dict(result["provenance"], "provenance")
     _require_keys(
         provenance,
@@ -791,6 +864,7 @@ def validate_adalin_result(value: object) -> None:
             "schedule_sha256",
             "initial_state_sha256",
             "final_state_sha256",
+            "runtime",
         },
         "provenance",
     )
@@ -804,6 +878,8 @@ def validate_adalin_result(value: object) -> None:
     for field, expected in expected_literals.items():
         if type(provenance[field]) is not str or provenance[field] != expected:
             raise ValueError(f"provenance.{field} does not match current source")
+    if provenance["runtime"] != _runtime_identity():
+        raise ValueError("provenance.runtime does not match the current runtime")
     for field in (
         "schedule_sha256",
         "initial_state_sha256",
@@ -825,7 +901,13 @@ def validate_adalin_result(value: object) -> None:
             "observations",
             "label_queries",
             "optimizer_updates",
+            "preupdate_prediction_model_queries",
+            "differentiated_training_model_queries",
+            "postupdate_test_model_queries",
             "model_queries",
+            "preupdate_prediction_forward_calls",
+            "differentiated_training_forward_calls",
+            "postupdate_test_forward_calls",
             "model_forward_calls",
             "wall_clock_seconds_telemetry",
             "timing_qualified",
@@ -839,8 +921,14 @@ def validate_adalin_result(value: object) -> None:
         "observations": observations,
         "label_queries": observations,
         "optimizer_updates": updates,
-        "model_queries": observations + config.tasks * cast(int, dataset["test_examples"]),
-        "model_forward_calls": updates + config.tasks,
+        "preupdate_prediction_model_queries": observations,
+        "differentiated_training_model_queries": observations,
+        "postupdate_test_model_queries": config.tasks * cast(int, dataset["test_examples"]),
+        "model_queries": 2 * observations + config.tasks * cast(int, dataset["test_examples"]),
+        "preupdate_prediction_forward_calls": updates,
+        "differentiated_training_forward_calls": updates,
+        "postupdate_test_forward_calls": config.tasks,
+        "model_forward_calls": 2 * updates + config.tasks,
         "timing_qualified": False,
     }
     for resource_field, resource_expected in expected_resources.items():
@@ -889,6 +977,8 @@ def validate_adalin_result(value: object) -> None:
         + width2 * config.classes
         + config.classes
     )
+    if parameter_scalars > _MAX_DATASET_ELEMENTS:
+        raise ValueError("dataset metadata and config exceed the executable model bound")
     if state["parameter_bytes"] != parameter_scalars * 4:
         raise ValueError("parameter bytes disagree with the configured float32 model")
     if state["alpha_bytes"] != (width1 + width2) * 4:
@@ -948,12 +1038,8 @@ def validate_adalin_result(value: object) -> None:
         {"paper_comparable", "residual_gaps", "schedule_difference", "boundary_difference"},
         "comparison",
     )
-    if (
-        comparison["paper_comparable"] is not False
-        or type(comparison["residual_gaps"]) is not list
-        or len(cast(list[object], comparison["residual_gaps"])) < 1
-    ):
-        raise ValueError("paper comparison must fail closed with explicit gaps")
+    if comparison != _comparison_payload(config):
+        raise ValueError("paper comparison must match the exact current comparison declaration")
     policy = _exact_dict(result["policy"], "policy")
     if policy != {
         "status": "development-only-nonpromoting",

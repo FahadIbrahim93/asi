@@ -73,7 +73,7 @@ class FrozenFeatureState:
 
 def _key_from_params(params: dict[str, Array], domain: int) -> Array:
     bits = jax.lax.bitcast_convert_type(params["w1"].reshape(-1), jnp.uint32)
-    key = jr.fold_in(jr.key(jnp.uint32(domain)), bits[0])
+    key = jr.fold_in(jr.key(jnp.uint32(domain), impl="threefry2x32"), bits[0])
     return jr.fold_in(key, bits[-1])
 
 
@@ -183,7 +183,12 @@ def make_replay_context_learner(
             name: task_gradient[name] + hp["replay_weight"] * replay_gradient[name]
             for name in _PARAM_KEYS
         }
-        update = adam_step(params, state.optimizer_state, combined, jr.key(0))
+        update = adam_step(
+            params,
+            state.optimizer_state,
+            combined,
+            jr.key(0, impl="threefry2x32"),
+        )
         if type(update) is not LearnerUpdateResult:
             raise TypeError("matched Adam returned an unsupported update")
         candidate_examples = state.examples.at[safe_cursor].set(x)

@@ -109,6 +109,25 @@ def test_charged_mechanism_off_is_end_to_end_exact_adam_control() -> None:
     assert np.array_equal(off.per_task_plasticity, control.per_task_plasticity)
 
 
+def test_replay_frozen_runner_is_ambient_prng_invariant() -> None:
+    x, y = _data()
+    prior = str(jax.config.jax_default_prng_impl)
+    try:
+        jax.config.update("jax_default_prng_impl", "threefry2x32")
+        threefry = run_screening_config(
+            x, y, screening_spec("ranpac_random_projection"), 3, _config()
+        )
+        jax.config.update("jax_default_prng_impl", "rbg")
+        rbg = run_screening_config(
+            x, y, screening_spec("ranpac_random_projection"), 3, _config()
+        )
+    finally:
+        jax.config.update("jax_default_prng_impl", prior)
+    assert np.array_equal(threefry.per_task_accuracy, rbg.per_task_accuracy)
+    assert np.array_equal(threefry.per_task_loss, rbg.per_task_loss)
+    assert np.array_equal(threefry.per_task_plasticity, rbg.per_task_plasticity)
+
+
 def test_active_replay_step_has_eager_jit_parity() -> None:
     params = init_mlp_params(jr.key(4), _config())
     spec = screening_spec("replay_context_full")

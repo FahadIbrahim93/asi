@@ -4,6 +4,7 @@ import copy
 import json
 import subprocess
 import sys
+from pathlib import Path
 from typing import Any
 
 import jax
@@ -19,6 +20,8 @@ from alberta_framework.benchmarks.telapa_qualification import (
     TeLAPASmokeConfig,
     _bounded_json_bytes,
     _preflight_json_tree,
+    load_local_comparator_result,
+    retain_local_comparator_result,
     rollout_latent_descriptor,
     run_smoke,
     validate_result,
@@ -42,6 +45,28 @@ def test_catalog_fails_closed_without_immutable_anonymous_revision() -> None:
         TeLAPACatalogEntry(immutable_external_source_established=True).validate()
 
 
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    (
+        ("paper_mechanism", "forged mechanism"),
+        ("development_adapter", "forged adapter"),
+        ("protocol_differences", ("a", "b", "c", "d", "e")),
+        ("paper_metrics", ("a", "b", "c", "d")),
+        ("timing_policy", "decision_axis"),
+        ("promotion_policy", "promoting"),
+    ),
+)
+def test_catalog_rejects_same_shape_semantic_forgery(field: str, replacement: object) -> None:
+    values = {field: replacement}
+    with pytest.raises(ValueError, match="catalog|protocol|timing|nonpromoting"):
+        TeLAPACatalogEntry(**values).validate()  # type: ignore[arg-type]
+
+    payload = _result()
+    payload["catalog"][field] = list(replacement) if type(replacement) is tuple else replacement
+    with pytest.raises(ValueError, match="catalog|protocol|timing|nonpromoting"):
+        validate_result(payload)
+
+
 def test_latent_descriptor_is_jittable_and_deterministic() -> None:
     observations = jnp.asarray([[1.0, 0.0], [0.0, 1.0]], dtype=jnp.float32)
     actions = jnp.asarray([1, 0], dtype=jnp.int32)
@@ -55,17 +80,47 @@ def test_latent_descriptor_is_jittable_and_deterministic() -> None:
 def test_current_life_adapter_is_deterministic_for_the_same_key() -> None:
     first = SwitchingPolicyLifeAdapter(phase_length=2, learning_rate=0.125)
     second = SwitchingPolicyLifeAdapter(phase_length=2, learning_rate=0.125)
-    first_state, first_policy = first.init(jax.random.key(7))
-    second_state, second_policy = second.init(jax.random.key(7))
-    first_step = first.step(first_state, first_policy, key=jax.random.key(8))
-    second_step = second.step(second_state, second_policy, key=jax.random.key(8))
+    first_state, first_policy = first.init(jax.random.key(7, impl="threefry2x32"))
+    second_state, second_policy = second.init(jax.random.key(7, impl="threefry2x32"))
+    first_step = first.step(
+        first_state, first_policy, key=jax.random.key(8, impl="threefry2x32")
+    )
+    second_step = second.step(
+        second_state, second_policy, key=jax.random.key(8, impl="threefry2x32")
+    )
     np.testing.assert_array_equal(first_step[1], second_step[1])
     np.testing.assert_array_equal(first_step[2], second_step[2])
     assert first_step[3:] == second_step[3:]
     with pytest.raises(ValueError, match="learning_rate"):
         SwitchingPolicyLifeAdapter(phase_length=2, learning_rate=True)
     with pytest.raises(ValueError, match="live policy"):
-        first.step(first_state, np.ones((2, 2), dtype=np.float64), key=jax.random.key(8))
+        first.step(
+            first_state,
+            np.ones((2, 2), dtype=np.float64),
+            key=jax.random.key(8, impl="threefry2x32"),
+        )
+
+
+def test_smoke_explicitly_requests_threefry_rng_roots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_key = telapa.jr.key
+    requested_impls: list[object] = []
+
+    def recording_key(seed: int, *, impl: object = None) -> jax.Array:
+        requested_impls.append(impl)
+        return original_key(seed, impl=impl)
+
+    monkeypatch.setattr(telapa.jr, "key", recording_key)
+    result = _result()
+    assert requested_impls
+    assert set(requested_impls) == {"threefry2x32"}
+    for record in result["records"]:
+        receipt = record["resource_receipt"]
+        assert receipt["rng_implementation"] == "threefry2x32"
+        assert receipt["rng_root_keys"] == 1
+        assert receipt["rng_key_derivations"] == 10
+        assert receipt["rng_root_persistent_bytes"] == 8
 
 
 def test_end_to_end_matrix_has_exact_mechanism_off_parity() -> None:
@@ -94,6 +149,30 @@ def test_end_to_end_matrix_has_exact_mechanism_off_parity() -> None:
     assert off["resource_receipt"]["archive_persistent_bytes"] == 0
 
 
+def test_result_contains_replayed_descriptive_archive_vs_control_comparisons() -> None:
+    result = _result()
+    comparisons = result["comparisons"]
+    assert [comparison["control"] for comparison in comparisons] == [
+        "one_model",
+        "fixed_snapshot",
+    ]
+    for comparison in comparisons:
+        assert comparison["candidate"] == "diverse_archive"
+        assert comparison["metric"] == "mean_reward"
+        assert comparison["classification"] == "descriptive_nonpromoting"
+        assert comparison["direction"] in {"improved", "tied", "regressed"}
+        assert [item["seed"] for item in comparison["per_seed"]] == list(
+            TeLAPASmokeConfig().seeds
+        )
+        expected_delta = sum(item["delta"] for item in comparison["per_seed"]) / 3
+        assert comparison["mean_delta"] == expected_delta
+
+    records = result["records"]
+    for record in records:
+        assert 0.0 <= record["mean_reward"] <= 1.0
+        assert record["reward_sum"] == record["mean_reward"] * 8
+
+
 def test_matched_axes_and_exact_resource_receipts() -> None:
     result = _result()
     for record in result["records"]:
@@ -112,6 +191,13 @@ def test_matched_axes_and_exact_resource_receipts() -> None:
         assert receipt["timing"] is None
         assert receipt["timing_policy"] == "telemetry_only"
 
+        if record["arm"] == "mechanism_off":
+            assert receipt["archive_selection_entry_queries"] == 0
+            assert receipt["anchor_selection_queries"] == 4
+        else:
+            assert receipt["archive_selection_entry_queries"] >= 4
+            assert receipt["anchor_selection_queries"] == 0
+
 
 @pytest.mark.parametrize(
     ("path", "replacement", "match"),
@@ -125,6 +211,9 @@ def test_matched_axes_and_exact_resource_receipts() -> None:
         (("records", 0, "resource_receipt", "environment_steps"), True, "resource receipt"),
         (("records", 0, "resource_receipt", "timing"), 0.1, "timing"),
         (("records", 0, "action_sha256"), "x" * 64, "SHA-256"),
+        (("records", 0, "mean_reward"), 0.12345, "replay|comparison"),
+        (("comparisons", 0, "mean_delta"), 0.5, "comparison"),
+        (("comparisons", 0, "direction"), "forged", "comparison"),
     ),
 )
 def test_validator_rejects_hostile_or_promoting_payloads(
@@ -145,7 +234,9 @@ def test_validator_rejects_nan_extra_fields_and_unbounded_config() -> None:
     with pytest.raises(ValueError, match="fields"):
         validate_result(payload)
     payload = _result()
-    payload["records"][0]["resource_receipt"]["archive_entry_queries"] = float("nan")
+    payload["records"][0]["resource_receipt"][
+        "archive_selection_entry_queries"
+    ] = float("nan")
     with pytest.raises(ValueError, match="finite JSON"):
         validate_result(payload)
     with pytest.raises(ValueError, match=r"\[1, 64\]"):
@@ -156,19 +247,34 @@ def test_validator_rejects_nan_extra_fields_and_unbounded_config() -> None:
         TeLAPASmokeConfig(steps=64, phase_length=1, archive_byte_budget=128)
 
 
-def test_validator_replays_archive_accounting_and_binds_current_identity() -> None:
-    payload = copy.deepcopy(_result())
-    payload["records"][0]["resource_receipt"]["archive_entry_queries"] += 1
+def test_validator_rejects_forged_archive_totals_and_current_identity() -> None:
+    forged = copy.deepcopy(_result())
+    receipt = forged["records"][0]["resource_receipt"]
+    receipt["archive_selection_entry_queries"] = 2**62
+    receipt["archive_persistent_bytes"] = 2**62
+    forged["records"][0]["archive_entry_count"] = 0
+    with pytest.raises(ValueError, match="budget|replay"):
+        validate_result(forged)
+
+    forged = copy.deepcopy(_result())
+    forged["records"][0]["resource_receipt"]["archive_persistent_bytes"] += 1
     with pytest.raises(ValueError, match="replay"):
-        validate_result(payload)
-    payload = copy.deepcopy(_result())
-    payload["records"][0]["archive_entry_count"] = 0
+        validate_result(forged)
+
+    forged = copy.deepcopy(_result())
+    forged["records"][3]["resource_receipt"]["archive_selection_entry_queries"] = 1
+    with pytest.raises(ValueError, match="mechanism-off"):
+        validate_result(forged)
+
+    forged = copy.deepcopy(_result())
+    forged["records"][0]["reward_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="replay"):
-        validate_result(payload)
-    payload = copy.deepcopy(_result())
-    payload["identity"]["lane_source_sha256"] = "0" * 64
-    with pytest.raises(ValueError, match="identity"):
-        validate_result(payload)
+        validate_result(forged)
+
+    forged = copy.deepcopy(_result())
+    forged["identity"]["lane_source_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="current tree/runtime"):
+        validate_result(forged)
 
 
 def test_json_preflight_rejects_deep_cyclic_and_oversized_trees_before_serialization(
@@ -238,3 +344,13 @@ def test_cli_executes_and_round_trips() -> None:
     payload = json.loads(process.stdout)
     validate_result(payload)
     assert len(payload["records"]) == 12
+
+
+def test_local_comparator_retention_is_content_named_and_create_only(tmp_path: Path) -> None:
+    result = _result()
+    destination = retain_local_comparator_result(result, repository_root=tmp_path)
+    assert destination.name.startswith("result.")
+    assert destination.parent == tmp_path / "outputs/telapa/local-comparator.v2"
+    assert load_local_comparator_result(destination) == result
+    with pytest.raises(FileExistsError):
+        retain_local_comparator_result(result, repository_root=tmp_path)

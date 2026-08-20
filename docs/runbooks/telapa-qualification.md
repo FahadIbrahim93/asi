@@ -39,6 +39,9 @@ The live adapter uses the repository's action-dependent two-state switching
 environment. A policy is a 2x2 float32 action-value table. At each declared
 phase boundary, a JIT-compatible descriptor summarizes state occupancy, action
 occupancy, reward, and action switching. The descriptor has no learned state.
+Every arm creates an explicit `threefry2x32` root, and the workload identity
+and receipt bind the implementation, root count, derivation count, and root
+bytes; the ambient JAX PRNG default cannot select this protocol's generator.
 Task boundaries are visible only to archive maintenance; task identity is not
 an input to the policy, future tasks are hidden, and prior environments cannot
 be queried.
@@ -46,11 +49,18 @@ be queried.
 The fixed-snapshot and archive-off paths must have identical observation,
 action, reward, initial-policy, and final-policy hashes. Resource receipts
 separately count environment steps, observations, updates, policy/descriptor/
-archive queries, disclosed boundaries, payload bytes, active policy bytes,
-archive or anchor bytes, and environment-state bytes. Timing is absent and
-telemetry-only. Every valid development outcome, including a tie or regression,
-must be retained outside this smoke under a new nonpromoting path; this CLI does
-not write `outputs/`.
+archive-selection and anchor-selection queries, disclosed boundaries, payload
+bytes, active policy bytes, archive or anchor bytes, RNG roots/derivations/root
+bytes, and environment-state bytes. The result reports exact per-arm reward
+sums and means plus descriptive
+per-seed and mean deltas for `diverse_archive` against both requested controls.
+Those comparisons are nonpromoting diagnostics, not a selection or benefit
+claim. Timing is absent and telemetry-only. Every valid development outcome,
+including a tie or regression, can be retained through the create-only Python
+publisher at
+`outputs/telapa/local-comparator.v2/result.<content-sha256>.json`. The CLI itself
+does not write `outputs/`. Publication remains unauthorized until this
+prospective protocol is independently reviewed and merged.
 
 Run the CI-cheap smoke or print only its catalog:
 
@@ -58,6 +68,9 @@ Run the CI-cheap smoke or print only its catalog:
 .venv/bin/asi-telapa-qualification-smoke --steps 32 --phase-length 4
 .venv/bin/asi-telapa-qualification-smoke --catalog
 ```
+
+The CLI emits schema `asi.telapa_qualification_smoke.development.v2`; its
+strict validator rejects the earlier smoke schema rather than upgrading it.
 
 ## Gates still closed
 

@@ -113,6 +113,14 @@ def test_tiny_adalin_runner_is_strict_and_nonpromoting() -> None:
     validate_adalin_result(result)
     assert result["policy"]["scientific_promotion_allowed"] is False
     assert result["resources"]["optimizer_updates"] == 4
+    assert result["resources"]["preupdate_prediction_forward_calls"] == 4
+    assert result["resources"]["differentiated_training_forward_calls"] == 4
+    assert result["resources"]["postupdate_test_forward_calls"] == 2
+    assert result["resources"]["model_forward_calls"] == 10
+    assert result["resources"]["preupdate_prediction_model_queries"] == 8
+    assert result["resources"]["differentiated_training_model_queries"] == 8
+    assert result["resources"]["postupdate_test_model_queries"] == 8
+    assert result["resources"]["model_queries"] == 24
     assert (
         result["provenance"]["initial_state_sha256"] != result["provenance"]["final_state_sha256"]
     )
@@ -203,6 +211,35 @@ def test_validator_rejects_tampering(section: str, field: str, replacement: obje
     tampered[section][field] = replacement
     with pytest.raises(ValueError):
         validate_adalin_result(tampered)
+
+
+def test_validator_binds_current_runtime_dataset_digest_and_exact_gap_roster() -> None:
+    inputs = np.eye(4, dtype=np.float32)
+    labels = np.array([0, 1, 0, 1], dtype=np.int32)
+    config = AdaLinConfig(
+        tasks=1, examples_per_task=4, batch_size=2, hidden_widths=(3, 2), classes=2
+    )
+    result = run_adalin_development(inputs, labels, inputs, labels, config=config, seed=6)
+
+    forged_runtime = copy.deepcopy(result)
+    forged_runtime["provenance"]["runtime"] = ["forged"] * 4
+    with pytest.raises(ValueError, match="current runtime"):
+        validate_adalin_result(forged_runtime)
+
+    forged_digest = copy.deepcopy(result)
+    forged_digest["dataset"]["sha256"] = "0" * 63
+    with pytest.raises(ValueError, match="dataset.sha256"):
+        validate_adalin_result(forged_digest)
+
+    unbounded_metadata = copy.deepcopy(result)
+    unbounded_metadata["dataset"]["test_examples"] = 10_000_001
+    with pytest.raises(ValueError, match="dataset metadata"):
+        validate_adalin_result(unbounded_metadata)
+
+    missing_gap = copy.deepcopy(result)
+    missing_gap["comparison"]["residual_gaps"].pop()
+    with pytest.raises(ValueError, match="comparison"):
+        validate_adalin_result(missing_gap)
 
 
 def test_validator_and_runner_reject_hostile_containers_without_hooks() -> None:

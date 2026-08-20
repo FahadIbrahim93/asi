@@ -27,6 +27,8 @@ _MAX_RESULT_COUNT: Final[int] = 256
 _MAX_PERSISTENT_BYTES: Final[int] = 256 * 1024 * 1024
 _MAX_WORKING_SET_BYTES: Final[int] = 512 * 1024 * 1024
 _MAX_ARRAY_BYTES: Final[int] = 512 * 1024 * 1024
+_MAX_ENERGY_RANK_LOGICAL_WORK: Final[int] = 100_000_000
+_MAX_ENERGY_RANK_WORKING_SET_BYTES: Final[int] = 256 * 1024 * 1024
 _FLOAT64_BYTES: Final[int] = np.dtype(np.float64).itemsize
 _APPENDIX_C1_VALIDATION_OBSERVATIONS: Final[int] = 10_000
 _APPENDIX_C1_BATCH_SIZE: Final[int] = 4
@@ -112,6 +114,9 @@ OPTIMIZATION_READINESS_PROTOCOL = MappingProxyType(
         "resource_receipts_are_authenticated": False,
         "metrics_are_recomputed_by_this_module": False,
         "outcomes_are_derived_by_this_module": False,
+        "energy_rank_max_logical_work": _MAX_ENERGY_RANK_LOGICAL_WORK,
+        "energy_rank_max_working_set_bytes": _MAX_ENERGY_RANK_WORKING_SET_BYTES,
+        "energy_rank_working_set_scope": "total_live_bytes_including_logical_input",
         "completed_result_exists": False,
     }
 )
@@ -181,6 +186,17 @@ class DevelopmentResultReceipt:
     parameter_norm: float
     future_relative_loss_reduction: float
     reported_outcome: str
+
+
+@dataclass(frozen=True)
+class EnergyRankResourceEstimate:
+    """Metadata-derived total-live-memory bounds charged before an energy-rank SVD."""
+
+    rows: int
+    columns: int
+    input_bytes: int
+    logical_work: int
+    peak_working_set_bytes: int
 
 
 def _finite_array(
@@ -322,12 +338,59 @@ def estimate_appendix_c1_optimization_readiness(
     )
 
 
+def _preflight_energy_rank_resources(matrix: object) -> EnergyRankResourceEstimate:
+    """Reject an unsafe SVD from trusted ndarray metadata alone.
+
+    The logical-work charge is ``m * n * min(m, n)``.  The workspace bound
+    conservatively includes the caller-owned logical input payload, a float64
+    conversion, a LAPACK-owned matrix copy, a finite-value mask, singular-value
+    temporaries, and a quadratic LAPACK workspace allowance.  Charging logical
+    ``nbytes`` is deliberately conservative for strided and broadcast views.
+    This runs before any element scan, conversion, or call into ``numpy.linalg``.
+    """
+    if type(matrix) is not np.ndarray:
+        raise ValueError("matrix must be an exact numpy.ndarray")
+    if matrix.ndim != 2 or any(size < 1 for size in matrix.shape):
+        raise ValueError("matrix must be a non-empty 2-dimensional array")
+    if matrix.dtype.kind not in {"i", "u", "f"}:
+        raise ValueError("matrix must have a real numeric dtype")
+    rows = int(matrix.shape[0])
+    columns = int(matrix.shape[1])
+    rank = min(rows, columns)
+    elements = rows * columns
+    input_bytes = int(matrix.nbytes)
+    logical_work = elements * rank
+    if logical_work > _MAX_ENERGY_RANK_LOGICAL_WORK:
+        raise ValueError("matrix SVD logical work exceeds the bounded energy-rank budget")
+
+    # 17 bytes/element accounts for two float64 matrices plus a one-byte
+    # finite-value mask.  The remainder deliberately over-approximates the
+    # no-singular-vector LAPACK workspace and the rank-length energy arrays.
+    peak_working_set_bytes = (
+        input_bytes
+        + 17 * elements
+        + 24 * rank * rank
+        + 8 * max(rows, columns)
+        + 96 * rank
+    )
+    if peak_working_set_bytes > _MAX_ENERGY_RANK_WORKING_SET_BYTES:
+        raise ValueError("matrix SVD working set exceeds the bounded energy-rank budget")
+    return EnergyRankResourceEstimate(
+        rows=rows,
+        columns=columns,
+        input_bytes=input_bytes,
+        logical_work=logical_work,
+        peak_working_set_bytes=peak_working_set_bytes,
+    )
+
+
 def energy_rank(matrix: object, *, threshold: float = 0.99) -> int:
     """Return the smallest singular-value count reaching squared-energy mass."""
     if type(threshold) is not float:
         raise ValueError("threshold must be a float in (0, 1]")
     if not math.isfinite(threshold) or not 0.0 < threshold <= 1.0:
         raise ValueError("threshold must be a float in (0, 1]")
+    _preflight_energy_rank_resources(matrix)
     resolved = _finite_array(matrix, name="matrix", dimensions=2)
     try:
         singular_values = np.linalg.svd(resolved, compute_uv=False)
