@@ -10,7 +10,6 @@ import pytest
 
 from alberta_framework.utils import metrics
 from alberta_framework.utils.metrics import (
-    _BOOLEAN_TRACE_MAX_NODES,
     compute_cumulative_error,
     compute_running_mean,
 )
@@ -18,17 +17,23 @@ from alberta_framework.utils.metrics import (
 pytestmark = pytest.mark.unit
 
 
-def test_running_mean_rejects_origin_hang_class_before_trace_walk() -> None:
+def test_running_mean_rejects_origin_hang_class_before_trace_walk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 8)
     started = time.perf_counter()
     with pytest.raises(ValueError, match="boolean-trace value limit"):
-        compute_running_mean([0.0] * (_BOOLEAN_TRACE_MAX_NODES + 1), window_size=2)
+        compute_running_mean([0.0] * 9, window_size=2)
     assert time.perf_counter() - started < 0.25
 
 
-def test_cumulative_error_rejects_oversized_metrics_history_before_walk() -> None:
+def test_cumulative_error_rejects_oversized_metrics_history_before_walk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 8)
     started = time.perf_counter()
     with pytest.raises(ValueError, match="boolean-trace value limit"):
-        compute_cumulative_error([{"squared_error": 1.0}] * (_BOOLEAN_TRACE_MAX_NODES + 1))
+        compute_cumulative_error([{"squared_error": 1.0}] * 9)
     assert time.perf_counter() - started < 0.25
 
 
@@ -49,10 +54,11 @@ def test_running_mean_accepts_public_last_fit() -> None:
     assert result.shape == (6,)
 
 
-def test_running_mean_rejects_oversized_broadcast_view_before_numeric_work() -> None:
-    view = np.broadcast_to(
-        np.asarray(0.0, dtype=np.float64), (_BOOLEAN_TRACE_MAX_NODES + 1,)
-    )
+def test_running_mean_rejects_oversized_broadcast_view_before_numeric_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 8)
+    view = np.broadcast_to(np.asarray(0.0, dtype=np.float64), (9,))
     with pytest.raises(ValueError, match="boolean-trace value limit"):
         compute_running_mean(view, window_size=2)
 
@@ -82,3 +88,21 @@ def test_metric_history_rejects_wide_record_before_key_iteration() -> None:
     record["squared_error"] = 1.0
     with pytest.raises(ValueError, match="metric-record key limit"):
         compute_cumulative_error([record])
+
+
+def test_index_vector_rejects_oversized_broadcast_view_before_numeric_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 8)
+    view = np.broadcast_to(np.asarray(0, dtype=np.int64), (9,))
+    with pytest.raises(ValueError, match="boolean-trace value limit"):
+        metrics._require_index_vector(view, name="indices")
+
+
+def test_compare_learners_shares_one_history_item_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 8)
+    shared = [{"squared_error": 1.0}, {"squared_error": 2.0}]
+    with pytest.raises(ValueError, match="aggregate metric-record item limit"):
+        metrics.compare_learners({"a": shared, "b": shared})

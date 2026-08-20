@@ -212,6 +212,8 @@ def _require_index_vector(values: object, *, name: str) -> NDArray[np.int64]:
         return np.asarray(values, dtype=np.int64)
     elif type(values) is np.ndarray:
         array = values
+        if array.size > _BOOLEAN_TRACE_MAX_NODES:
+            raise ValueError(f"{name} exceeds the boolean-trace value limit")
         if array.size == 0:
             return np.asarray(array, dtype=np.int64)
         if array.dtype.kind not in "iu":
@@ -628,24 +630,28 @@ def _metric_history_values(
     key: str,
     *,
     name: str,
+    _remaining_items: list[int] | None = None,
 ) -> NDArray[np.float64]:
     if type(key) is not str:
         raise ValueError(f"{name} metric key must be an exact string")
     if type(metrics_history) is not list:
         raise ValueError(f"{name} must be an exact list")
     history = cast(list[object], metrics_history)
-    if len(history) > _BOOLEAN_TRACE_MAX_NODES:
+    remaining_items = (
+        [_BOOLEAN_TRACE_MAX_NODES] if _remaining_items is None else _remaining_items
+    )
+    if len(history) > remaining_items[0]:
         raise ValueError(f"{name} exceeds the boolean-trace value limit")
+    remaining_items[0] -= len(history)
     values: list[float] = []
-    total_record_items = 0
     for index, record in enumerate(history):
         if type(record) is not dict:
             raise ValueError(f"{name}[{index}] must be an exact dictionary")
         if len(record) > 4_096:
             raise ValueError(f"{name}[{index}] exceeds the metric-record key limit")
-        total_record_items += len(record)
-        if total_record_items > _BOOLEAN_TRACE_MAX_NODES:
+        if len(record) > remaining_items[0]:
             raise ValueError(f"{name} exceeds the aggregate metric-record item limit")
+        remaining_items[0] -= len(record)
         if any(type(record_key) is not str for record_key in record):
             raise ValueError(f"{name}[{index}] keys must be exact strings")
         if key not in record:
@@ -801,10 +807,18 @@ def compare_learners(
         raise ValueError("results must be an exact dictionary")
     if not results:
         raise ValueError("results must contain at least one learner")
+    if len(results) > _BOOLEAN_TRACE_MAX_NODES:
+        raise ValueError("results exceeds the learner traversal limit")
     summary = {}
+    remaining_items = [_BOOLEAN_TRACE_MAX_NODES - len(results)]
     for name, metrics_history in results.items():
         _require_exact_str("learner name", name)
-        values = extract_metric(metrics_history, metric)
+        values = _metric_history_values(
+            metrics_history,
+            metric,
+            name="metrics_history",
+            _remaining_items=remaining_items,
+        )
         if values.size == 0:
             raise ValueError(f"learner {name} must contain at least one metric record")
         scale = float(np.max(np.abs(values)))
