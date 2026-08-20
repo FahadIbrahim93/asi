@@ -6,8 +6,8 @@ import copy
 from pathlib import Path
 from typing import Never
 
-import pytest
 import numpy as np
+import pytest
 
 from alberta_framework.benchmarks import intentional_updates_control as lane
 from alberta_framework.benchmarks.ipmnist_screening import (
