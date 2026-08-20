@@ -41,3 +41,5 @@ def test_coom_runtime_smoke_is_bounded_external_and_nonpromoting() -> None:
     assert '"paper_parity_claimed": False' in source
     assert '"scientific_promotion_allowed": False' in source
     assert "elapsed_ns_telemetry_only" in source
+    assert '_file_sha256(root / "LICENSE.txt")' in source
+    assert '_file_sha256(root / "COOM/wrappers/reward.py")' in source

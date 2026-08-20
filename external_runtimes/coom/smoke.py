@@ -26,6 +26,9 @@ SOURCE_ARCHIVE_SHA256 = "a4736e9916468482d75831d53a12a8601c4da91cd40b9b24d313522
 SOURCE_LICENSE_SHA256 = "47c8691ec5399bc8c58bcfaf0ba43b4ff48e6917c894c03748e3e0d14345d649"
 SOURCE_ASSET_MANIFEST_SHA256 = "deaa00979139cf80055f9d04d65800abc78c4feb11e061274e1a4486f9fa6cab"
 PATCH_SHA256 = "481aa922dded4be796b2431f8c6f23852def70b5abfaccc84e613259d705be87"
+PATCHED_REWARD_WRAPPER_SHA256 = (
+    "0ab457a6bc95dc2551b2c81608d1619549e56ced47e2c85949c39b87b8b5a8cf"
+)
 SEED = 1_582_000
 STEPS_PER_TASK = 2
 
@@ -52,6 +55,10 @@ def _asset_manifest() -> tuple[int, int, str]:
         digest.update(len(raw).to_bytes(8, "big"))
         digest.update(raw)
     return len(paths), total, digest.hexdigest()
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _trace() -> tuple[list[dict[str, object]], int]:
@@ -119,6 +126,14 @@ def _trace() -> tuple[list[dict[str, object]], int]:
 
 
 def main() -> None:
+    root = Path("/opt/coom")
+    if _file_sha256(root / "LICENSE.txt") != SOURCE_LICENSE_SHA256:
+        raise SystemExit("COOM license bytes differ from the audited source pin")
+    if (
+        _file_sha256(root / "COOM/wrappers/reward.py")
+        != PATCHED_REWARD_WRAPPER_SHA256
+    ):
+        raise SystemExit("COOM qualification patch result differs from the reviewed bytes")
     asset_count, asset_bytes, asset_sha256 = _asset_manifest()
     if (asset_count, asset_bytes, asset_sha256) != (
         33,
@@ -150,6 +165,7 @@ def main() -> None:
             "asset_bytes": asset_bytes,
             "asset_manifest_sha256": asset_sha256,
             "qualification_patch_sha256": PATCH_SHA256,
+            "patched_reward_wrapper_sha256": PATCHED_REWARD_WRAPPER_SHA256,
             "qualification_patch_scope": "gym RewardWrapper import only",
         },
         "runtime": {
