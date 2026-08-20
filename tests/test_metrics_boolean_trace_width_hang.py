@@ -61,6 +61,20 @@ def test_nested_shared_trace_uses_one_traversal_wide_budget(
         metrics._reject_boolean_numeric_trace(root, name="values")
 
 
+def test_trace_budget_counts_the_root_and_rejects_the_first_non_fit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 4)
+    metrics._reject_boolean_numeric_trace([0.0, 1.0, 2.0], name="values")
+    with pytest.raises(ValueError, match="boolean-trace value limit"):
+        metrics._reject_boolean_numeric_trace([0.0, 1.0, 2.0, 3.0], name="values")
+    with pytest.raises(ValueError, match="boolean-trace value limit"):
+        metrics._reject_boolean_numeric_trace(
+            np.asarray([0.0, 1.0, 2.0, 3.0], dtype=object),
+            name="values",
+        )
+
+
 def test_running_mean_accepts_public_last_fit() -> None:
     result = compute_running_mean([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], window_size=3)
     assert result.shape == (6,)

@@ -120,7 +120,12 @@ def _reject_boolean_numeric_trace(
         return
     if type(values) in (list, tuple):
         sequence = cast(list[object] | tuple[object, ...], values)
-        if len(sequence) > _BOOLEAN_TRACE_MAX_NODES:
+        # Every direct child consumes at least one of the shared traversal
+        # nodes.  Reject that lower bound before formatting per-index names;
+        # comparing only with the global ceiling needlessly walked a root
+        # sequence of exactly ``_BOOLEAN_TRACE_MAX_NODES`` items before the
+        # final child exhausted the root-inclusive budget.
+        if len(sequence) > _remaining_nodes[0]:
             raise ValueError(f"{name} exceeds the boolean-trace value limit")
         for index, item in enumerate(sequence):
             _reject_boolean_numeric_trace(
@@ -134,7 +139,7 @@ def _reject_boolean_numeric_trace(
         if values.dtype.kind == "b":
             raise ValueError(f"{name} must not be a boolean array")
         if values.dtype.kind == "O":
-            if values.size > _BOOLEAN_TRACE_MAX_NODES:
+            if values.size > _remaining_nodes[0]:
                 raise ValueError(f"{name} exceeds the boolean-trace value limit")
             for index, item in enumerate(values.flat):
                 _reject_boolean_numeric_trace(
