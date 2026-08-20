@@ -39,8 +39,13 @@ def test_mechanism_off_reduces_bit_exactly_to_fixed_consumer(
     actual = lane.run_control_shard(off, seed=25610, horizon=48, phase_length=12)
     assert actual["arm"] == off
     assert actual["execution_arm"] == fixed
-    for key in ("trajectory", "final_state", "metrics", "resources"):
+    for key in ("trajectory", "final_state", "metrics"):
         assert actual[key] == expected[key]
+    expected_resources = dict(expected["resources"])
+    actual_resources = dict(actual["resources"])
+    expected_resources.pop("timing_telemetry_ns")
+    actual_resources.pop("timing_telemetry_ns")
+    assert actual_resources == expected_resources
 
 
 @pytest.mark.parametrize("arm", lane.CONTROL_ARMS)
