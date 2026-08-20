@@ -77,3 +77,46 @@ def test_periodic_schedule_rejects_large_rows_before_array_conversion(
             mode=MaskMode.PERIODIC,
             schedule=(row,) * schedule_length,
         )
+
+
+def test_periodic_schedule_rejects_hostile_container_before_len() -> None:
+    class HostileSchedule(tuple[object, ...]):
+        calls = 0
+
+        def __len__(self) -> int:
+            type(self).calls += 1
+            raise AssertionError("hostile length")
+
+    with pytest.raises(ValueError, match="exact tuple"):
+        PartialObservationWrapper(
+            _inner(), mode=MaskMode.PERIODIC, schedule=HostileSchedule()
+        )
+    assert HostileSchedule.calls == 0
+
+
+def test_periodic_schedule_rejects_hostile_row_before_array_hooks() -> None:
+    class HostileRow:
+        calls = 0
+
+        def __jax_array__(self) -> object:
+            type(self).calls += 1
+            raise AssertionError("hostile JAX conversion")
+
+        def __array__(self, dtype: object = None) -> object:
+            type(self).calls += 1
+            raise AssertionError("hostile NumPy conversion")
+
+    with pytest.raises(ValueError, match="exact NumPy or JAX array"):
+        PartialObservationWrapper(
+            _inner(), mode=MaskMode.PERIODIC, schedule=(HostileRow(),)
+        )
+    assert HostileRow.calls == 0
+
+
+def test_fixed_mask_rejects_numeric_dtype_instead_of_boolean_laundering() -> None:
+    with pytest.raises(ValueError, match="dtype bool"):
+        PartialObservationWrapper(
+            _inner(),
+            mode=MaskMode.FIXED,
+            fixed_mask=np.asarray([1, 0], dtype=np.int32),
+        )

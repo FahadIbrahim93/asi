@@ -21,11 +21,13 @@ just receives less information about the underlying state.
 from __future__ import annotations
 
 import enum
-from typing import TypeVar
+from typing import TypeVar, cast
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, PRNGKeyArray
 
@@ -58,6 +60,21 @@ _MAX_PERIODIC_SCHEDULE_LENGTH = 4_096
 # once again in the stacked schedule.  Cap the logical payload at 64 MiB so
 # those two runner-owned arrays stay below 128 MiB before allocator overhead.
 _MAX_PERIODIC_SCHEDULE_VALUES = 64 * 1024 * 1024
+
+
+def _trusted_boolean_mask(name: str, value: object, feature_dim: int) -> Array:
+    """Validate mask metadata before JAX conversion can dispatch user hooks."""
+    actual_type = type(value)
+    if actual_type is not np.ndarray and not issubclass(
+        actual_type, (jax.Array, jax.core.Tracer)
+    ):
+        raise ValueError(f"{name} must be an exact NumPy or JAX array")
+    trusted = cast(Array, value)
+    if trusted.shape != (feature_dim,) or trusted.dtype != jnp.dtype(jnp.bool_):
+        raise ValueError(
+            f"{name} must have shape (feature_dim={feature_dim},) and dtype bool"
+        )
+    return jnp.asarray(trusted)
 
 
 def _require_unit_interval_probability(name: str, value: object) -> float:
@@ -156,17 +173,15 @@ class PartialObservationWrapper[InnerStateT]:
         if mode == MaskMode.FIXED:
             if fixed_mask is None:
                 raise ValueError("MaskMode.FIXED requires fixed_mask.")
-            mask = jnp.asarray(fixed_mask, dtype=jnp.bool_)
-            if mask.shape != (feature_dim,):
-                raise ValueError(
-                    f"fixed_mask shape {mask.shape} != (feature_dim={feature_dim},)"
-                )
+            mask = _trusted_boolean_mask("fixed_mask shape", fixed_mask, feature_dim)
             self._fixed_mask: Array | None = mask
         else:
             self._fixed_mask = None
 
         if mode == MaskMode.PERIODIC:
-            if schedule is None or len(schedule) == 0:
+            if type(schedule) is not tuple:
+                raise ValueError("periodic schedule must be an exact tuple")
+            if len(schedule) == 0:
                 raise ValueError(
                     "MaskMode.PERIODIC requires a non-empty schedule."
                 )
@@ -181,11 +196,10 @@ class PartialObservationWrapper[InnerStateT]:
                     "periodic schedule working set exceeds the bounded "
                     f"{_MAX_PERIODIC_SCHEDULE_VALUES}-value payload"
                 )
-            masks = [jnp.asarray(m, dtype=jnp.bool_) for m in schedule]
-            if any(mask.shape != (feature_dim,) for mask in masks):
-                raise ValueError(
-                    f"schedule masks must each have shape (feature_dim={feature_dim},)"
-                )
+            masks = [
+                _trusted_boolean_mask("schedule masks", row, feature_dim)
+                for row in schedule
+            ]
             sched = jnp.stack(masks, axis=0)
             self._schedule: Array | None = sched
         else:
