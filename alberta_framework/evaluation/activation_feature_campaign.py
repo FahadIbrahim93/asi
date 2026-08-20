@@ -67,19 +67,33 @@ QUARANTINED_FULL_SEEDS: Final[tuple[int, ...]] = (
     156_613,
     156_614,
 )
-CHEAP_SCREEN_SEEDS: Final[tuple[int, ...]] = (
+QUARANTINED_REPLACEMENT_CHEAP_SEEDS: Final[tuple[int, ...]] = (
     2_156_600,
     2_156_601,
     2_156_602,
     2_156_603,
     2_156_604,
 )
-FULL_CONFIRMATION_SEEDS: Final[tuple[int, ...]] = (
+QUARANTINED_REPLACEMENT_FULL_SEEDS: Final[tuple[int, ...]] = (
     2_156_610,
     2_156_611,
     2_156_612,
     2_156_613,
     2_156_614,
+)
+CHEAP_SCREEN_SEEDS: Final[tuple[int, ...]] = (
+    3_975_019_531,
+    3_975_019_532,
+    3_975_019_533,
+    3_975_019_534,
+    3_975_019_535,
+)
+FULL_CONFIRMATION_SEEDS: Final[tuple[int, ...]] = (
+    2_924_933_221,
+    2_924_933_222,
+    2_924_933_223,
+    2_924_933_224,
+    2_924_933_225,
 )
 _SEEDS: Final[Mapping[str, tuple[int, ...]]] = {
     "cheap_screen": CHEAP_SCREEN_SEEDS,
@@ -154,6 +168,12 @@ _MAX_AGGREGATE_BYTES: Final[int] = 128 * 1024 * 1024
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 _CANONICAL_X_SHAPE: Final[tuple[int, int]] = (60_000, 784)
 _CANONICAL_Y_SHAPE: Final[tuple[int]] = (60_000,)
+_CANONICAL_X_SHA256: Final[str] = (
+    "b8078cd833f53d89828a5e28d728517be9add34076f13fe973399f1f16381313"
+)
+_CANONICAL_Y_SHA256: Final[str] = (
+    "4f1dd9551f104f8153409e0add59f0a71568f7bad5a5f8e2274480c186fe219a"
+)
 _DATASET_MATERIALIZATION: Final[str] = (
     "OpenML mnist_784 v1 rows 0:60000; float32 pixels scaled by "
     "(x / 255 - 0.5) / 0.5 and int32 labels"
@@ -357,6 +377,12 @@ def _canonical_dataset_shapes() -> tuple[tuple[int, int], tuple[int]]:
     return _CANONICAL_X_SHAPE, _CANONICAL_Y_SHAPE
 
 
+def _canonical_dataset_hashes() -> tuple[str, str]:
+    """Return the frozen canonical materialized-array identities."""
+
+    return _CANONICAL_X_SHA256, _CANONICAL_Y_SHA256
+
+
 def _validated_arrays(data_x: object, data_y: object) -> tuple[np.ndarray, np.ndarray]:
     if type(data_x) is not np.ndarray or data_x.dtype != np.dtype(np.float32):
         raise ValueError("data_x must be an exact float32 NumPy array")
@@ -375,6 +401,15 @@ def _validated_arrays(data_x: object, data_y: object) -> tuple[np.ndarray, np.nd
         raise ValueError("data_x must use the frozen [-1, 1] scaling")
     if np.any(data_y < 0) or np.any(data_y >= 10):
         raise ValueError("data_y lies outside the frozen ten-class label range")
+    expected_x_sha256, expected_y_sha256 = _canonical_dataset_hashes()
+    x_sha256 = screening_lane._array_bundle_sha256(
+        "alberta.ipmnist_screening.materialized_x.v1", {"x": data_x}
+    )
+    y_sha256 = screening_lane._array_bundle_sha256(
+        "alberta.ipmnist_screening.materialized_y.v1", {"y": data_y}
+    )
+    if x_sha256 != expected_x_sha256 or y_sha256 != expected_y_sha256:
+        raise ValueError("dataset bytes differ from the frozen canonical OpenML materialization")
     return data_x, data_y
 
 
@@ -448,9 +483,10 @@ def _policy(stage: str) -> dict[str, object]:
         "completed_shard_negative_results_retained": True,
         "execution_failure_receipts_retained": False,
         "execution_failure_note": (
-            "an execution failure does not produce a result shard; the failed matrix is "
-            "incomplete and cannot be aggregated, and the external scheduler must retain "
-            "its failure log before any separately authorized retry"
+            "ordinary Exception, BaseException, process death, and publication failure do not "
+            "produce campaign failure receipts; the reservation marker is concurrency state, "
+            "not failure evidence, so the external scheduler must retain its log before any "
+            "separately authorized retry"
         ),
         "timing_is_telemetry_only": True,
         "execution_attestation": False,
@@ -526,10 +562,12 @@ def _protocol(stage: str) -> dict[str, object]:
         "quarantined_seed_rosters": {
             "public_result_v1_and_tests": list(QUARANTINED_CHEAP_SEEDS),
             "preauthorization_pull_request_and_tests": list(QUARANTINED_FULL_SEEDS),
+            "first_replacement_cheap_tests": list(QUARANTINED_REPLACEMENT_CHEAP_SEEDS),
+            "first_replacement_full_tests": list(QUARANTINED_REPLACEMENT_FULL_SEEDS),
         },
         "quarantine_reason": (
-            "the old rosters were publicly exposed and exercised in repository or pull-request "
-            "history, so neither roster is represented as fresh"
+            "every earlier roster was publicly exposed or used to derive schedule and "
+            "initialization identities in pull-request tests, so none is represented as fresh"
         ),
         "randomness": (
             "seed and runtime PRNG implementation are source-bound; campaign records do not "
@@ -680,13 +718,16 @@ def _validated_dataset_identity(value: object) -> dict[str, object]:
     checked_x_shape = cast(list[int], x_shape)
     checked_y_shape = cast(list[int], y_shape)
     expected_x_shape, expected_y_shape = _canonical_dataset_shapes()
+    expected_x_sha256, expected_y_sha256 = _canonical_dataset_hashes()
     rows = expected_x_shape[0]
     if (
         checked_x_shape != list(expected_x_shape)
         or checked_y_shape != list(expected_y_shape)
         or dataset["row_stop_exclusive"] != rows
+        or dataset["x_sha256"] != expected_x_sha256
+        or dataset["y_sha256"] != expected_y_sha256
     ):
-        raise ValueError("plan dataset row count is invalid")
+        raise ValueError("plan dataset identity differs from the canonical materialization")
     numeric_bytes = dataset["numeric_bytes"]
     if type(numeric_bytes) is not int or numeric_bytes != rows * (784 + 1) * 4:
         raise ValueError("plan dataset byte accounting drifted")
@@ -852,6 +893,30 @@ def _require_execution_authorized() -> None:
         )
 
 
+def _receipt_source_identity(plan: Mapping[str, object]) -> list[str]:
+    identity = cast(dict[str, object], plan["identity"])
+    sources = cast(dict[str, str], identity["source_sha256"])
+    names = (
+        "alberta_framework/benchmarks/activation_feature_ipmnist.py",
+        "alberta_framework/benchmarks/ipmnist_screening.py",
+        "alberta_framework/benchmarks/upgd_ipmnist.py",
+    )
+    return [sources[name] for name in names]
+
+
+def _receipt_runtime_identity(plan: Mapping[str, object]) -> list[str]:
+    identity = cast(dict[str, object], plan["identity"])
+    runtime = cast(dict[str, object], identity["runtime"])
+    python = cast(list[int], runtime["python"])
+    packages = cast(dict[str, str], runtime["packages"])
+    return [
+        ".".join(str(part) for part in python),
+        packages["jax"],
+        packages["numpy"],
+        cast(str, runtime["backend"]),
+    ]
+
+
 def build_shard(
     plan: object,
     data_x: object,
@@ -897,6 +962,11 @@ def _build_shard_authorized(
         raise ValueError("seed is outside the frozen matrix")
     x, y = _validated_arrays(data_x, data_y)
     dataset_identity = _dataset_identity(x, y)
+    identity = cast(dict[str, object], checked_plan["identity"])
+    planned_sources = cast(dict[str, str], identity["source_sha256"])
+    planned_runtime = cast(dict[str, object], identity["runtime"])
+    if _source_identity() != planned_sources or _runtime_identity() != planned_runtime:
+        raise RuntimeError("source or runtime changed before shard execution")
     execution_identity = _expected_execution_identity(stage, seed, x.shape[0])
     result = run_activation_feature_arm(
         x,
@@ -905,6 +975,8 @@ def _build_shard_authorized(
         seed=seed,
         config=_config_from_plan(checked_plan),
     )
+    if _source_identity() != planned_sources or _runtime_identity() != planned_runtime:
+        raise RuntimeError("source or runtime changed during shard execution")
     receipt = activation_feature_campaign_result_payload(
         result, outcome="inconclusive", development_seeds=seeds
     )
@@ -973,6 +1045,10 @@ def _validate_shard_against_plan(
         or execution["n_train"] != cast(list[object], dataset["x_shape"])[0]
     ):
         raise ValueError("shard dataset identity disagrees with the plan")
+    if execution["source_sha256"] != _receipt_source_identity(checked_plan):
+        raise ValueError("shard receipt source identity disagrees with the plan")
+    if execution["runtime"] != _receipt_runtime_identity(checked_plan):
+        raise ValueError("shard receipt runtime identity disagrees with the plan")
     n_train = cast(int, execution["n_train"])
     expected_execution = _expected_execution_identity(stage, seed, n_train)
     if shard["execution_identity"] != expected_execution:
@@ -1416,7 +1492,9 @@ def _load_json_strict_at(
     parent_fd: int, name: str, *, max_bytes: int
 ) -> tuple[dict[str, object], bytes]:
     descriptor = os.open(
-        name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd
+        name,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        dir_fd=parent_fd,
     )
     try:
         opened = os.fstat(descriptor)
@@ -1519,9 +1597,13 @@ def _publish_reserved_json(
         view = memoryview(encoded)
         written = 0
         while written < len(view):
-            written += os.write(file_fd, view[written:])
+            count = os.write(file_fd, view[written:])
+            if count <= 0:
+                raise OSError("short write while publishing campaign output")
+            written += count
         os.fsync(file_fd)
         os.fchmod(file_fd, 0o444)
+        os.fsync(file_fd)
         try:
             _link_unnamed_file(file_fd, parent_fd, destination.name)
         except FileExistsError as error:

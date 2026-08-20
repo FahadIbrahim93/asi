@@ -24,9 +24,31 @@ def data() -> tuple[np.ndarray, np.ndarray]:
 
 
 @pytest.fixture(scope="module", autouse=True)
-def _bounded_dataset_shapes() -> Iterator[None]:
+def _bounded_protocol(data: tuple[np.ndarray, np.ndarray]) -> Iterator[None]:
     patch = pytest.MonkeyPatch()
     patch.setattr(campaign, "_canonical_dataset_shapes", lambda: ((5_000, 784), (5_000,)))
+    patch.setattr(
+        campaign,
+        "_canonical_dataset_hashes",
+        lambda: (
+            campaign.screening_lane._array_bundle_sha256(
+                "alberta.ipmnist_screening.materialized_x.v1", {"x": data[0]}
+            ),
+            campaign.screening_lane._array_bundle_sha256(
+                "alberta.ipmnist_screening.materialized_y.v1", {"y": data[1]}
+            ),
+        ),
+    )
+    test_seeds = {
+        "cheap_screen": campaign.QUARANTINED_CHEAP_SEEDS,
+        "full_confirmation": campaign.QUARANTINED_FULL_SEEDS,
+    }
+    patch.setattr(campaign, "_SEEDS", test_seeds)
+    patch.setattr(
+        campaign,
+        "ALL_SEEDS",
+        campaign.QUARANTINED_CHEAP_SEEDS + campaign.QUARANTINED_FULL_SEEDS,
+    )
     yield
     patch.undo()
 
@@ -37,11 +59,7 @@ def cheap_plan(data: tuple[np.ndarray, np.ndarray]) -> dict[str, object]:
 
 
 def _metric(arm: str, seed: int) -> float:
-    seed_index = (
-        campaign.CHEAP_SCREEN_SEEDS.index(seed)
-        if seed in campaign.CHEAP_SCREEN_SEEDS
-        else campaign.FULL_CONFIRMATION_SEEDS.index(seed)
-    )
+    seed_index = next(seeds.index(seed) for seeds in campaign._SEEDS.values() if seed in seeds)
     base = 0.50 + seed_index / 1_000.0
     if arm == "smooth_leaky":
         return base + 0.10
@@ -50,9 +68,9 @@ def _metric(arm: str, seed: int) -> float:
     return base
 
 
-def _receipt(
+def _result(
     plan: dict[str, object], data: tuple[np.ndarray, np.ndarray], arm: str, seed: int
-) -> dict[str, object]:
+) -> activation.ActivationFeatureRunResult:
     config_values = cast(dict[str, int], plan["config"])
     config = IPMNISTConfig(**config_values)
     value = _metric(arm, seed)
@@ -70,7 +88,7 @@ def _receipt(
     )
     stage = cast(str, plan["stage"])
     execution_identity = campaign._expected_execution_identity(stage, seed, data[0].shape[0])
-    result = activation.ActivationFeatureRunResult(
+    return activation.ActivationFeatureRunResult(
         screening=screening,
         dataset_sha256=activation._array_bundle_sha256(*data),
         schedule_sha256=execution_identity["schedule_sha256"],
@@ -81,11 +99,14 @@ def _receipt(
             config, n_train=data[0].shape[0]
         ),
     )
-    seeds = (
-        campaign.CHEAP_SCREEN_SEEDS
-        if stage == "cheap_screen"
-        else campaign.FULL_CONFIRMATION_SEEDS
-    )
+
+
+def _receipt(
+    plan: dict[str, object], data: tuple[np.ndarray, np.ndarray], arm: str, seed: int
+) -> dict[str, object]:
+    result = _result(plan, data, arm, seed)
+    stage = cast(str, plan["stage"])
+    seeds = campaign._SEEDS[stage]
     return activation.activation_feature_campaign_result_payload(
         result,
         outcome="inconclusive",
@@ -120,11 +141,7 @@ def _matrix(
     prerequisite: object | None = None,
 ) -> list[dict[str, object]]:
     stage = cast(str, plan["stage"])
-    seeds = (
-        campaign.CHEAP_SCREEN_SEEDS
-        if stage == "cheap_screen"
-        else campaign.FULL_CONFIRMATION_SEEDS
-    )
+    seeds = campaign._SEEDS[stage]
     authorization = campaign._execution_authorization(plan, prerequisite)
     shards: list[dict[str, object]] = []
     for seed in seeds:
@@ -163,14 +180,14 @@ def test_both_plans_freeze_full_11_by_5_matrix_without_horizon_shrink(
     full = campaign.build_plan("full_confirmation", *data)
     assert cheap["matrix"] == {
         "arms": list(campaign.ARM_ROSTER),
-        "seeds": list(campaign.CHEAP_SCREEN_SEEDS),
+        "seeds": list(campaign.QUARANTINED_CHEAP_SEEDS),
         "shard_count": 55,
         "ordering": "seed_major_then_arm_roster",
         "execution": "one_shard_per_fresh_python_process",
     }
     full_matrix = cast(dict[str, object], full["matrix"])
     assert full_matrix["arms"] == list(campaign.ARM_ROSTER)
-    assert full_matrix["seeds"] == list(campaign.FULL_CONFIRMATION_SEEDS)
+    assert full_matrix["seeds"] == list(campaign.QUARANTINED_FULL_SEEDS)
     assert full_matrix["shard_count"] == 55
     assert set(campaign.CHEAP_SCREEN_SEEDS).isdisjoint(campaign.FULL_CONFIRMATION_SEEDS)
     assert cheap["config"] == IPMNISTConfig(n_tasks=2, task_length=500).to_config()
@@ -183,8 +200,17 @@ def test_both_plans_freeze_full_11_by_5_matrix_without_horizon_shrink(
     assert full_gate["execution_authorized"] is False
     assert campaign.QUARANTINED_CHEAP_SEEDS == (0, 1, 2, 3, 4)
     assert campaign.QUARANTINED_FULL_SEEDS == (156_610, 156_611, 156_612, 156_613, 156_614)
-    assert set(campaign.ALL_SEEDS).isdisjoint(
-        campaign.QUARANTINED_CHEAP_SEEDS + campaign.QUARANTINED_FULL_SEEDS
+    assert campaign.QUARANTINED_REPLACEMENT_CHEAP_SEEDS == tuple(
+        range(2_156_600, 2_156_605)
+    )
+    assert campaign.QUARANTINED_REPLACEMENT_FULL_SEEDS == tuple(
+        range(2_156_610, 2_156_615)
+    )
+    assert set(campaign.CHEAP_SCREEN_SEEDS + campaign.FULL_CONFIRMATION_SEEDS).isdisjoint(
+        campaign.QUARANTINED_CHEAP_SEEDS
+        + campaign.QUARANTINED_FULL_SEEDS
+        + campaign.QUARANTINED_REPLACEMENT_CHEAP_SEEDS
+        + campaign.QUARANTINED_REPLACEMENT_FULL_SEEDS
     )
     assert campaign.validate_plan(copy.deepcopy(cheap), data_x=data[0], data_y=data[1]) == cheap
 
@@ -193,6 +219,17 @@ def test_production_dataset_contract_names_the_full_canonical_train_split() -> N
     assert campaign._CANONICAL_X_SHAPE == (60_000, 784)
     assert campaign._CANONICAL_Y_SHAPE == (60_000,)
     assert "rows 0:60000" in campaign._DATASET_MATERIALIZATION
+    assert campaign._CANONICAL_X_SHA256 == (
+        "b8078cd833f53d89828a5e28d728517be9add34076f13fe973399f1f16381313"
+    )
+    assert campaign._CANONICAL_Y_SHA256 == (
+        "4f1dd9551f104f8153409e0add59f0a71568f7bad5a5f8e2274480c186fe219a"
+    )
+
+
+def test_production_seed_rosters_are_fresh_without_deriving_their_keys() -> None:
+    assert campaign.CHEAP_SCREEN_SEEDS == tuple(range(3_975_019_531, 3_975_019_536))
+    assert campaign.FULL_CONFIRMATION_SEEDS == tuple(range(2_924_933_221, 2_924_933_226))
 
 
 def test_plan_binds_exact_source_runtime_dataset_resources_and_paper_limits(
@@ -229,7 +266,8 @@ def test_plan_binds_exact_source_runtime_dataset_resources_and_paper_limits(
     policy = cast(dict[str, Any], cheap_plan["policy"])
     assert policy["completed_shard_negative_results_retained"] is True
     assert policy["execution_failure_receipts_retained"] is False
-    assert "incomplete" in policy["execution_failure_note"]
+    assert "do not produce campaign failure receipts" in policy["execution_failure_note"]
+    assert "external scheduler must retain its log" in policy["execution_failure_note"]
     per_shard = cast(dict[str, Any], resources["per_shard"])
     assert per_shard["retained_schedule_numeric_bytes"] == 4 * 2 * (784 + 5_000)
 
@@ -274,11 +312,11 @@ def test_plan_rejects_resigned_horizon_dataset_and_runtime_forgery(
 def test_shard_uses_external_seed_v2_and_cross_validates_wrapper_plan_and_resources(
     cheap_plan: dict[str, object], data: tuple[np.ndarray, np.ndarray]
 ) -> None:
-    shard = _shard(cheap_plan, data, "aid", campaign.CHEAP_SCREEN_SEEDS[2])
+    shard = _shard(cheap_plan, data, "aid", campaign._SEEDS["cheap_screen"][2])
     receipt = cast(dict[str, object], shard["result"])
     assert receipt["schema"] == activation.CAMPAIGN_RESULT_SCHEMA
     assert activation.validate_activation_feature_campaign_result(
-        copy.deepcopy(receipt), development_seeds=campaign.CHEAP_SCREEN_SEEDS
+        copy.deepcopy(receipt), development_seeds=campaign._SEEDS["cheap_screen"]
     ) == receipt
 
     wrong_arm = copy.deepcopy(shard)
@@ -341,7 +379,7 @@ def test_full_confirmation_uses_fresh_v2_seeds_and_fails_closed_without_cheap_wi
                 full_plan,
                 data,
                 "smooth_leaky",
-                campaign.FULL_CONFIRMATION_SEEDS[0],
+                campaign._SEEDS["full_confirmation"][0],
                 cheap,
             ),
             full_plan,
@@ -351,13 +389,13 @@ def test_full_confirmation_uses_fresh_v2_seeds_and_fails_closed_without_cheap_wi
         full_plan,
         data,
         "smooth_leaky",
-        campaign.FULL_CONFIRMATION_SEEDS[0],
+        campaign._SEEDS["full_confirmation"][0],
         cheap,
     )
     receipt = cast(dict[str, object], full_shard["result"])
     assert receipt["schema"] == activation.CAMPAIGN_RESULT_SCHEMA
     assert activation.validate_activation_feature_campaign_result(
-        copy.deepcopy(receipt), development_seeds=campaign.FULL_CONFIRMATION_SEEDS
+        copy.deepcopy(receipt), development_seeds=campaign._SEEDS["full_confirmation"]
     ) == receipt
     with pytest.raises(ValueError, match="unsupported result identity"):
         activation.validate_activation_feature_result(receipt)
@@ -381,7 +419,7 @@ def test_full_confirmation_gate_rejects_complete_cheap_screen_without_primary_su
         receipt = cast(dict[str, object], shard["result"])
         metrics = cast(dict[str, object], receipt["metrics"])
         metrics["asi_whole_stream_mean_accuracy"] = 0.50 + (
-            campaign.CHEAP_SCREEN_SEEDS.index(cast(int, shard["seed"])) / 1_000.0
+            campaign._SEEDS["cheap_screen"].index(cast(int, shard["seed"])) / 1_000.0
         )
         _resign_shard(cast(dict[str, Any], shard))
     cheap_without_support = campaign.build_aggregate(cheap_plan, shards)
@@ -407,7 +445,7 @@ def test_full_gate_runs_before_any_arm_execution(
             full_plan,
             *data,
             arm="smooth_leaky",
-            seed=campaign.FULL_CONFIRMATION_SEEDS[0],
+            seed=campaign._SEEDS["full_confirmation"][0],
         )
     assert calls == 0
 
@@ -426,13 +464,39 @@ def test_execution_failure_is_not_misrepresented_as_a_retained_result_shard(
             cheap_plan,
             *data,
             arm="aid",
-            seed=campaign.CHEAP_SCREEN_SEEDS[0],
+            seed=campaign._SEEDS["cheap_screen"][0],
             _capability=campaign._EXECUTION_CAPABILITY,
         )
 
     policy = cast(dict[str, object], cheap_plan["policy"])
     assert policy["execution_failure_receipts_retained"] is False
     assert policy["completed_shard_negative_results_retained"] is True
+
+
+def test_private_executor_rechecks_full_source_identity_after_runner_return(
+    cheap_plan: dict[str, object],
+    data: tuple[np.ndarray, np.ndarray],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_source = campaign._source_identity()
+    seed = campaign._SEEDS["cheap_screen"][0]
+
+    def drift_after_execution(*args: object, **kwargs: object) -> object:
+        drifted = dict(original_source)
+        drifted["alberta_framework/evaluation/activation_feature_campaign.py"] = "0" * 64
+        monkeypatch.setattr(campaign, "_source_identity", lambda: drifted)
+        return _result(cheap_plan, data, "aid", seed)
+
+    monkeypatch.setattr(campaign, "run_activation_feature_arm", drift_after_execution)
+    with pytest.raises(RuntimeError, match="changed during shard execution"):
+        campaign._build_shard_authorized(
+            cheap_plan,
+            *data,
+            arm="aid",
+            seed=seed,
+            _capability=campaign._EXECUTION_CAPABILITY,
+        )
+
 
 def test_public_builder_and_cli_fail_before_dataset_or_arm_execution(
     cheap_plan: dict[str, object],
@@ -456,7 +520,7 @@ def test_public_builder_and_cli_fail_before_dataset_or_arm_execution(
             cheap_plan,
             *data,
             arm="aid",
-            seed=campaign.CHEAP_SCREEN_SEEDS[0],
+            seed=campaign._SEEDS["cheap_screen"][0],
         )
     with pytest.raises(RuntimeError, match="not authorized"):
         campaign.main(
@@ -467,7 +531,7 @@ def test_public_builder_and_cli_fail_before_dataset_or_arm_execution(
                 "--arm",
                 "aid",
                 "--seed",
-                str(campaign.CHEAP_SCREEN_SEEDS[0]),
+                str(campaign._SEEDS["cheap_screen"][0]),
             ]
         )
     assert calls == {"dataset": 0, "arm": 0}
@@ -624,3 +688,31 @@ def test_reservation_is_exclusive_before_work_and_publication_strictly_rereads(
     assert campaign.load_json_strict(
         destination, max_bytes=campaign._MAX_SHARD_BYTES
     ) == cheap_plan
+
+
+@pytest.mark.skipif(
+    not all(hasattr(os, name) for name in ("O_NOFOLLOW", "O_TMPFILE")),
+    reason="descriptor-pinned publication requires Linux",
+)
+def test_publication_rejects_zero_write_and_nonregular_reread_swap(
+    cheap_plan: dict[str, object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    short_output = tmp_path / "short.json"
+    with campaign._reserved_new_output(short_output) as target:
+        monkeypatch.setattr(os, "write", lambda *_args, **_kwargs: 0)
+        with pytest.raises(OSError, match="short write"):
+            campaign._publish_reserved_json(target, cheap_plan)
+    monkeypatch.undo()
+
+    swapped_output = tmp_path / "swapped.json"
+    with campaign._reserved_new_output(swapped_output) as target:
+        real_link = campaign._link_unnamed_file
+
+        def link_then_swap(file_fd: int, parent_fd: int, name: str) -> None:
+            real_link(file_fd, parent_fd, name)
+            os.unlink(name, dir_fd=parent_fd)
+            os.mkfifo(name, dir_fd=parent_fd)
+
+        monkeypatch.setattr(campaign, "_link_unnamed_file", link_then_swap)
+        with pytest.raises(ValueError, match="regular file"):
+            campaign._publish_reserved_json(target, cheap_plan)

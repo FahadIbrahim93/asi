@@ -42,11 +42,14 @@ body-training signal are not a mechanism-off match.
 The public result-v1 seed set `0, 1, 2, 3, 4` is quarantined: it has long been
 exposed by the CLI and exercised by repository tests and history. The earlier
 preauthorization full roster `156610`–`156614` is also quarantined because it
-was exposed and exercised in pull-request history. Neither roster is represented
-as fresh. The replacement cheap roster is `2156600`–`2156604` and the replacement
-full roster is `2156610`–`2156614`; a repository and history search found no prior
-occurrence when this successor protocol was frozen. Both use result v2's external
-seed contract. A complete comparison
+was exposed and exercised in pull-request history. The first replacement rosters
+`2156600`–`2156604` and `2156610`–`2156614` are quarantined too: their schedule and
+initialization identities were derived by pull-request tests. None of those four
+rosters is represented as fresh. The untouched cheap roster is
+`3975019531`–`3975019535`, and the untouched full roster is
+`2924933221`–`2924933225`. Tests use only quarantined roots and never derive keys
+from either campaign roster. Both stages use result v2's external seed contract.
+A complete comparison
 contains every registered arm exactly once for one seed; its validator requires
 identical configuration, observation/update/query counts, parameter allocation,
 persistent numeric bytes, and learner-visible information. The learner receives
@@ -100,8 +103,10 @@ with 4 degrees of freedom uses Bonferroni alpha `0.05 / 8` (critical value
 `supported`, wholly below zero is `rejected`, and every other result is
 `inconclusive`. These are permanently nonpromoting development outcomes. The
 aggregate retains every completed shard, decision, resource count, and completed negative
-outcome. An execution failure produces no result shard, leaves the matrix incomplete, and
-must be retained by the external scheduler before any separately authorized retry;
+outcome. Ordinary exceptions, `BaseException`, process death, and publication failures
+produce no campaign failure receipt. The temporary reservation marker is cooperative
+concurrency state, not failure evidence; the external scheduler must retain its log before
+any separately authorized retry.
 timing is telemetry only and consistency hashes are not execution attestation.
 
 Canonical append-only namespaces are:
@@ -112,8 +117,7 @@ Canonical append-only namespaces are:
 Plan, shard, and aggregate publication pins every path segment with no-follow
 directory descriptors, reserves the destination with deterministic `O_EXCL`
 before dataset access or execution, publishes without replacement, fsyncs, and
-strictly rereads and validates the linked file. No campaign has been run or
-result produced by this implementation change.
+strictly rereads and validates the linked file. No retained campaign result exists.
 
 For either stage, plan creation is the only enabled campaign mutation:
 
