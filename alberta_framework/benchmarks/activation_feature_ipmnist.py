@@ -699,7 +699,7 @@ def _activation_feature_result_payload(
 def activation_feature_result_payload(
     result: ActivationFeatureRunResult, *, outcome: str
 ) -> dict[str, object]:
-    """Build the frozen result-v1 receipt without changing its seed protocol."""
+    """Build a result-v1 receipt under its fixed seed protocol."""
     return _activation_feature_result_payload(
         result,
         outcome=outcome,
@@ -924,7 +924,7 @@ def _validate_activation_feature_result(
 
 
 def validate_activation_feature_result(payload: object) -> dict[str, object]:
-    """Validate the original result-v1 contract and seed set unchanged."""
+    """Validate the result-v1 contract and fixed seed set."""
     return _validate_activation_feature_result(
         payload, schema=RESULT_SCHEMA, seed_protocol=DEVELOPMENT_SEEDS
     )
@@ -986,7 +986,7 @@ def _validate_matched_activation_feature_results(
 
 
 def validate_matched_activation_feature_results(payloads: object) -> list[dict[str, object]]:
-    """Validate the original complete result-v1 comparison unchanged."""
+    """Validate one complete result-v1 comparison."""
     return _validate_matched_activation_feature_results(
         payloads, schema=RESULT_SCHEMA, seed_protocol=DEVELOPMENT_SEEDS
     )

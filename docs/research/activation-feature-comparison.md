@@ -12,8 +12,8 @@ screening runner and only creates a new, immutable receipt path.
   `lute47lillo/activations_plasticity`; the campaign pins commit
   `bdce354782cd183d63550819550b33312506d3e3`. The repository has no license
   file, so it is a read-only disambiguation source and no code is copied.
-  Result-v1 retains its earlier source-field strings for compatibility;
-  campaign plans carry this corrected registry. Equation 1 is
+  Result-v1 has a fixed source-field contract; campaign plans separately bind
+  this exact source registry. Equation 1 is
   `alpha*x + (1-alpha)*x*sigmoid(c*x/p)`. The development arm uses the paper's
   displayed `alpha=0.1, p=3, c=5` values. A fixed Leaky-ReLU arm removes the
   smooth transition while retaining the negative leak.
@@ -63,7 +63,8 @@ is exactly 200 tasks × 5,000 examples. Both plans require all 11 arms at all 5
 development seeds (55 fresh-process shards each). The full plan does not become
 smaller after seeing the cheap screen. The cheap plan uses the unconsumed
 result-v1 seeds 0–4. The full plan preregisters the disjoint seeds
-156610–156614 and uses result v2, while result-v1 validation remains unchanged.
+156610–156614 and uses result v2. Result-v1 validation enforces its fixed
+seed and source-field contract.
 These are still development seeds; neither stage can promote a claim.
 
 Full-horizon execution is conditionally authorized. It requires a retained,
@@ -76,11 +77,12 @@ the gate never authorizes a selected-candidate subset.
 
 Each plan binds the exact MNIST bytes, current implementation sources,
 Python/JAX/dependency/runtime identity, configuration, schedule-derived receipt
-identity, resource schedule, and output namespace. Shard receipts retain the
-`asi.activation_feature_ipmnist.result.v1` contract. The campaign wrapper adds
-an immutable plan digest and does not reinterpret a shard's self-reported
-outcome. Run each `run-shard` command in a fresh Python process; `summarize`
-rejects any roster other than the complete 55 unique shard files.
+identity, resource schedule, and output namespace. Shard receipts use the
+`asi.activation_feature_ipmnist.result.v1` contract for the cheap screen and
+`asi.activation_feature_ipmnist.result.v2` for full confirmation. Every shard
+binds an immutable plan digest, and aggregation does not reinterpret its
+self-reported outcome. Run each `run-shard` command in a fresh Python process;
+`summarize` rejects any roster other than the complete 55 unique shard files.
 
 The eight predeclared candidate-versus-family-off comparisons use paired seed
 deltas in whole-stream mean online accuracy. A two-sided Student-t interval

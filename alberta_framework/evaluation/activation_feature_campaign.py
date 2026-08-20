@@ -1,10 +1,11 @@
 """Frozen, sharded, permanently nonpromoting issue #1566 campaigns.
 
-The campaign layer deliberately wraps the result-v1 shard contract instead of
-changing it.  A plan binds one exact dataset and runtime, every arm executes in
-its own CLI process, and aggregation admits only the complete 11-arm by 5-seed
-matrix.  The resulting decisions are development diagnostics, not paper
-reproductions or scientific evidence.
+Cheap-screen shards use the result-v1 schema and its fixed seed protocol;
+full-confirmation shards use result-v2 with their separately frozen seeds. A
+plan binds one exact dataset and runtime, every arm executes in its own CLI
+process, and aggregation admits only the complete 11-arm by 5-seed matrix. The
+resulting decisions are development diagnostics, not paper reproductions or
+scientific evidence.
 """
 
 from __future__ import annotations
@@ -380,11 +381,11 @@ def _paper_parity() -> dict[str, object]:
         "sources": {
             family: dict(source) for family, source in CAMPAIGN_PAPER_SOURCES.items()
         },
-        "result_v1_source_compatibility_note": (
-            "result-v1 retains its original audited source fields; this campaign registry "
-            "adds the subsequently located official Smooth-Leaky repository without changing "
-            "the result-v1 schema"
-        ),
+        "result_schema_semantics": {
+            "cheap_screen": "result-v1 with its fixed seed and source-field contract",
+            "full_confirmation": "result-v2 with the full-confirmation frozen seed contract",
+            "campaign_source_binding": "exact sources in this plan's identity and registry",
+        },
         "paper_metric_reported": False,
         "paper_protocol_parity_claimed": False,
         "paper_result_reproduction_claimed": False,
