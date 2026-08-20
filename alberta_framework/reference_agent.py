@@ -44,8 +44,10 @@ _MAX_LIFECYCLE_ID_LENGTH = _MAX_ID_LENGTH - len(
 )
 _MAX_CONFIG_BYTES = 1 << 20
 _MAX_JSON_NESTING_DEPTH = 64
-# Frozen manifests are tiny. Cap nodes before walking toward the 1 MiB encoding cap.
+# Frozen manifests are tiny. Bound every traversal axis before canonical encoding.
 _MAX_JSON_VALUES = 1_000_000
+_MIN_JSON_INTEGER = -(1 << 63)
+_MAX_JSON_INTEGER = (1 << 63) - 1
 _MAX_ARRAY_RANK = 8
 _MAX_ARRAY_ELEMENTS = 1 << 20
 _SUPPORTED_DTYPES = frozenset(
@@ -124,43 +126,126 @@ def _load_manifest_config_json(raw: str) -> Any:
 def _validate_json_value(
     value: Any, *, path: str, depth: int = 0, nodes: int = 0
 ) -> int:
-    nodes += 1
-    if nodes > _MAX_JSON_VALUES:
-        raise ValueError(f"{path} exceeds the canonical JSON value resource limit")
-    if depth > _MAX_JSON_NESTING_DEPTH:
-        raise ValueError(f"{path} exceeds the maximum canonical JSON nesting depth")
-    value_type = type(value)
-    if value is None or value_type is str or value_type is bool or value_type is int:
-        return nodes
-    if value_type is float:
-        if not math.isfinite(value):
-            raise ValueError(f"{path} must contain only finite JSON numbers")
-        return nodes
-    if isinstance(value, list):
-        extra = len(value)
-        if nodes + extra > _MAX_JSON_VALUES:
-            raise ValueError(f"{path} exceeds the canonical JSON value resource limit")
-        for index, item in enumerate(value):
-            nodes = _validate_json_value(
-                item, path=f"{path}[{index}]", depth=depth + 1, nodes=nodes
+    if type(path) is not str or type(depth) is not int or type(nodes) is not int:
+        raise ValueError("canonical JSON traversal controls must use exact built-ins")
+    if depth < 0 or nodes < 0 or nodes > _MAX_JSON_VALUES:
+        raise ValueError("canonical JSON traversal controls are outside their limits")
+    budget = [nodes, 0, 0]  # nodes, cumulative UTF-8 bytes, canonical encoding work
+
+    def visit(item: object, *, item_depth: int, item_path: str) -> None:
+        budget[0] += 1
+        if budget[0] > _MAX_JSON_VALUES:
+            raise ValueError(
+                f"{item_path} exceeds the canonical JSON value resource limit"
             )
-        return nodes
-    if isinstance(value, Mapping):
-        extra = len(value)
-        if nodes + extra > _MAX_JSON_VALUES:
-            raise ValueError(f"{path} exceeds the canonical JSON value resource limit")
-        for key, item in value.items():
-            if type(key) is not str:
-                raise ValueError(f"{path} JSON object keys must be strings")
-            nodes = _validate_json_value(
-                item, path=f"{path}.{key}", depth=depth + 1, nodes=nodes
+        if item_depth > _MAX_JSON_NESTING_DEPTH:
+            raise ValueError(
+                f"{item_path} exceeds the maximum canonical JSON nesting depth"
             )
-        return nodes
-    raise ValueError(f"{path} is not a canonical JSON value")
+        item_type = type(item)
+        if item is None:
+            budget[2] += 4
+        elif item_type is bool:
+            budget[2] += 4 if item else 5
+        elif item_type is int:
+            integer = cast(int, item)
+            if not _MIN_JSON_INTEGER <= integer <= _MAX_JSON_INTEGER:
+                raise ValueError(f"{item_path} integer must fit signed 64-bit bounds")
+            budget[2] += len(str(integer))
+        elif item_type is float:
+            number = cast(float, item)
+            if not math.isfinite(number):
+                raise ValueError(f"{item_path} must contain only finite JSON numbers")
+            budget[2] += len(json.dumps(number, allow_nan=False))
+        elif item_type is str:
+            text = cast(str, item)
+            if len(text) > _MAX_CONFIG_BYTES:
+                raise ValueError(f"{item_path} exceeds the aggregate UTF-8 byte limit")
+            try:
+                encoded = text.encode("utf-8")
+            except UnicodeEncodeError as error:
+                raise ValueError(f"{item_path} must contain valid UTF-8 text") from error
+            budget[1] += len(encoded)
+            if budget[1] > _MAX_CONFIG_BYTES:
+                raise ValueError(f"{item_path} exceeds the aggregate UTF-8 byte limit")
+            budget[2] += len(json.dumps(text, ensure_ascii=True))
+        elif item_type is list:
+            sequence = cast(list[object], item)
+            length = len(sequence)
+            if budget[0] + length > _MAX_JSON_VALUES:
+                raise ValueError(
+                    f"{item_path} exceeds the canonical JSON value resource limit"
+                )
+            punctuation = 2 + max(0, length - 1)
+            if budget[2] + punctuation + length > _MAX_CONFIG_BYTES:
+                raise ValueError(
+                    f"{item_path} exceeds the canonical JSON encoding work limit"
+                )
+            budget[2] += punctuation
+            for index, child in enumerate(sequence):
+                visit(
+                    child,
+                    item_depth=item_depth + 1,
+                    item_path=f"{item_path}[{index}]",
+                )
+        elif item_type is dict:
+            mapping = cast(dict[object, object], item)
+            length = len(mapping)
+            if budget[0] + length > _MAX_JSON_VALUES:
+                raise ValueError(
+                    f"{item_path} exceeds the canonical JSON value resource limit"
+                )
+            punctuation = 2 + max(0, length - 1) + length
+            if budget[2] + punctuation + length > _MAX_CONFIG_BYTES:
+                raise ValueError(
+                    f"{item_path} exceeds the canonical JSON encoding work limit"
+                )
+            keys = tuple(mapping.keys())
+            if any(type(key) is not str for key in keys):
+                raise ValueError(f"{item_path} JSON object keys must be strings")
+            budget[2] += punctuation
+            for raw_key in keys:
+                key = cast(str, raw_key)
+                if len(key) > _MAX_CONFIG_BYTES:
+                    raise ValueError(
+                        f"{item_path} exceeds the aggregate UTF-8 byte limit"
+                    )
+                try:
+                    encoded_key = key.encode("utf-8")
+                except UnicodeEncodeError as error:
+                    raise ValueError(
+                        f"{item_path} JSON object keys must be valid UTF-8"
+                    ) from error
+                budget[1] += len(encoded_key)
+                budget[2] += len(json.dumps(key, ensure_ascii=True))
+                if budget[1] > _MAX_CONFIG_BYTES:
+                    raise ValueError(
+                        f"{item_path} exceeds the aggregate UTF-8 byte limit"
+                    )
+                if budget[2] > _MAX_CONFIG_BYTES:
+                    raise ValueError(
+                        f"{item_path} exceeds the canonical JSON encoding work limit"
+                    )
+            for raw_key in keys:
+                key = cast(str, raw_key)
+                visit(
+                    mapping[key],
+                    item_depth=item_depth + 1,
+                    item_path=f"{item_path}.{key}",
+                )
+        else:
+            raise ValueError(f"{item_path} is not a canonical JSON value")
+        if budget[2] > _MAX_CONFIG_BYTES:
+            raise ValueError(
+                f"{item_path} exceeds the canonical JSON encoding work limit"
+            )
+
+    visit(value, item_depth=depth, item_path=path)
+    return budget[0]
 
 
 def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
-    if not isinstance(value, Mapping):
+    if type(value) is not dict:
         raise ValueError("config must be a JSON mapping")
     _validate_json_value(value, path="config")
     try:
