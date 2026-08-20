@@ -24,7 +24,7 @@ import math
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -95,6 +95,9 @@ CONDITION_NAMES = (
 EARLY_WINDOW_STEPS = 200
 TAIL_WINDOW_STEPS = 500
 ASYMPTOTIC_WINDOW_STEPS = 1_500
+# Origin ConditionSeedRecord rebuilt every pair before any count bound.
+# A cheap ``((0, 1),) * 25_000_000`` pointer-repeat took 4.107s on origin/main.
+_MAX_INTEGER_PAIRS = 4096
 
 FROZEN_STREAM_CONFIGURATION: dict[str, int | float] = {
     "relevant_dim": 8,
@@ -226,13 +229,30 @@ def _finite_float(value: object, *, name: str) -> float:
     return nonnegative_finite_real(name, value)
 
 
+def _bounded_pair_sequence_length(
+    value: object,
+    *,
+    name: str,
+    allow_list: bool = False,
+) -> int:
+    """Return a pair-sequence length after rejecting oversized host collections."""
+
+    allowed: tuple[type, ...] = (tuple, list) if allow_list else (tuple,)
+    if type(value) not in allowed:
+        kind = "tuple or list" if allow_list else "tuple"
+        raise TypeError(f"{name} must be an exact {kind}")
+    count = len(cast(tuple[object, ...] | list[object], value))
+    if count > _MAX_INTEGER_PAIRS:
+        raise ValueError(f"{name} exceeds the {_MAX_INTEGER_PAIRS}-pair limit")
+    return count
+
+
 def _integer_pairs(
     value: object, *, name: str
 ) -> tuple[tuple[int, int], ...]:
-    if type(value) is not tuple:
-        raise TypeError(f"{name} must be an exact tuple")
+    _bounded_pair_sequence_length(value, name=name)
     pairs: list[tuple[int, int]] = []
-    for index, pair in enumerate(value):
+    for index, pair in enumerate(cast(tuple[object, ...], value)):
         if type(pair) is not tuple or len(pair) != 2:
             raise ValueError(f"{name}[{index}] must be an exact integer pair")
         left, right = pair
@@ -503,6 +523,7 @@ def count_relevant_context_pairs(
 ) -> int:
     """Count unique canonical context products over relevant input channels."""
 
+    _bounded_pair_sequence_length(pairs, name="pairs", allow_list=True)
     relevant_pairs = {
         (min(left, right), max(left, right))
         for left, right in pairs
@@ -519,6 +540,7 @@ def count_relevant_context_pairs_by_task(
 ) -> tuple[int, int]:
     """Count unique relevant products for the supplied C and D cues separately."""
 
+    _bounded_pair_sequence_length(pairs, name="pairs", allow_list=True)
     canonical_pairs = {(min(left, right), max(left, right)) for left, right in pairs}
     counts = tuple(
         sum(
