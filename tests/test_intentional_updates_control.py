@@ -74,6 +74,44 @@ def test_catalog_cli_is_read_only_and_execution_stays_closed(
     assert json.loads(capsys.readouterr().out) == lane.frozen_plan()
 
 
+@pytest.mark.parametrize("dependency_input", ["pyproject.toml", "uv.lock"])
+def test_source_identity_binds_exact_dependency_inputs(
+    monkeypatch: pytest.MonkeyPatch, dependency_input: str,
+) -> None:
+    plan_files = lane.frozen_plan()["source_identity_policy"]["hashed_files"]
+    assert "pyproject.toml" in plan_files
+    assert "uv.lock" in plan_files
+    original = lane._source_identity()
+    read_bytes = Path.read_bytes
+
+    def mutated(path: Path) -> bytes:
+        payload = read_bytes(path)
+        return payload + b"\nmutation" if path.name == dependency_input else payload
+
+    monkeypatch.setattr(Path, "read_bytes", mutated)
+    changed = lane._source_identity()
+    assert changed[dependency_input] != original[dependency_input]
+
+
+def test_runtime_identity_binds_dependencies_jax_devices_config_and_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = lane._runtime_identity()
+    assert set(original["packages"]) == {
+        "chex", "jax", "jaxlib", "jaxtyping", "numpy", "orbax-checkpoint",
+        "scikit-learn", "scipy",
+    }
+    assert original["jax"]["devices"]
+    assert "jax_default_prng_impl" in original["jax"]["config"]
+    assert "XLA_FLAGS" in original["process_environment"]
+    monkeypatch.setenv("JAX_RANDOM_SEED_OFFSET", "provenance-mutation")
+    changed = lane._runtime_identity()
+    assert changed != original
+    assert changed["process_environment"]["JAX_RANDOM_SEED_OFFSET"] == (
+        "provenance-mutation"
+    )
+
+
 @pytest.mark.parametrize(
     ("fixed", "off"),
     [
@@ -344,6 +382,27 @@ def test_report_recomputes_all_four_bonferroni_paired_questions(
         )
     assert report["paired_comparisons"]["q_lambda"]["deltas"] == expected_q_deltas
     assert lane.validate_report(report, require_current_source=True) == report
+
+
+def test_report_rejects_runtime_identity_drift(
+    complete_records: tuple[list[dict[str, object]], list[dict[str, object]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lane, "_current_source", lambda: {"git_commit": "c" * 40})
+    runtime = {"backend": "cpu", "dependency_lock": "a" * 64}
+    monkeypatch.setattr(lane, "_current_runtime", lambda: runtime)
+    report = lane.build_report(
+        *complete_records,
+        dataset_provenance=lane.frozen_plan()["dataset"],
+        execution_source_commit="c" * 40,
+    )
+    monkeypatch.setattr(
+        lane,
+        "_current_runtime",
+        lambda: {"backend": "cpu", "dependency_lock": "b" * 64},
+    )
+    with pytest.raises(ValueError, match="runtime environment"):
+        lane.validate_report(report, require_current_source=True)
 
 
 def test_report_rejects_missing_shard_arithmetic_and_promotion(

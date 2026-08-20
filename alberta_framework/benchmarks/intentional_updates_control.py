@@ -19,6 +19,7 @@ import platform
 import secrets
 import stat
 import subprocess
+import sys
 import time
 from collections.abc import Sequence
 from pathlib import Path
@@ -31,7 +32,6 @@ import numpy as np
 from alberta_framework.benchmarks.adamo_diagnostic import _load_dataset
 from alberta_framework.benchmarks.ipmnist_screening import (
     _screening_dataset_provenance,
-    _screening_runtime_environment,
     _screening_source_provenance,
     intentional_updates_development_record,
     run_screening_config,
@@ -127,11 +127,13 @@ def frozen_plan() -> dict[str, object]:
                 "alberta_framework/benchmarks/ipmnist_screening.py",
                 "alberta_framework/benchmarks/plasticity_comparators.py",
                 "alberta_framework/benchmarks/upgd_ipmnist.py",
+                "pyproject.toml",
+                "uv.lock",
             ],
         },
         "runtime_identity_policy": (
-            "retain the exact execution Python, platform, package, JAX backend, "
-            "device, and configuration identity in every report"
+            "retain exact execution Python, platform, all direct dependency versions, "
+            "JAX backend/device/configuration, and relevant process environment"
         ),
         "seeds": list(CAMPAIGN_SEEDS),
         "quarantined_test_consumed_seeds": list(QUARANTINED_SEEDS),
@@ -281,6 +283,8 @@ def _source_identity() -> dict[str, str]:
         "alberta_framework/benchmarks/ipmnist_screening.py",
         "alberta_framework/benchmarks/plasticity_comparators.py",
         "alberta_framework/benchmarks/upgd_ipmnist.py",
+        "pyproject.toml",
+        "uv.lock",
     )
     return {
         relative: hashlib.sha256((_REPO_ROOT / relative).read_bytes()).hexdigest()
@@ -288,14 +292,71 @@ def _source_identity() -> dict[str, str]:
     }
 
 
-def _runtime_identity() -> dict[str, str]:
+def _runtime_identity() -> dict[str, object]:
+    environment_names = (
+        "JAX_DEFAULT_MATMUL_PRECISION",
+        "JAX_DEFAULT_PRNG_IMPL",
+        "JAX_ENABLE_X64",
+        "JAX_NUM_CPU_DEVICES",
+        "JAX_PLATFORMS",
+        "JAX_PLATFORM_NAME",
+        "JAX_RANDOM_SEED_OFFSET",
+        "XLA_FLAGS",
+    )
     return {
-        "python": platform.python_version(),
-        "jax": _version("jax"),
-        "jaxlib": _version("jaxlib"),
-        "numpy": _version("numpy"),
-        "backend": jax.default_backend(),
-        "platform": platform.platform(),
+        "schema": "asi.intentional-updates.runtime.v1",
+        "python": list(sys.version_info[:3]),
+        "python_implementation": platform.python_implementation(),
+        "byteorder": sys.byteorder,
+        "platform": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "machine": platform.machine(),
+        },
+        "packages": {
+            name: _version(name)
+            for name in (
+                "chex",
+                "jax",
+                "jaxlib",
+                "jaxtyping",
+                "numpy",
+                "orbax-checkpoint",
+                "scikit-learn",
+                "scipy",
+            )
+        },
+        "jax": {
+            "backend": jax.default_backend(),
+            "devices": [
+                {
+                    "id": int(device.id),
+                    "platform": str(device.platform),
+                    "device_kind": str(device.device_kind),
+                    "process_index": int(device.process_index),
+                }
+                for device in jax.devices()
+            ],
+            "config": {
+                "jax_default_matmul_precision": str(
+                    jax.config.jax_default_matmul_precision
+                ),
+                "jax_default_prng_impl": str(jax.config.jax_default_prng_impl),
+                "jax_disable_jit": bool(jax.config.jax_disable_jit),
+                "jax_enable_x64": bool(jax.config.jax_enable_x64),
+                "jax_numpy_dtype_promotion": str(
+                    jax.config.jax_numpy_dtype_promotion.value
+                ),
+                "jax_numpy_rank_promotion": str(jax.config.jax_numpy_rank_promotion),
+                "jax_random_seed_offset": int(jax.config.jax_random_seed_offset),
+                "jax_threefry_partitionable": bool(
+                    jax.config.jax_threefry_partitionable
+                ),
+            },
+        },
+        "process_environment": {
+            name: os.environ.get(name) for name in environment_names
+        },
     }
 
 
@@ -688,7 +749,7 @@ def _current_source() -> dict[str, object]:
 
 
 def _current_runtime() -> dict[str, object]:
-    return _screening_runtime_environment()
+    return _runtime_identity()
 
 
 def _digest(value: object, *, length: int, context: str) -> str:

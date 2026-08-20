@@ -20,6 +20,11 @@ counts within each pair, and asks four two-sided paired questions with a Bonferr
 bytes, data/environment steps, updates, model/action queries, RNG operations, and optimizer solves
 are explicit in every child record.
 
+Execution provenance binds the exact `pyproject.toml` and `uv.lock` bytes alongside all consumed
+Python sources. Runtime provenance records every direct project dependency version, Python and
+platform identity, JAX backend, devices and configuration, and relevant JAX/XLA environment. Both
+identities are checked throughout execution and again during strict report validation.
+
 The supervised pair shares its example schedule. All three linear pairs consume one seed-derived
 uniform behavior stream within a pair, so states, actions, rewards, observations, and update counts
 remain matched while learner parameters may differ. Q(lambda) is assessed by learner-sensitive
