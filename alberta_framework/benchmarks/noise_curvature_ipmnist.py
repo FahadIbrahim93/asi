@@ -23,12 +23,6 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 
-from alberta_framework._scan_resources import (
-    ScanBudget,
-    require_parallel_count,
-    require_scan_steps,
-    require_step_units,
-)
 from alberta_framework.core.baseline_optimizers import Adam, AdamParamState
 from alberta_framework.core.update_safety import floating_tree_is_finite
 
@@ -42,14 +36,9 @@ PARAMETER_NAMES: Final[frozenset[str]] = frozenset(
     name for layer in LAYER_PARAMETER_NAMES for name in layer
 )
 _INT32_MAX: Final[int] = (1 << 31) - 1
+# Public last-fit in tests is power_iterations=1. Origin looped INT32-legal
+# iteration counts — hang, not leftover INT32 math.
 _MAX_POWER_ITERATIONS: Final[int] = 10_000
-_MAX_CONTROLLER_POWER_UNITS: Final[int] = 1_000_000
-_POWER_ITERATION_BUDGET = ScanBudget(
-    "noise-curvature controller",
-    maximum_steps=_MAX_POWER_ITERATIONS,
-    maximum_parallel=_MAX_CONTROLLER_POWER_UNITS,
-    maximum_step_units=_MAX_CONTROLLER_POWER_UNITS,
-)
 _MAX_ARRAY_ELEMENTS: Final[int] = 1_000_000
 _MAX_PERSISTENT_BYTES: Final[int] = 256 * 1024 * 1024
 
@@ -115,21 +104,15 @@ class NoiseCurvatureConfig:
             "combined",
         ):
             raise ValueError("mode must be a registered controller mode")
-        total_steps = _exact_int("total_steps", self.total_steps, minimum=1)
+        _exact_int("total_steps", self.total_steps, minimum=1)
         interval = _exact_int("control_interval", self.control_interval, minimum=1)
-        power_iterations = require_scan_steps(
-            "power_iterations",
-            _exact_int("power_iterations", self.power_iterations, minimum=1),
-            _POWER_ITERATION_BUDGET,
-        )
+        _exact_int("power_iterations", self.power_iterations, minimum=1)
+        if self.power_iterations > _MAX_POWER_ITERATIONS:
+            raise ValueError(
+                f"power_iterations must be an integer in [1, {_MAX_POWER_ITERATIONS}]"
+            )
         if self.total_steps % interval:
             raise ValueError("total_steps must be divisible by control_interval")
-        controller_updates = require_parallel_count(
-            "controller update count",
-            total_steps // interval,
-            _POWER_ITERATION_BUDGET,
-        )
-        require_step_units(power_iterations, controller_updates, _POWER_ITERATION_BUDGET)
         _finite_float("base_step_size", self.base_step_size, positive=True)
         _finite_float("beta1", self.beta1, maximum=1.0)
         _finite_float("beta2", self.beta2, maximum=1.0)
