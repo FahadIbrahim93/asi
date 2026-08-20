@@ -64,6 +64,10 @@ class HistoryFeatureState:
 # =============================================================================
 
 _INT32_MAX = 2**31 - 1
+# Same list ceiling as HordeSpec demons / JAX seed-sequence length. Origin
+# enumerated every decay/channel before the INT32 feature_dim product.
+_MAX_HISTORY_DECAY_RATES = 4_096
+_MAX_HISTORY_CHANNELS = 4_096
 _ACTUAL_INT_TYPES = frozenset(
     {
         int,
@@ -135,6 +139,10 @@ def _require_decay_rates(value: object) -> tuple[float, ...]:
     if type(value) is not tuple:
         raise ValueError("decay_rates must be an actual tuple")
     rates = cast(tuple[object, ...], value)
+    if len(rates) > _MAX_HISTORY_DECAY_RATES:
+        raise ValueError(
+            f"decay_rates must contain at most {_MAX_HISTORY_DECAY_RATES} rates"
+        )
     return tuple(
         validated_float32_scalar(
             f"decay_rates[{index}]",
@@ -152,6 +160,11 @@ def _require_channels(value: object, raw_dim: int) -> tuple[int, ...] | None:
         return None
     if type(value) is not tuple:
         raise ValueError("channels must be an actual tuple or None")
+    channels = cast(tuple[object, ...], value)
+    if len(channels) > _MAX_HISTORY_CHANNELS:
+        raise ValueError(
+            f"channels must contain at most {_MAX_HISTORY_CHANNELS} indices"
+        )
     return tuple(
         _require_int32(
             f"channels[{index}]",
@@ -159,7 +172,7 @@ def _require_channels(value: object, raw_dim: int) -> tuple[int, ...] | None:
             minimum=0,
             maximum=raw_dim - 1,
         )
-        for index, channel in enumerate(cast(tuple[object, ...], value))
+        for index, channel in enumerate(channels)
     )
 
 
