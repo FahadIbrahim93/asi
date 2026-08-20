@@ -162,7 +162,7 @@ def frozen_plan() -> dict[str, object]:
             "phase_length": 64,
             "discount": 0.95,
             "trace_decay": 0.8,
-            "epsilon_greedy": 0.1,
+            "behavior_policy": "seeded_uniform_random_common_within_pair",
         },
         "matched_axes": {
             "all_families": [
@@ -173,11 +173,9 @@ def frozen_plan() -> dict[str, object]:
                 "allowed_boundary_and_task_information",
             ],
             "supervised_ipmnist": ["example_schedule"],
-            "td_prediction": ["transition_schedule"],
-            "q_lambda_control": [
-                "environment_dynamics",
-                "agent_rng_root_and_index_schedule",
-                "policy-dependent realized trajectories are not matched",
+            "td_control": [
+                "transition_schedule",
+                "behavior_rng_root_and_index_schedule",
             ],
         },
         "boundary_information": [],
@@ -186,7 +184,7 @@ def frozen_plan() -> dict[str, object]:
             "supervised_ipmnist": "mean_per_task_accuracy:higher",
             "td0": "mean_squared_td_error:lower",
             "trace": "mean_squared_td_error:lower",
-            "q_lambda": "mean_reward:higher",
+            "q_lambda": "mean_squared_td_error:lower",
         },
         "confidence_method": "two_sided_student_t_bonferroni_four_comparisons",
         "familywise_confidence": 0.95,
@@ -313,12 +311,9 @@ def _transition(state: int, action: int, step: int, phase_length: int) -> tuple[
     return successor, 1.0 if successor == goal else 0.0
 
 
-def _select_action(values: np.ndarray, key: jax.Array) -> tuple[int, bool, bool]:
-    explore_key, action_key = jr.split(key)
-    greedy = int(np.argmax(values))
-    explore = float(jr.uniform(explore_key, (), dtype=np.float32)) < 0.1
-    action = int(jr.randint(action_key, (), 0, 2)) if explore else greedy
-    return action, explore, action != greedy
+def _behavior_action(key: jax.Array) -> int:
+    """Return one arm-independent action from the paired behavior stream."""
+    return int(jr.randint(key, (), 0, 2))
 
 
 def _intentional_update(
@@ -376,25 +371,17 @@ def _run(
     second = np.zeros(shape, dtype=np.float32)
     sigma = np.float32(0.0)
     clip_ema = np.float32(0.0)
-    root = jr.key(seed, impl=_AGENT_RNG_IMPL) if is_control else None
-    state = seed % 2
+    root = jr.key(seed, impl=_AGENT_RNG_IMPL)
+    state = int(jr.randint(jr.fold_in(root, _MAX_HORIZON), (), 0, 2))
     states = [state]
     actions: list[int] = []
     rewards: list[float] = []
     errors: list[float] = []
     step_sizes: list[float] = []
-    integer_draws = 0
     start_ns = time.perf_counter_ns()
     for index in range(horizon):
-        if is_control:
-            assert root is not None
-            action, explored, non_greedy = _select_action(
-                weights[state], jr.fold_in(root, index)
-            )
-            integer_draws += int(explored)
-        else:
-            action = (index + seed) % 2
-            non_greedy = False
+        action = _behavior_action(jr.fold_in(root, index))
+        non_greedy = is_control and action != int(np.argmax(weights[state]))
         successor, reward = _transition(state, action, index, phase_length)
         if is_control:
             prediction = np.float32(weights[state, action])
@@ -443,8 +430,7 @@ def _run(
             + 2 * np.dtype(np.float32).itemsize
             + np.dtype(np.int32).itemsize
         )
-    if root is not None:
-        numeric_bytes += int(root.nbytes)
+    numeric_bytes += int(root.nbytes)
     trajectory = {
         "states": states,
         "actions": actions,
@@ -459,7 +445,7 @@ def _run(
         "global_normalizer": float(sigma) if intentional else 0.0,
         "clip_squared_error_ema": float(clip_ema) if intentional else 0.0,
         "optimizer_step": horizon if intentional else 0,
-        "agent_rng_root": jr.key_data(root).tolist() if root is not None else [],
+        "behavior_rng_root": jr.key_data(root).tolist(),
     }
     resources: dict[str, object] = {
         "observations": horizon,
@@ -468,11 +454,11 @@ def _run(
         "reward_observations": horizon,
         "updates": horizon,
         "model_queries": 2 * horizon,
-        "action_queries": horizon if is_control else 0,
-        "rng_splits": horizon if is_control else 0,
-        "rng_fold_ins": horizon if is_control else 0,
-        "rng_uniform_draws": horizon if is_control else 0,
-        "rng_integer_draws": integer_draws if is_control else 0,
+        "action_queries": 0,
+        "rng_splits": 0,
+        "rng_fold_ins": horizon + 1,
+        "rng_uniform_draws": 0,
+        "rng_integer_draws": horizon + 1,
         "intentional_step_size_solves": horizon if intentional else 0,
         "persistent_numeric_bytes": numeric_bytes,
         "timing_telemetry_ns": timing_ns,
@@ -540,7 +526,7 @@ def _run_control_shard_authorized(
             "trace_decay": 0.0 if execution_arm.endswith("td0") else 0.8,
             "fixed_step_size": 0.05,
             "intentional_fraction": 0.5,
-            "epsilon_greedy": 0.1,
+            "behavior_policy": "seeded_uniform_random_common_within_pair",
         },
         "references": {
             "paper": PAPER_REVISION,
@@ -552,7 +538,7 @@ def _run_control_shard_authorized(
         },
         "information": {"boundary_information": [], "task_information": []},
         "identity": {
-            "agent_rng_impl": _AGENT_RNG_IMPL,
+            "behavior_rng_impl": _AGENT_RNG_IMPL,
             "source_sha256": _source_identity(),
             "runtime": _runtime_identity(),
             "workload": "asi.recurring-two-state-continuing-mdp.v1",
@@ -601,7 +587,7 @@ def validate_control_shard(value: object) -> dict[str, object]:
         frozenset(
             {
                 "horizon", "phase_length", "discount", "trace_decay", "fixed_step_size",
-                "intentional_fraction", "epsilon_greedy",
+                "intentional_fraction", "behavior_policy",
             }
         ),
         context="control config",
@@ -660,7 +646,7 @@ def validate_control_shard(value: object) -> dict[str, object]:
         "trace_decay": 0.0 if execution_arm.endswith("td0") else 0.8,
         "fixed_step_size": 0.05,
         "intentional_fraction": 0.5,
-        "epsilon_greedy": 0.1,
+        "behavior_policy": "seeded_uniform_random_common_within_pair",
     }
     expected_record["references"] = {
         "paper": PAPER_REVISION,
@@ -672,7 +658,7 @@ def validate_control_shard(value: object) -> dict[str, object]:
     }
     expected_record["information"] = {"boundary_information": [], "task_information": []}
     expected_record["identity"] = {
-        "agent_rng_impl": _AGENT_RNG_IMPL,
+        "behavior_rng_impl": _AGENT_RNG_IMPL,
         "source_sha256": _source_identity(),
         "runtime": _runtime_identity(),
         "workload": "asi.recurring-two-state-continuing-mdp.v1",
@@ -843,8 +829,8 @@ def _comparisons(runs: list[dict[str, object]]) -> dict[str, object]:
             - metric("intentional_trace", "mean_squared_td_error")
         )
         q_deltas.append(
-            metric("intentional_q_lambda", "mean_reward")
-            - metric("fixed_q_lambda", "mean_reward")
+            metric("fixed_q_lambda", "mean_squared_td_error")
+            - metric("intentional_q_lambda", "mean_squared_td_error")
         )
     return {
         "supervised_ipmnist": _paired(supervised_deltas),

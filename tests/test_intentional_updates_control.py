@@ -114,10 +114,10 @@ def test_each_control_arm_runs_end_to_end_with_exact_resources(arm: str) -> None
 @pytest.mark.parametrize(
     ("arm", "expected_bytes"),
     [
-        ("fixed_td0", 16),
-        ("intentional_td0", 36),
-        ("fixed_trace", 16),
-        ("intentional_trace", 36),
+        ("fixed_td0", 24),
+        ("intentional_td0", 44),
+        ("fixed_trace", 24),
+        ("intentional_trace", 44),
         ("fixed_q_lambda", 40),
         ("intentional_q_lambda", 68),
     ],
@@ -137,15 +137,41 @@ def test_prediction_and_control_information_and_rng_are_explicit() -> None:
         "intentional_q_lambda", seed=lane.SEEDS[2], horizon=16, phase_length=4
     )
     assert prediction["resources"]["action_queries"] == 0
-    assert prediction["resources"]["rng_fold_ins"] == 0
-    assert control["resources"]["action_queries"] == 16
-    assert control["resources"]["rng_fold_ins"] == 16
-    assert control["resources"]["rng_splits"] == 16
-    assert control["resources"]["rng_uniform_draws"] == 16
-    assert 0 <= control["resources"]["rng_integer_draws"] <= 16
-    assert control["identity"]["agent_rng_impl"] == "threefry2x32"
+    assert prediction["resources"]["rng_fold_ins"] == 17
+    assert control["resources"]["action_queries"] == 0
+    assert control["resources"]["rng_fold_ins"] == 17
+    assert control["resources"]["rng_splits"] == 0
+    assert control["resources"]["rng_uniform_draws"] == 0
+    assert control["resources"]["rng_integer_draws"] == 17
+    assert control["identity"]["behavior_rng_impl"] == "threefry2x32"
+    assert prediction["final_state"]["behavior_rng_root"]
     assert prediction["information"]["boundary_information"] == []
     assert prediction["information"]["task_information"] == []
+
+
+@pytest.mark.parametrize(
+    ("fixed", "candidate"),
+    [
+        ("fixed_td0", "intentional_td0"),
+        ("fixed_trace", "intentional_trace"),
+        ("fixed_q_lambda", "intentional_q_lambda"),
+    ],
+)
+def test_pairs_share_one_exogenous_behavior_trajectory(
+    fixed: str, candidate: str
+) -> None:
+    control = _control(fixed, seed=lane.SEEDS[0], horizon=64, phase_length=8)
+    intentional = _control(candidate, seed=lane.SEEDS[0], horizon=64, phase_length=8)
+    for field in ("states", "actions", "rewards"):
+        assert control["trajectory"][field] == intentional["trajectory"][field]
+
+
+def test_seed_roster_produces_independent_behavior_schedules() -> None:
+    schedules = {
+        tuple(_control("fixed_td0", seed=seed, horizon=64)["trajectory"]["actions"])
+        for seed in lane.SEEDS
+    }
+    assert len(schedules) == len(lane.SEEDS)
 
 
 def test_validator_rejects_nested_subclasses_without_hooks() -> None:

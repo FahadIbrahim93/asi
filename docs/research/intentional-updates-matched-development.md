@@ -20,11 +20,11 @@ counts within each pair, and asks four two-sided paired questions with a Bonferr
 bytes, data/environment steps, updates, model/action queries, RNG operations, and optimizer solves
 are explicit in every child record.
 
-The supervised pair shares its example schedule and the prediction pairs share their realized
-transition schedule. The Q(lambda) pair instead shares the environment dynamics plus the agent RNG
-root/index schedule: learned policies can choose different actions and therefore produce different
-realized trajectories. Those policy-dependent trajectories are deliberately not described as a
-matched axis.
+The supervised pair shares its example schedule. All three linear pairs consume one seed-derived
+uniform behavior stream within a pair, so states, actions, rewards, observations, and update counts
+remain matched while learner parameters may differ. Q(lambda) is assessed by learner-sensitive
+mean squared TD error rather than the common behavior stream's necessarily identical reward. Each
+seed derives a distinct behavior schedule; nominal roots are not duplicate parity aliases.
 
 Seeds `31561001..31561004` are quarantined because contract tests consumed them. Contract tests
 use a distinct test-only capability and roster. Execution and public publication are
