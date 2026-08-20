@@ -13,13 +13,14 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import json
-from alberta_framework._strict_json import load_strict_json_object
 import os
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn, TypeGuard, cast
+
+from alberta_framework._strict_json import load_strict_json_object
 
 _SOURCE_ROOT = Path("/opt/foragax-agents")
 _PROTOCOL_ROOT = Path("/protocol")

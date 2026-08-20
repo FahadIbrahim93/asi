@@ -28,12 +28,11 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-
-from alberta_framework._strict_json import load_strict_json_object
 from typing import Any, cast
 
 import jax
 
+from alberta_framework._strict_json import load_strict_json_object
 from alberta_framework.benchmarks.causal_map_forager import (
     CAUSAL_MAP_VARIANT_KIND,
     CausalMapForagerAgent,
@@ -557,6 +556,51 @@ def historical_main(
     return 0
 
 
+def _verified_reference_manifest_specs(
+    parser: argparse.ArgumentParser,
+    manifest_paths: Sequence[Path],
+    environment: Any,
+) -> tuple[Any, ...]:
+    """Verify reference manifests before any benchmark execution begins."""
+
+    from alberta_framework.benchmarks import official_foragax as official_foragax_module
+
+    specs: list[Any] = []
+    for manifest_path in manifest_paths:
+        try:
+            dispatch = load_strict_json_object(manifest_path)
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            parser.error(f"could not decode --reference-manifest {manifest_path}: {exc}")
+        manifest_kind = dispatch.get("manifest_kind")
+        try:
+            if manifest_kind == "official_foragax_single":
+                verified = (
+                    official_foragax_module.official_foragax_run_spec_from_manifest(
+                        manifest_path,
+                        environment=environment,
+                    ),
+                )
+            elif manifest_kind == "official_foragax_batch":
+                verified = (
+                    official_foragax_module.official_foragax_batch_run_specs_from_manifest(
+                        manifest_path,
+                        environment=environment,
+                    )
+                )
+            else:
+                parser.error(
+                    f"--reference-manifest {manifest_path} has unsupported "
+                    f"manifest_kind {manifest_kind!r}"
+                )
+        except (
+            official_foragax_module.OfficialForagaxValidationError,
+            FileNotFoundError,
+        ) as exc:
+            parser.error(f"--reference-manifest {manifest_path} did not verify: {exc}")
+        specs.extend(verified)
+    return tuple(specs)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the benchmark CLI."""
     _configure_logging()
@@ -698,6 +742,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         features=features,
     )
 
+    manifest_specs = _verified_reference_manifest_specs(
+        parser,
+        args.reference_manifest,
+        environment,
+    )
+
     agents = args.agents or ["alberta", "random"]
     if "causal-map" in agents and preset != "field_of_view":
         parser.error("--agent causal-map is defined only for --preset field_of_view")
@@ -763,56 +813,15 @@ def main(argv: Sequence[str] | None = None) -> int:
                 final_window=benchmark_config.final_window,
             )
         )
-    for manifest_path in args.reference_manifest:
-        try:
-            dispatch = load_strict_json_object(manifest_path)
-        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
-            parser.error(
-                f"could not decode --reference-manifest {manifest_path}: {exc}"
-            )
-        if not isinstance(dispatch, Mapping):
-            parser.error(
-                f"--reference-manifest {manifest_path} must contain a JSON object"
-            )
-        manifest_kind = dispatch.get("manifest_kind")
-        from alberta_framework.benchmarks import (
-            official_foragax as official_foragax_module,
+    runs.extend(
+        import_official_foragax_npz(
+            spec,
+            ewm_decay=protocol.ewm_decay,
+            record_every=args.record_every,
+            final_window=benchmark_config.final_window,
         )
-
-        try:
-            if manifest_kind == "official_foragax_single":
-                specs = (
-                    official_foragax_module.official_foragax_run_spec_from_manifest(
-                        manifest_path,
-                        environment=environment,
-                    ),
-                )
-            elif manifest_kind == "official_foragax_batch":
-                specs = official_foragax_module.official_foragax_batch_run_specs_from_manifest(
-                    manifest_path,
-                    environment=environment,
-                )
-            else:
-                parser.error(
-                    f"--reference-manifest {manifest_path} has unsupported "
-                    f"manifest_kind {manifest_kind!r}"
-                )
-        except (
-            official_foragax_module.OfficialForagaxValidationError,
-            FileNotFoundError,
-        ) as exc:
-            parser.error(
-                f"--reference-manifest {manifest_path} did not verify: {exc}"
-            )
-        runs.extend(
-            import_official_foragax_npz(
-                spec,
-                ewm_decay=protocol.ewm_decay,
-                record_every=args.record_every,
-                final_window=benchmark_config.final_window,
-            )
-            for spec in specs
-        )
+        for spec in manifest_specs
+    )
 
     grouped: dict[str, list[Any]] = {}
     for run in runs:
