@@ -9,6 +9,7 @@ import math
 import operator
 import time
 from collections.abc import Sequence
+from itertools import islice
 from numbers import Real
 from typing import Any, SupportsIndex, cast
 
@@ -944,13 +945,16 @@ def create_horde_spec(demons: Sequence[GVFSpec]) -> HordeSpec:
         raise ValueError(
             f"demons must contain at most {_MAX_HORDE_DEMONS} GVFSpec entries"
         )
-    demons_tuple = tuple(demons)
-    if not demons_tuple or any(type(demon) is not GVFSpec for demon in demons_tuple):
-        raise ValueError("demons must be a nonempty sequence of GVFSpec")
+    if type(demons) in (list, tuple):
+        demons_tuple = tuple(demons)
+    else:
+        demons_tuple = tuple(islice(iter(demons), _MAX_HORDE_DEMONS + 1))
     if len(demons_tuple) > _MAX_HORDE_DEMONS:
         raise ValueError(
             f"demons must contain at most {_MAX_HORDE_DEMONS} GVFSpec entries"
         )
+    if not demons_tuple or any(type(demon) is not GVFSpec for demon in demons_tuple):
+        raise ValueError("demons must be a nonempty sequence of GVFSpec")
     gammas = jnp.array([d.gamma for d in demons_tuple], dtype=jnp.float32)
     lamdas = jnp.array([d.lamda for d in demons_tuple], dtype=jnp.float32)
     return HordeSpec(demons=demons_tuple, gammas=gammas, lamdas=lamdas)

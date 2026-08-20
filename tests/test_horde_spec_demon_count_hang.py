@@ -8,6 +8,8 @@ A cheap ``[spec] * 400_000`` pointer-repeat took 3.736s on origin/main.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator, Sequence
+from typing import overload
 
 import pytest
 
@@ -65,3 +67,40 @@ def test_create_horde_spec_rejects_oversized_pointer_repeat() -> None:
     with pytest.raises(ValueError, match="at most 4096"):
         create_horde_spec([_demon()] * 400_000)
     assert time.perf_counter() - started < 0.5
+
+
+class _CountingDemonSequence(Sequence[GVFSpec]):
+    def __init__(self, item_count: int) -> None:
+        self.item_count = item_count
+        self.yields = 0
+        self.value = _demon()
+
+    def __len__(self) -> int:
+        return self.item_count
+
+    @overload
+    def __getitem__(self, index: int) -> GVFSpec: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> Sequence[GVFSpec]: ...
+
+    def __getitem__(self, index: int | slice) -> GVFSpec | Sequence[GVFSpec]:
+        if isinstance(index, slice):
+            return tuple(self.value for _ in range(*index.indices(self.item_count)))
+        if not 0 <= index < self.item_count:
+            raise IndexError(index)
+        return self.value
+
+    def __iter__(self) -> Iterator[GVFSpec]:
+        for _ in range(self.item_count):
+            self.yields += 1
+            yield self.value
+
+
+def test_create_horde_spec_bounds_generic_sequence_consumption() -> None:
+    demons = _CountingDemonSequence(400_000)
+
+    with pytest.raises(ValueError, match="at most 4096"):
+        create_horde_spec(demons)
+
+    assert demons.yields <= _MAX_HORDE_DEMONS + 1
