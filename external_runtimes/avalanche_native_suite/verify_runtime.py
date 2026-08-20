@@ -143,6 +143,29 @@ def _preflight(value: object) -> None:
             raise ValueError("plan exceeds its cumulative text limit")
 
 
+def _json_exact_equal(left: object, right: object) -> bool:
+    """Compare admitted JSON without Python's bool/int/float equality aliases."""
+
+    if type(left) is not type(right):
+        return False
+    if type(left) is list:
+        left_list = cast("list[object]", left)
+        right_list = cast("list[object]", right)
+        return len(left_list) == len(right_list) and all(
+            _json_exact_equal(left_item, right_item)
+            for left_item, right_item in zip(left_list, right_list, strict=True)
+        )
+    if type(left) is dict:
+        left_dict = cast("dict[str, object]", left)
+        right_dict = cast("dict[str, object]", right)
+        if left_dict.keys() != right_dict.keys():
+            return False
+        return all(
+            _json_exact_equal(left_dict[key], right_dict[key]) for key in left_dict
+        )
+    return left == right
+
+
 def _exact_keys(
     value: object, expected: Sequence[str], *, name: str
 ) -> dict[str, JsonValue]:
@@ -216,7 +239,7 @@ def _source_tree(directory: Path) -> bytes:
 def _validate_plan(plan: dict[str, JsonValue]) -> None:
     if plan["schema"] != "asi.avalanche_native_suite.prospective_runtime.v1":
         raise ValueError("plan schema differs")
-    if plan["qualification_issue"] != 1578:
+    if not _json_exact_equal(plan["qualification_issue"], 1578):
         raise ValueError("plan issue differs")
     authority = _exact_keys(
         plan["authority"],
@@ -232,7 +255,7 @@ def _validate_plan(plan: dict[str, JsonValue]) -> None:
         ),
         name="authority",
     )
-    if authority != {
+    if not _json_exact_equal(authority, {
         "paper_revision": "arXiv:2302.01766v1",
         "repository": "https://github.com/ContinualAI/avalanche.git",
         "commit": SOURCE_COMMIT,
@@ -243,7 +266,7 @@ def _validate_plan(plan: dict[str, JsonValue]) -> None:
         "license": "MIT",
         "license_sha256": REQUIRED_SOURCE_SHA256["LICENSE"],
         "required_file_sha256": REQUIRED_SOURCE_SHA256,
-    }:
+    }):
         raise ValueError("source authority differs from the audited official revision")
     inputs = _exact_keys(
         plan["qualification_inputs"],
@@ -323,7 +346,7 @@ def _validate_plan(plan: dict[str, JsonValue]) -> None:
         "compatibility_deviations": COMPATIBILITY_DEVIATIONS,
         "future_invocation_requirements": FUTURE_INVOCATION_REQUIREMENTS,
     }
-    if runtime != expected_runtime:
+    if not _json_exact_equal(runtime, expected_runtime):
         raise ValueError("runtime plan differs")
     diagnostic = _exact_keys(
         plan["prospective_diagnostic"],
@@ -338,7 +361,7 @@ def _validate_plan(plan: dict[str, JsonValue]) -> None:
         ),
         name="prospective diagnostic",
     )
-    if diagnostic != {
+    if not _json_exact_equal(diagnostic, {
         "families": ["SplitMNIST", "RotatedMNIST", "SplitCIFAR100", "existing ASI IPMNIST"],
         "avalanche_scenario_construction_only": True,
         "dataset_in_image": False,
@@ -346,7 +369,7 @@ def _validate_plan(plan: dict[str, JsonValue]) -> None:
         "workload_executed": False,
         "receipt_created": False,
         "parity_verified": False,
-    }:
+    }):
         raise ValueError("prospective diagnostic differs")
     claims = _exact_keys(
         plan["claims"],
@@ -363,7 +386,7 @@ def _validate_plan(plan: dict[str, JsonValue]) -> None:
         ),
         name="claims",
     )
-    if claims != {
+    if not _json_exact_equal(claims, {
         "runtime_build_verified": False,
         "bit_reproducible_image_claimed": False,
         "external_workload_executed": False,
@@ -373,9 +396,9 @@ def _validate_plan(plan: dict[str, JsonValue]) -> None:
         "performance_metrics_computed": False,
         "scientific_promotion_allowed": False,
         "external_execution_authorized": False,
-    }:
+    }):
         raise ValueError("plan claims exceed a prospective runtime")
-    if plan["blockers"] != BLOCKERS:
+    if not _json_exact_equal(plan["blockers"], BLOCKERS):
         raise ValueError("plan must retain all ten exact blockers")
 
 

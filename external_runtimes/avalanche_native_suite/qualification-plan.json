@@ -24,7 +24,7 @@
     "requirements_in_sha256": "ee1999d77202779e6b1e7ea29c23b8ca435a004b91ed6505d7faa210ee545a21",
     "requirements_lock_sha256": "9f9e2943b528d7fa692dc2e91e96f7085d38df879e4e35bdc3958542763e40dd",
     "fetch_source_sha256": "8b0b39cd5b24948f213755d370bd2262188b0ae2b7bf432a66bc8b127203eed5",
-    "verify_runtime_sha256": "3b2d7d31ee0b2ec9adab8d1e7fdab6c2bacc71965e4985c3187e76cd17c67d0e"
+    "verify_runtime_sha256": "61922591ec3f0bcf4f4b26282149402329cebe46fab124fc6aa2136571c50cc1"
   },
   "runtime": {
     "platform": "linux-x86_64",

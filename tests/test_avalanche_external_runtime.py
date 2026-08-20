@@ -134,6 +134,54 @@ def test_verifier_accepts_exact_plan_and_rejects_weakened_future_gates(
         verifier._validate_plan(removed)
 
 
+@pytest.mark.parametrize(
+    ("section", "field", "alias", "message"),
+    [
+        ("claims", "external_execution_authorized", 0, "claims exceed"),
+        ("claims", "scientific_promotion_allowed", 0, "claims exceed"),
+        ("prospective_diagnostic", "dataset_in_image", 0, "diagnostic differs"),
+        (
+            "prospective_diagnostic",
+            "avalanche_scenario_construction_only",
+            1,
+            "diagnostic differs",
+        ),
+    ],
+)
+def test_verifier_rejects_boolean_integer_aliases(
+    section: str,
+    field: str,
+    alias: int,
+    message: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    verifier = _module()
+    for source, destination in (
+        ("Dockerfile", "Dockerfile.source"),
+        ("requirements.in", "requirements.in"),
+        ("requirements.lock", "requirements.lock"),
+        ("fetch_source.py", "fetch_source.py"),
+        ("verify_runtime.py", "verify_runtime.py"),
+    ):
+        (tmp_path / destination).write_bytes((ROOT / source).read_bytes())
+    monkeypatch.setattr(verifier, "QUALIFICATION_ROOT", tmp_path)
+    plan = _plan()
+    nested = plan[section]
+    assert type(nested) is dict
+    nested[field] = alias
+    with pytest.raises(ValueError, match=message):
+        verifier._validate_plan(plan)
+
+
+def test_verifier_rejects_numeric_alias_for_issue_identity() -> None:
+    verifier = _module()
+    plan = _plan()
+    plan["qualification_issue"] = 1578.0
+    with pytest.raises(ValueError, match="plan issue differs"):
+        verifier._validate_plan(plan)
+
+
 def test_verifier_rejects_hostile_or_unbounded_plan_before_hooks() -> None:
     verifier = _module()
     hostile = _HookMapping({"schema": "x"})
