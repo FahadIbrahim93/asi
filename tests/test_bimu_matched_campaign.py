@@ -370,6 +370,7 @@ def test_cli_validate_cross_binds_aggregate_to_reexecuted_shard_files(
             ),
             shard,
             root=tmp_path,
+            _completed_replay_arrays=_slice_data(),
         )
     different_valid_aggregate = campaign.summarize_bimu_shards(_six_shards())
     campaign.publish_json(
@@ -471,19 +472,145 @@ def test_publication_race_retains_concurrent_destination(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
-def test_shard_publisher_does_not_run_unreceipted_reexecution(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_campaign: Any
+def test_completed_shard_publisher_requires_replay_arrays(
+    tmp_path: Path, tiny_campaign: Any
 ) -> None:
     destination = campaign.campaign_path(
         tmp_path, "shard", arm="memory_off", seed=157001
     )
     shard = campaign.run_bimu_shard("memory_off", 157001)
-    def forbidden(*args: object, **kwargs: object) -> None:
-        raise AssertionError("publisher performed an unreceipted learner replay")
-
-    monkeypatch.setattr(campaign, "validate_bimu_shard_by_reexecution", forbidden)
-    campaign.publish_json(destination, shard, root=tmp_path)
+    with pytest.raises(ValueError, match="strict dataset-bound admission"):
+        campaign.publish_json(destination, shard, root=tmp_path)
+    campaign.publish_json(
+        destination,
+        shard,
+        root=tmp_path,
+        _completed_replay_arrays=_slice_data(),
+    )
     assert destination.is_file()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_completed_shard_publisher_rejects_noncanonical_replay_arrays(
+    tmp_path: Path, tiny_campaign: Any
+) -> None:
+    destination = campaign.campaign_path(
+        tmp_path, "shard", arm="memory_off", seed=157001
+    )
+    shard = campaign.run_bimu_shard("memory_off", 157001)
+    invalid_arrays = list(_slice_data())
+    with pytest.raises(ValueError, match="strict dataset-bound admission"):
+        campaign.publish_json(
+            destination,
+            shard,
+            root=tmp_path,
+            _completed_replay_arrays=cast(Any, invalid_arrays),
+        )
+    assert not destination.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_forged_self_consistent_completed_shard_cannot_be_retained(
+    tmp_path: Path, tiny_campaign: Any
+) -> None:
+    destination = campaign.campaign_path(
+        tmp_path, "shard", arm="bimu", seed=157002
+    )
+    shard = campaign.run_bimu_shard("bimu", 157002)
+    forged = copy.deepcopy(shard)
+    forged["result"]["final_state_sha256"] = "0" * 64
+    forged["result"]["resources"]["state_changed"] = True
+    _resign(forged)
+    assert campaign.validate_bimu_shard(forged) == forged
+
+    with pytest.raises(ValueError, match="strict dataset-bound admission"):
+        campaign.publish_json(
+            destination,
+            forged,
+            root=tmp_path,
+            _completed_replay_arrays=_slice_data(),
+        )
+    assert not destination.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_cli_replays_before_retaining_completed_shard_and_receipts_forgery(
+    tmp_path: Path, tiny_campaign: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign.publish_json(
+        campaign.campaign_path(tmp_path, "plan"),
+        campaign.build_plan_document(),
+        root=tmp_path,
+    )
+    forged = copy.deepcopy(campaign.run_bimu_shard("bimu", 157002))
+    forged["result"]["final_state_sha256"] = "0" * 64
+    forged["result"]["resources"]["state_changed"] = True
+    _resign(forged)
+    assert campaign.validate_bimu_shard(forged) == forged
+    loads = 0
+
+    def load_once(_home: Path | None = None) -> tuple[np.ndarray, ...]:
+        nonlocal loads
+        loads += 1
+        return _slice_data()
+
+    monkeypatch.setattr(campaign, "load_frozen_bimu_dataset", load_once)
+    monkeypatch.setattr(campaign, "run_bimu_shard", lambda *args, **kwargs: forged)
+    assert (
+        campaign.main(
+            [
+                "run-shard",
+                "--root",
+                str(tmp_path),
+                "--arm",
+                "bimu",
+                "--seed",
+                "157002",
+            ]
+        )
+        == 1
+    )
+    destination = campaign.campaign_path(tmp_path, "shard", arm="bimu", seed=157002)
+    retained = campaign.validate_failed_bimu_shard(
+        campaign.load_json_strict(destination, byte_ceiling=campaign.MAX_SHARD_BYTES)
+    )
+    assert retained["status"] == "failed"
+    assert loads == 1
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_cli_retains_failure_receipt_when_strict_replay_raises_runtime_error(
+    tmp_path: Path, tiny_campaign: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign.publish_json(
+        campaign.campaign_path(tmp_path, "plan"),
+        campaign.build_plan_document(),
+        root=tmp_path,
+    )
+
+    def fail_replay(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("hostile replay failure must not escape")
+
+    monkeypatch.setattr(campaign, "validate_bimu_shard_by_reexecution", fail_replay)
+    assert (
+        campaign.main(
+            [
+                "run-shard",
+                "--root",
+                str(tmp_path),
+                "--arm",
+                "bimu",
+                "--seed",
+                "157002",
+            ]
+        )
+        == 1
+    )
+    destination = campaign.campaign_path(tmp_path, "shard", arm="bimu", seed=157002)
+    retained = campaign.validate_failed_bimu_shard(
+        campaign.load_json_strict(destination, byte_ceiling=campaign.MAX_SHARD_BYTES)
+    )
+    assert retained["status"] == "failed"
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
@@ -808,7 +935,7 @@ def test_validate_rejects_relocated_shards_before_loading_them(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
-def test_cli_completes_with_exactly_one_learner_execution(
+def test_cli_completes_after_one_execution_and_one_strict_replay(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_campaign: Any
 ) -> None:
     campaign.publish_json(
@@ -842,7 +969,7 @@ def test_cli_completes_with_exactly_one_learner_execution(
         == 0
     )
 
-    assert learner_runs == 1
+    assert learner_runs == 2
     assert destination.stat().st_mode & 0o777 == 0o444
     campaign.validate_bimu_shard(
         campaign.load_json_strict(destination, byte_ceiling=campaign.MAX_SHARD_BYTES)
