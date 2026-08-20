@@ -25,6 +25,7 @@ import jax.random as jr
 import numpy as np
 
 import alberta_framework.core.ftl_world_model as ftl_world_model_module
+from alberta_framework._scan_resources import ScanBudget, require_scan_steps
 from alberta_framework.benchmarks.development_provenance import (
     DevelopmentIdentity,
     collect_development_identity,
@@ -42,7 +43,8 @@ ARM_IDS = ("sparse_ftl_online", "sparse_ftl_frozen", "privileged_dynamics_mpc")
 ACTION_DELTAS = np.asarray(((1, 0), (-1, 0), (0, 1), (0, -1)), dtype=np.float32)
 ACTION_DELTAS.flags.writeable = False
 MAX_STEPS_PER_TASK = 16
-MAX_PLANNING_HORIZON = 4
+_MPC_ENUMERATION_BUDGET = ScanBudget("FTL MPC enumeration", maximum_steps=4)
+MAX_PLANNING_HORIZON = _MPC_ENUMERATION_BUDGET.maximum_steps
 WORKLOAD_REGISTRY = (
     ("arm_ids", ARM_IDS),
     ("action_deltas", ((1, 0), (-1, 0), (0, 1), (0, -1))),
@@ -188,12 +190,14 @@ def _mpc_action(
     horizon: int,
     predict: Callable[[np.ndarray, int], np.ndarray],
 ) -> tuple[int, int, int]:
-    host_horizon = _int(horizon, "planning_horizon", 1, MAX_PLANNING_HORIZON)
-    sequences = tuple(itertools.product(range(4), repeat=host_horizon))
+    host_horizon = require_scan_steps(
+        "planning_horizon", horizon, _MPC_ENUMERATION_BUDGET
+    )
+    candidate_count = 4**host_horizon
     best_score = -math.inf
     best_action = 0
     queries = 0
-    for sequence in sequences:
+    for sequence in itertools.product(range(4), repeat=host_horizon):
         imagined = observation.copy()
         for action in sequence:
             imagined = np.asarray(predict(imagined, action), dtype=np.float32)
@@ -201,7 +205,7 @@ def _mpc_action(
         score = -float(np.sum((imagined - goal) ** 2))
         if score > best_score:
             best_score, best_action = score, sequence[0]
-    return best_action, queries, len(sequences)
+    return best_action, queries, candidate_count
 
 
 def _run_arm(seed: int, steps: int, horizon: int, arm_id: str) -> ArmResult:
