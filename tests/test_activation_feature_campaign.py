@@ -380,7 +380,9 @@ def test_full_confirmation_gate_rejects_complete_cheap_screen_without_primary_su
             continue
         receipt = cast(dict[str, object], shard["result"])
         metrics = cast(dict[str, object], receipt["metrics"])
-        metrics["asi_whole_stream_mean_accuracy"] = 0.50 + cast(int, shard["seed"]) / 1_000.0
+        metrics["asi_whole_stream_mean_accuracy"] = 0.50 + (
+            campaign.CHEAP_SCREEN_SEEDS.index(cast(int, shard["seed"])) / 1_000.0
+        )
         _resign_shard(cast(dict[str, Any], shard))
     cheap_without_support = campaign.build_aggregate(cheap_plan, shards)
     full_plan = campaign.build_plan("full_confirmation", *data)
@@ -568,7 +570,9 @@ def test_summarizer_uses_metadata_from_the_descriptor_that_supplied_bytes(
     not all(hasattr(os, name) for name in ("O_NOFOLLOW", "O_TMPFILE")),
     reason="descriptor-pinned publication requires Linux",
 )
-def test_reserved_publication_resists_parent_swap_and_occupied_race(tmp_path: Path) -> None:
+def test_reserved_publication_resists_parent_swap_and_occupied_race(
+    cheap_plan: dict[str, object], tmp_path: Path
+) -> None:
     requested_parent = tmp_path / "requested"
     requested_parent.mkdir()
     destination = requested_parent / "result.json"
@@ -576,15 +580,15 @@ def test_reserved_publication_resists_parent_swap_and_occupied_race(tmp_path: Pa
     with campaign._reserved_new_output(destination) as target:
         requested_parent.rename(moved_parent)
         requested_parent.mkdir()
-        campaign._publish_reserved_json(target, {"value": 1})
-    assert json.loads((moved_parent / "result.json").read_text()) == {"value": 1}
+        campaign._publish_reserved_json(target, cheap_plan)
+    assert json.loads((moved_parent / "result.json").read_text()) == cheap_plan
     assert not destination.exists()
 
     occupied = tmp_path / "occupied.json"
     with campaign._reserved_new_output(occupied) as target:
         occupied.write_text("do not replace", encoding="utf-8")
         with pytest.raises(FileExistsError, match="refusing to replace"):
-            campaign._publish_reserved_json(target, {"value": 2})
+            campaign._publish_reserved_json(target, cheap_plan)
     assert occupied.read_text(encoding="utf-8") == "do not replace"
 
 

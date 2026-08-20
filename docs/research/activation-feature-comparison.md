@@ -39,7 +39,14 @@ causal control; the stronger `rls_head_resid_l1_preset005` incumbent remains a
 separate live context comparator because its RLS head, resource shape, and
 body-training signal are not a mechanism-off match.
 
-The development seed set is frozen at `0, 1, 2, 3, 4`. A complete comparison
+The public result-v1 seed set `0, 1, 2, 3, 4` is quarantined: it has long been
+exposed by the CLI and exercised by repository tests and history. The earlier
+preauthorization full roster `156610`–`156614` is also quarantined because it
+was exposed and exercised in pull-request history. Neither roster is represented
+as fresh. The replacement cheap roster is `2156600`–`2156604` and the replacement
+full roster is `2156610`–`2156614`; a repository and history search found no prior
+occurrence when this successor protocol was frozen. Both use result v2's external
+seed contract. A complete comparison
 contains every registered arm exactly once for one seed; its validator requires
 identical configuration, observation/update/query counts, parameter allocation,
 persistent numeric bytes, and learner-visible information. The learner receives
@@ -60,14 +67,15 @@ comparison to the live incumbent, and a separately frozen fresh-seed protocol.
 `asi-activation-feature-campaign` provides two separate, immutable plans. The
 cheap screen is exactly 2 tasks × 500 examples; the full-horizon remeasurement
 is exactly 200 tasks × 5,000 examples. Both plans require all 11 arms at all 5
-development seeds (55 fresh-process shards each). The full plan does not become
-smaller after seeing the cheap screen. The cheap plan uses the unconsumed
-result-v1 seeds 0–4. The full plan preregisters the disjoint seeds
-156610–156614 and uses result v2. Result-v1 validation enforces its fixed
-seed and source-field contract.
+replacement development seeds (55 fresh-process shards each). The full plan does
+not become smaller after seeing the cheap screen. Both stages use result v2. The
+campaign's public execution gate is frozen false: neither `build_shard` nor
+`run-shard` can load the dataset or invoke the runner until a separate reviewed
+source transition authorizes it.
 These are still development seeds; neither stage can promote a claim.
 
-Full-horizon execution is conditionally authorized. It requires a retained,
+After a separate reviewed execution transition, full-horizon execution would
+remain conditionally gated. It requires a retained,
 strictly valid cheap-screen aggregate from the exact same dataset, source, and
 runtime, and at least one primary candidate (`smooth_leaky`, `aid`, or
 `deep_fourier`) must have a simultaneous interval wholly above zero. If that
@@ -77,13 +85,13 @@ the gate never authorizes a selected-candidate subset.
 
 Each plan binds the exact MNIST bytes, current implementation sources,
 Python/JAX/dependency/runtime identity, configuration, schedule-derived receipt
-identity, retained schedule numeric-byte bound, resource schedule, and output namespace.
-Shard receipts use the
-`asi.activation_feature_ipmnist.result.v1` contract for the cheap screen and
-`asi.activation_feature_ipmnist.result.v2` for full confirmation. Every shard
+identity, retained schedule numeric-byte bound, resource schedule, and output
+namespace. Shard receipts use the `asi.activation_feature_ipmnist.result.v2`
+contract for both stages. Every shard
 binds an immutable plan digest, and aggregation does not reinterpret its
-self-reported outcome. Run each `run-shard` command in a fresh Python process;
-`summarize` rejects any roster other than the complete 55 unique shard files.
+self-reported outcome. If separately authorized, each `run-shard` command must
+use a fresh Python process; `summarize` rejects any roster other than the
+complete 55 unique shard files.
 
 The eight predeclared candidate-versus-family-off comparisons use paired seed
 deltas in whole-stream mean online accuracy. A two-sided Student-t interval
@@ -98,43 +106,22 @@ timing is telemetry only and consistency hashes are not execution attestation.
 
 Canonical append-only namespaces are:
 
-- `outputs/activation_feature_ipmnist/cheap_screen.v1/`
-- `outputs/activation_feature_ipmnist/full_confirmation.v1/`
+- `outputs/activation_feature_ipmnist/cheap_screen.v2/`
+- `outputs/activation_feature_ipmnist/full_confirmation.v2/`
 
-Create `plan.json`, write shards under `shards/`, then publish
-`aggregate.json`. The CLI refuses to replace an existing path. No campaign has
-been run or result produced by this implementation change.
+Plan, shard, and aggregate publication pins every path segment with no-follow
+directory descriptors, reserves the destination with deterministic `O_EXCL`
+before dataset access or execution, publishes without replacement, fsyncs, and
+strictly rereads and validates the linked file. No campaign has been run or
+result produced by this implementation change.
 
-For either stage, first create the canonical directories and plan:
+For either stage, plan creation is the only enabled campaign mutation:
 
 ```bash
 stage=cheap_screen  # or full_confirmation
-root="outputs/activation_feature_ipmnist/${stage}.v1"
-mkdir -p "$root/shards"
 .venv/bin/asi-activation-feature-campaign plan --stage "$stage"
 ```
 
-Run each matrix cell as its own process. The following shell is illustrative;
-production scheduling may parallelize the same commands without changing a
-shard:
-
-```bash
-seeds="0 1 2 3 4"
-extra=()
-if [ "$stage" = full_confirmation ]; then
-  seeds="156610 156611 156612 156613 156614"
-  extra=(--cheap-aggregate \
-    outputs/activation_feature_ipmnist/cheap_screen.v1/aggregate.json)
-fi
-for seed in $seeds; do
-  for arm in smooth_leaky smooth_leaky_off smooth_leaky_fixed_leak \
-    aid aid_off aid_expected ordinary_dropout deep_fourier deep_fourier_off \
-    deep_fourier_first_layer deep_fourier_sine_only; do
-    .venv/bin/asi-activation-feature-campaign run-shard \
-      --stage "$stage" --seed "$seed" --arm "$arm" "${extra[@]}"
-  done
-done
-.venv/bin/asi-activation-feature-campaign summarize --stage "$stage" \
-  "${extra[@]}" "$root"/shards/*.json
-.venv/bin/asi-activation-feature-campaign validate "$root/aggregate.json"
-```
+`run-shard` intentionally fails closed. There is no executable shard command
+to copy from this frozen-plan change; independent review and a separate
+authorization transition must precede any dataset load or campaign execution.

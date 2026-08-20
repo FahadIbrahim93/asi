@@ -1,10 +1,11 @@
 """Frozen, sharded, permanently nonpromoting issue #1566 campaigns.
 
-Cheap-screen shards use the result-v1 schema and its fixed seed protocol;
-full-confirmation shards use result-v2 with their separately frozen seeds. A
-plan binds one exact dataset and runtime, every arm executes in its own CLI
-process, and aggregation admits only the complete 11-arm by 5-seed matrix. The
-resulting decisions are development diagnostics, not paper reproductions or
+Both stages use result-v2 with separately frozen external seed protocols. The
+earlier public result-v1 and preauthorization rosters are quarantined. A plan
+binds one exact dataset and runtime, every arm eventually executes in its own
+CLI process, and aggregation admits only the complete 11-arm by 5-seed matrix.
+Execution is disabled until a separate reviewed authorization transition. The
+resulting decisions remain development diagnostics, not paper reproductions or
 scientific evidence.
 """
 
@@ -23,7 +24,7 @@ import os
 import platform
 import stat
 import sys
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Final, cast
@@ -38,15 +39,11 @@ import alberta_framework.benchmarks.plasticity_comparators as comparator_lane
 import alberta_framework.benchmarks.upgd_ipmnist as ipmnist_lane
 from alberta_framework.benchmarks.activation_feature_ipmnist import (
     ACTIVATION_FEATURE_SPECS,
-    DEVELOPMENT_SEEDS,
     _array_bundle_sha256,
     activation_feature_campaign_result_payload,
-    activation_feature_result_payload,
     run_activation_feature_arm,
     validate_activation_feature_campaign_result,
-    validate_activation_feature_result,
     validate_matched_activation_feature_campaign_results,
-    validate_matched_activation_feature_results,
 )
 from alberta_framework.benchmarks.upgd_ipmnist import (
     IPMNISTConfig,
@@ -56,19 +53,33 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     load_mnist_train,
 )
 
-PLAN_SCHEMA: Final[str] = "asi.activation-feature-ipmnist.campaign-plan.v1"
-SHARD_SCHEMA: Final[str] = "asi.activation-feature-ipmnist.campaign-shard.v1"
-AGGREGATE_SCHEMA: Final[str] = "asi.activation-feature-ipmnist.campaign-aggregate.v1"
+PLAN_SCHEMA: Final[str] = "asi.activation-feature-ipmnist.campaign-plan.v2"
+SHARD_SCHEMA: Final[str] = "asi.activation-feature-ipmnist.campaign-shard.v2"
+AGGREGATE_SCHEMA: Final[str] = "asi.activation-feature-ipmnist.campaign-aggregate.v2"
 
 ARM_ROSTER: Final[tuple[str, ...]] = tuple(ACTIVATION_FEATURE_SPECS)
 STAGE_ROSTER: Final[tuple[str, ...]] = ("cheap_screen", "full_confirmation")
-CHEAP_SCREEN_SEEDS: Final[tuple[int, ...]] = DEVELOPMENT_SEEDS
-FULL_CONFIRMATION_SEEDS: Final[tuple[int, ...]] = (
+QUARANTINED_CHEAP_SEEDS: Final[tuple[int, ...]] = (0, 1, 2, 3, 4)
+QUARANTINED_FULL_SEEDS: Final[tuple[int, ...]] = (
     156_610,
     156_611,
     156_612,
     156_613,
     156_614,
+)
+CHEAP_SCREEN_SEEDS: Final[tuple[int, ...]] = (
+    2_156_600,
+    2_156_601,
+    2_156_602,
+    2_156_603,
+    2_156_604,
+)
+FULL_CONFIRMATION_SEEDS: Final[tuple[int, ...]] = (
+    2_156_610,
+    2_156_611,
+    2_156_612,
+    2_156_613,
+    2_156_614,
 )
 _SEEDS: Final[Mapping[str, tuple[int, ...]]] = {
     "cheap_screen": CHEAP_SCREEN_SEEDS,
@@ -107,13 +118,15 @@ _CONFIGS: Final[Mapping[str, IPMNISTConfig]] = {
     "full_confirmation": IPMNISTConfig(n_tasks=200, task_length=5_000),
 }
 _PLAN_IDS: Final[Mapping[str, str]] = {
-    "cheap_screen": "issue-1566.activation-feature.cheap-screen.v1",
-    "full_confirmation": "issue-1566.activation-feature.full-confirmation.v1",
+    "cheap_screen": "issue-1566.activation-feature.cheap-screen.v2",
+    "full_confirmation": "issue-1566.activation-feature.full-confirmation.v2",
 }
 _OUTPUT_NAMESPACES: Final[Mapping[str, str]] = {
-    "cheap_screen": "outputs/activation_feature_ipmnist/cheap_screen.v1",
-    "full_confirmation": "outputs/activation_feature_ipmnist/full_confirmation.v1",
+    "cheap_screen": "outputs/activation_feature_ipmnist/cheap_screen.v2",
+    "full_confirmation": "outputs/activation_feature_ipmnist/full_confirmation.v2",
 }
+_EXECUTION_AUTHORIZED: Final[bool] = False
+_EXECUTION_CAPABILITY: Final[object] = object()
 _PRIMARY_CANDIDATES: Final[tuple[str, ...]] = ("smooth_leaky", "aid", "deep_fourier")
 
 # Eight hypotheses share one two-sided family-wise alpha.  The literal is
@@ -402,8 +415,8 @@ def _paper_parity() -> dict[str, object]:
             family: dict(source) for family, source in CAMPAIGN_PAPER_SOURCES.items()
         },
         "result_schema_semantics": {
-            "cheap_screen": "result-v1 with its fixed seed and source-field contract",
-            "full_confirmation": "result-v2 with the full-confirmation frozen seed contract",
+            "cheap_screen": "result-v2 with an external frozen seed contract",
+            "full_confirmation": "result-v2 with an external frozen seed contract",
             "campaign_source_binding": "exact sources in this plan's identity and registry",
         },
         "paper_metric_reported": False,
@@ -490,11 +503,7 @@ def _statistics(stage: str) -> dict[str, object]:
 def _protocol(stage: str) -> dict[str, object]:
     return {
         "runner": "alberta_framework.benchmarks.ipmnist_screening.run_screening_config",
-        "shard_result_schema": (
-            activation_lane.RESULT_SCHEMA
-            if stage == "cheap_screen"
-            else activation_lane.CAMPAIGN_RESULT_SCHEMA
-        ),
+        "shard_result_schema": activation_lane.CAMPAIGN_RESULT_SCHEMA,
         "matched_axes": [
             "seed_derived_task_permutations",
             "seed_derived_example_indices",
@@ -511,11 +520,16 @@ def _protocol(stage: str) -> dict[str, object]:
         "allowed_task_information": ["current_example_label"],
         "matrix_completion": "all_55_shards_required_without_adaptive_arm_or_seed_dropping",
         "seed_provenance": (
-            "prospectively frozen result-v1 seeds; no retained real-MNIST activation/feature "
-            "outcome existed at campaign freeze"
-            if stage == "cheap_screen"
-            else "disjoint mechanically allocated result-v2 seeds; no prior activation/feature "
-            "lane use existed at campaign freeze"
+            "globally searched replacement result-v2 roster frozen before authorization; "
+            "no execution is authorized by this plan"
+        ),
+        "quarantined_seed_rosters": {
+            "public_result_v1_and_tests": list(QUARANTINED_CHEAP_SEEDS),
+            "preauthorization_pull_request_and_tests": list(QUARANTINED_FULL_SEEDS),
+        },
+        "quarantine_reason": (
+            "the old rosters were publicly exposed and exercised in repository or pull-request "
+            "history, so neither roster is represented as fresh"
         ),
         "randomness": (
             "seed and runtime PRNG implementation are source-bound; campaign records do not "
@@ -532,6 +546,8 @@ def _execution_gate(stage: str) -> dict[str, object]:
             "required_primary_candidates": [],
             "rule": "plan_and_dataset_validation",
             "complete_matrix_if_authorized": True,
+            "execution_authorized": False,
+            "authorization_transition": "separate_reviewed_source_change_required",
         }
     return {
         "mode": "conditional_on_retained_cheap_screen",
@@ -539,6 +555,8 @@ def _execution_gate(stage: str) -> dict[str, object]:
         "required_primary_candidates": list(_PRIMARY_CANDIDATES),
         "rule": "at_least_one_primary_candidate_supported_by_simultaneous_ci",
         "complete_matrix_if_authorized": True,
+        "execution_authorized": False,
+        "authorization_transition": "separate_reviewed_source_change_required",
     }
 
 
@@ -826,6 +844,14 @@ def _unsigned_shard(
     }
 
 
+def _require_execution_authorized() -> None:
+    if _EXECUTION_AUTHORIZED is not True:
+        raise RuntimeError(
+            "activation/feature campaign execution is not authorized; a separate reviewed "
+            "authorization transition is required"
+        )
+
+
 def build_shard(
     plan: object,
     data_x: object,
@@ -835,7 +861,32 @@ def build_shard(
     seed: int,
     prerequisite: object | None = None,
 ) -> dict[str, object]:
-    """Execute one canonical shard; callers provide the fresh process boundary."""
+    """Fail closed until a separate reviewed transition authorizes execution."""
+    _require_execution_authorized()
+    return _build_shard_authorized(
+        plan,
+        data_x,
+        data_y,
+        arm=arm,
+        seed=seed,
+        prerequisite=prerequisite,
+        _capability=_EXECUTION_CAPABILITY,
+    )
+
+
+def _build_shard_authorized(
+    plan: object,
+    data_x: object,
+    data_y: object,
+    *,
+    arm: str,
+    seed: int,
+    prerequisite: object | None = None,
+    _capability: object,
+) -> dict[str, object]:
+    """Private executor reachable only behind the reviewed public gate."""
+    if _capability is not _EXECUTION_CAPABILITY:
+        raise RuntimeError("private campaign execution capability is invalid")
     checked_plan = validate_plan(plan, data_x=data_x, data_y=data_y)
     if type(arm) is not str or arm not in ARM_ROSTER:
         raise ValueError("arm is outside the frozen matrix")
@@ -854,12 +905,8 @@ def build_shard(
         seed=seed,
         config=_config_from_plan(checked_plan),
     )
-    receipt = (
-        activation_feature_result_payload(result, outcome="inconclusive")
-        if stage == "cheap_screen"
-        else activation_feature_campaign_result_payload(
-            result, outcome="inconclusive", development_seeds=seeds
-        )
+    receipt = activation_feature_campaign_result_payload(
+        result, outcome="inconclusive", development_seeds=seeds
     )
     if result.dataset_sha256 != dataset_identity["sha256"]:
         raise RuntimeError("dataset identity changed during shard execution")
@@ -909,12 +956,8 @@ def _validate_shard_against_plan(
         raise ValueError("shard arm is outside the frozen matrix")
     if type(seed) is not int or seed not in seeds:
         raise ValueError("shard seed is outside the frozen matrix")
-    receipt = (
-        validate_activation_feature_result(shard["result"])
-        if stage == "cheap_screen"
-        else validate_activation_feature_campaign_result(
-            shard["result"], development_seeds=seeds
-        )
+    receipt = validate_activation_feature_campaign_result(
+        shard["result"], development_seeds=seeds
     )
     if receipt["arm"] != arm or receipt["seed"] != seed:
         raise ValueError("shard wrapper and result identity disagree")
@@ -1127,12 +1170,9 @@ def _admit_complete_matrix(
     first_execution = cast(dict[str, object], first_result["execution_identity"])
     for seed in seeds:
         same_seed = [by_identity[(seed, arm)]["result"] for arm in ARM_ROSTER]
-        if stage == "cheap_screen":
-            validate_matched_activation_feature_results(same_seed)
-        else:
-            validate_matched_activation_feature_campaign_results(
-                same_seed, development_seeds=seeds
-            )
+        validate_matched_activation_feature_campaign_results(
+            same_seed, development_seeds=seeds
+        )
     for shard in ordered[1:]:
         receipt = cast(dict[str, object], shard["result"])
         execution = cast(dict[str, object], receipt["execution_identity"])
@@ -1274,10 +1314,14 @@ def _open_output_parent(path: Path, *, create: bool) -> tuple[Path, int]:
             if component in {"", ".", ".."}:
                 raise ValueError("output path contains an unsafe directory component")
             if create:
+                created = False
                 try:
                     os.mkdir(component, mode=0o755, dir_fd=descriptor)
+                    created = True
                 except FileExistsError:
                     pass
+                if created:
+                    os.fsync(descriptor)
             next_descriptor = os.open(
                 component,
                 os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -1292,9 +1336,13 @@ def _open_output_parent(path: Path, *, create: bool) -> tuple[Path, int]:
 
 
 @contextmanager
-def _reserved_new_output(path: Path) -> Iterator[tuple[Path, int]]:
-    """Pin one unoccupied output parent across execution and publication."""
+def _reserved_new_output(path: Path) -> Iterator[tuple[Path, int, str]]:
+    """Pin and exclusively reserve one output before any expensive work."""
     destination, parent_fd = _open_output_parent(path, create=True)
+    reservation_name = f".{destination.name}.reservation"
+    reservation_fd: int | None = None
+    reservation_acquired = False
+    reservation_identity: tuple[int, int] | None = None
     try:
         try:
             os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
@@ -1302,8 +1350,45 @@ def _reserved_new_output(path: Path) -> Iterator[tuple[Path, int]]:
             pass
         else:
             raise FileExistsError(f"refusing to replace immutable output: {destination}")
-        yield destination, parent_fd
+        try:
+            reservation_fd = os.open(
+                reservation_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o400,
+                dir_fd=parent_fd,
+            )
+        except FileExistsError as error:
+            raise FileExistsError(f"output is already reserved: {destination}") from error
+        reservation_acquired = True
+        marker = b"asi-activation-feature-campaign-output-reservation-v1\n"
+        marker_view = memoryview(marker)
+        marker_written = 0
+        while marker_written < len(marker_view):
+            count = os.write(reservation_fd, marker_view[marker_written:])
+            if count <= 0:
+                raise OSError("short write while reserving campaign output")
+            marker_written += count
+        os.fsync(reservation_fd)
+        marker_stat = os.fstat(reservation_fd)
+        reservation_identity = (marker_stat.st_dev, marker_stat.st_ino)
+        os.close(reservation_fd)
+        reservation_fd = None
+        os.fsync(parent_fd)
+        yield destination, parent_fd, reservation_name
     finally:
+        if reservation_fd is not None:
+            os.close(reservation_fd)
+        if reservation_acquired:
+            try:
+                current_marker = os.stat(
+                    reservation_name, dir_fd=parent_fd, follow_symlinks=False
+                )
+            except FileNotFoundError:
+                pass
+            else:
+                if (current_marker.st_dev, current_marker.st_ino) == reservation_identity:
+                    os.unlink(reservation_name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
         os.close(parent_fd)
 
 
@@ -1325,9 +1410,80 @@ def _link_unnamed_file(file_fd: int, parent_fd: int, name: str) -> None:
         raise OSError(error, os.strerror(error), name)
 
 
-def _publish_reserved_json(target: tuple[Path, int], value: object) -> Path:
-    destination, parent_fd = target
+def _load_json_strict_at(
+    parent_fd: int, name: str, *, max_bytes: int
+) -> tuple[dict[str, object], bytes]:
+    descriptor = os.open(
+        name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=parent_fd
+    )
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode) or not 0 < opened.st_size <= max_bytes:
+            raise ValueError("published campaign output is not a bounded regular file")
+        chunks: list[bytes] = []
+        remaining = max_bytes + 1
+        while remaining > 0:
+            chunk = os.read(descriptor, min(remaining, 1 << 20))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        encoded = b"".join(chunks)
+        final = os.fstat(descriptor)
+        stable_fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if (
+            len(encoded) != opened.st_size
+            or len(encoded) > max_bytes
+            or any(getattr(opened, field) != getattr(final, field) for field in stable_fields)
+        ):
+            raise ValueError("published campaign output changed during strict reread")
+        try:
+            value = json.loads(
+                encoded.decode("utf-8"),
+                object_pairs_hook=_object_from_pairs,
+                parse_constant=_reject_constant,
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as error:
+            raise ValueError("published campaign output is not bounded valid JSON") from error
+        if type(value) is not dict:
+            raise ValueError("published campaign output root must be an exact object")
+        _json_preflight(value)
+        return cast(dict[str, object], value), encoded
+    finally:
+        os.close(descriptor)
+
+
+def _publication_validator(
+    value: dict[str, object],
+) -> tuple[Callable[[object], dict[str, object]], int]:
+    schema = value.get("schema")
+    if type(schema) is not str:
+        raise ValueError("published campaign output schema must be an exact string")
+    if schema == PLAN_SCHEMA:
+        return validate_plan, _MAX_SHARD_BYTES
+    if schema == AGGREGATE_SCHEMA:
+        return validate_aggregate, _MAX_AGGREGATE_BYTES
+    raise ValueError("shard publication requires its plan-bound strict validator")
+
+
+def _publish_reserved_json(
+    target: tuple[Path, int, str],
+    value: object,
+    *,
+    validator: Callable[[object], dict[str, object]] | None = None,
+    max_bytes: int | None = None,
+) -> Path:
+    destination, parent_fd, _reservation_name = target
     _json_preflight(value)
+    checked_value = cast(dict[str, object], value)
+    if validator is None:
+        validator, inferred_max_bytes = _publication_validator(checked_value)
+        max_bytes = inferred_max_bytes
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise ValueError("publication requires an exact positive byte bound")
+    validated_input = validator(checked_value)
+    if _canonical(validated_input) != _canonical(checked_value):
+        raise ValueError("publication validator changed the campaign output")
     encoded = json.dumps(
         value,
         allow_nan=False,
@@ -1335,6 +1491,8 @@ def _publish_reserved_json(target: tuple[Path, int], value: object) -> Path:
         indent=2,
         sort_keys=True,
     ).encode("utf-8") + b"\n"
+    if not 0 < len(encoded) <= max_bytes:
+        raise ValueError("campaign output exceeds its publication byte bound")
     if not hasattr(os, "O_TMPFILE"):
         raise OSError("immutable publication requires Linux O_TMPFILE support")
     file_fd: int | None = None
@@ -1364,6 +1522,12 @@ def _publish_reserved_json(target: tuple[Path, int], value: object) -> Path:
                 f"refusing to replace immutable output: {destination}"
             ) from error
         os.fsync(parent_fd)
+        reread, reread_bytes = _load_json_strict_at(
+            parent_fd, destination.name, max_bytes=max_bytes
+        )
+        validated = validator(reread)
+        if reread_bytes != encoded or _canonical(validated) != _canonical(checked_value):
+            raise ValueError("published campaign output differs after strict reread")
         return destination
     finally:
         if file_fd is not None:
@@ -1467,6 +1631,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             _publish_reserved_json(target, plan)
         return 0
     if args.command == "run-shard":
+        _require_execution_authorized()
         output = args.output or _namespace_path(
             args.stage, "shards", f"seed-{args.seed}.{args.arm}.json"
         )
@@ -1483,15 +1648,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                     load_json_strict(args.cheap_aggregate, max_bytes=_MAX_AGGREGATE_BYTES)
                 )
             )
-            shard = build_shard(
+            shard = _build_shard_authorized(
                 plan,
                 x,
                 y,
                 arm=args.arm,
                 seed=args.seed,
                 prerequisite=prerequisite,
+                _capability=_EXECUTION_CAPABILITY,
             )
-            _publish_reserved_json(target, shard)
+            _publish_reserved_json(
+                target,
+                shard,
+                validator=lambda value: validate_shard(
+                    value, plan, prerequisite=prerequisite
+                ),
+                max_bytes=_MAX_SHARD_BYTES,
+            )
         return 0
     if args.command == "summarize":
         output = args.output or _namespace_path(args.stage, "aggregate.json")

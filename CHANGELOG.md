@@ -40,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Replaced the unissued activation/feature campaign's exposed seed rosters with
+  globally searched v2 rosters, quarantined both `0`–`4` and `156610`–`156614`,
+  and moved all future artifacts to NEW v2 namespaces. Public shard execution
+  now fails before dataset access or runner dispatch pending a separate reviewed
+  authorization transition. Output transactions reserve through pinned
+  no-follow directory descriptors before work, publish without replacement,
+  fsync, and strictly reread through the pinned descriptor with the artifact's
+  plan-bound validator. No campaign execution or output is included.
 - Made new IPMNIST screening shards and summaries strict v2 artifacts bound to a clean Git
   commit/tree, the actual tracked package and `uv.lock` bytes, runtime/JAX details, and the
   canonical materialized MNIST feature/label bytes. The run CLI now captures these bindings
