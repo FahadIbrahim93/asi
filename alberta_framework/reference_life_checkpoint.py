@@ -106,6 +106,8 @@ _MAX_CHILD_FILE_BYTES = 128 * 1024 * 1024
 _MAX_CHILD_TOTAL_BYTES = 512 * 1024 * 1024
 _PROTOTYPE_EMPTY_ARRAY_CODEC = "alberta.prototype_agent.empty_array_projection.v1"
 _PROTOTYPE_SUPPORTED_PRNG_IMPLS = frozenset({"threefry2x32", "rbg"})
+# Delete lowercase hex so a nonempty remainder means a non-hex or uppercase glyph.
+_LOWER_HEX_DELETE = str.maketrans("", "", "0123456789abcdef")
 
 
 def _fail(message: str) -> NoReturn:
@@ -378,6 +380,38 @@ def _decode_float(value: Any, *, path: str) -> float:
     return result
 
 
+def _bounded_element_count(shape: tuple[int, ...], *, path: str) -> int:
+    """Return ``prod(shape)`` or fail before a host hex walk can start."""
+
+    elements = 1
+    for dimension in shape:
+        if dimension > 0 and elements > _MAX_ARRAY_ELEMENTS // dimension:
+            _fail(f"{path}.shape exceeds the element limit")
+        elements *= dimension
+        if elements > _MAX_ARRAY_ELEMENTS:
+            _fail(f"{path}.shape exceeds the element limit")
+    return elements
+
+
+def _decode_hex_payload(payload_hex: str, *, path: str, expected_bytes: int) -> bytes:
+    """Decode lowercase hex only after ``expected_bytes`` is known from shape/dtype."""
+
+    if expected_bytes < 0 or expected_bytes > _MAX_ARRAY_BYTES:
+        _fail(f"{path} exceeds the byte limit")
+    expected_hex = expected_bytes * 2
+    if len(payload_hex) != expected_hex:
+        _fail(f"{path}.payload_hex length does not match shape and dtype")
+    if payload_hex.translate(_LOWER_HEX_DELETE):
+        _fail(f"{path}.payload_hex must be lowercase hexadecimal")
+    try:
+        raw = bytes.fromhex(payload_hex)
+    except ValueError as error:
+        raise ValueError(f"{path}.payload_hex must be lowercase hexadecimal") from error
+    if len(raw) != expected_bytes:
+        _fail(f"{path}.payload_hex length does not match shape and dtype")
+    return raw
+
+
 def _encode_array_value(value: ArrayValue) -> dict[str, Any]:
     if not isinstance(value, ArrayValue):
         raise ValueError("checkpoint protocol value must be an ArrayValue")
@@ -404,16 +438,24 @@ def _decode_array_value(value: Any, *, path: str) -> ArrayValue:
         _require_int(dimension, path=f"{path}.shape[{index}]", minimum=1)
         for index, dimension in enumerate(shape_raw)
     )
+    dtype_name = _require_str(data["dtype"], path=f"{path}.dtype")
+    try:
+        dtype = np.dtype(dtype_name)
+    except TypeError as exc:
+        raise ValueError(f"{path}.dtype is unsupported") from exc
+    if dtype.name != dtype_name:
+        _fail(f"{path}.dtype is not a canonical numeric dtype")
+    elements = _bounded_element_count(shape, path=path)
+    expected_bytes = elements * dtype.itemsize
     payload_hex = _require_str(data["payload_hex"], path=f"{path}.payload_hex")
-    if len(payload_hex) > 2 * _MAX_ARRAY_BYTES:
-        _fail(f"{path}.payload_hex exceeds the byte limit")
-    if len(payload_hex) % 2 or any(c not in "0123456789abcdef" for c in payload_hex):
-        _fail(f"{path}.payload_hex must be lowercase hexadecimal")
+    payload = _decode_hex_payload(
+        payload_hex, path=path, expected_bytes=expected_bytes
+    )
     return ArrayValue(
         semantic_id=_require_str(data["semantic_id"], path=f"{path}.semantic_id"),
-        dtype=_require_str(data["dtype"], path=f"{path}.dtype"),
+        dtype=dtype_name,
         shape=shape,
-        payload=bytes.fromhex(payload_hex),
+        payload=payload,
     )
 
 
@@ -504,20 +546,11 @@ def _decode_jax_array(value: Any, *, path: str) -> jax.Array:
         for index, dimension in enumerate(shape_raw)
     )
     payload_hex = _require_str(data["payload_hex"], path=f"{path}.payload_hex")
-    if len(payload_hex) > 2 * _MAX_ARRAY_BYTES:
-        _fail(f"{path}.payload_hex exceeds the byte limit")
-    if len(payload_hex) % 2 or any(c not in "0123456789abcdef" for c in payload_hex):
-        _fail(f"{path}.payload_hex must be lowercase hexadecimal")
-    raw = bytes.fromhex(payload_hex)
-    elements = 1
-    for dimension in shape:
-        elements *= dimension
-        if elements > _MAX_ARRAY_ELEMENTS:
-            _fail(f"{path}.shape exceeds the element limit")
-    if elements * dtype.itemsize > _MAX_ARRAY_BYTES:
-        _fail(f"{path} exceeds the byte limit")
-    if len(raw) != elements * dtype.itemsize:
-        _fail(f"{path}.payload_hex length does not match shape and dtype")
+    elements = _bounded_element_count(shape, path=path)
+    expected_bytes = elements * dtype.itemsize
+    raw = _decode_hex_payload(
+        payload_hex, path=path, expected_bytes=expected_bytes
+    )
     storage_dtype = dtype.newbyteorder("<")
     array = np.frombuffer(raw, dtype=storage_dtype).astype(dtype, copy=True).reshape(shape)
     result = jnp.asarray(array)
