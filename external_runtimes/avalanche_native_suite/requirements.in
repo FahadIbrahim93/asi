@@ -1,6 +1,8 @@
 # Mirrors the pinned Avalanche setup.py runtime requirements. NumPy and the
 # CPU-only Torch pair are fixed explicitly for one prospective Linux/x86-64
 # compatibility runtime; this is not a claim of Avalanche's default runtime.
+# GPUtil 1.4.0 publishes only the hash-pinned source archive recorded in the
+# plan; the Dockerfile's source-build exception is restricted to that package.
 typing-extensions>=4.6.0
 psutil
 gputil

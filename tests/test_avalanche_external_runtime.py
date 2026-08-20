@@ -48,6 +48,7 @@ def test_plan_binds_official_source_license_and_every_runtime_input() -> None:
     inputs = plan["qualification_inputs"]
     assert type(authority) is dict and type(inputs) is dict
     revision = qualification_plan(1578).code_revisions[0]
+    assert authority["paper_revision"] == qualification_plan(1578).paper_revisions[0]
     assert authority["repository"] == revision.repository
     assert authority["commit"] == revision.commit
     assert authority["git_tree"] == "fdfe9d9b4578587bf83a3970eaaf9701bb3db2a6"
@@ -73,18 +74,27 @@ def test_runtime_is_hash_locked_data_free_and_never_authorizes_execution() -> No
     assert runtime["numpy"] == "1.26.4"
     assert runtime["avalanche"] == "0.6.0a"
     assert runtime["uid"] == 65_532 and runtime["gid"] == 65_532
-    assert runtime["wheel"] == "0.43.0"
+    assert runtime["home"] == "/tmp/asi-runtime-home"
+    assert runtime["pip"] == "23.0.1"
+    assert runtime["wheel"] == "0.44.0"
+    source_build_exceptions = runtime["source_build_exceptions"]
+    assert type(source_build_exceptions) is list and len(source_build_exceptions) == 1
+    assert source_build_exceptions[0]["distribution"] == "gputil"
+    assert source_build_exceptions[0]["source_sha256"] == (
+        "099e52c65e512cdfa8c8763fca67f5a5c2afb63469602d5dcb4d296b3661efb9"
+    )
     assert diagnostic["dataset_in_image"] is False
     assert diagnostic["dataset_downloaded"] is False
     assert diagnostic["workload_executed"] is False
-    assert claims["runtime_build_verified"] is False
-    assert claims["external_execution_authorized"] is False
-    assert claims["negative_outcome_retained"] is False
+    assert claims and all(value is False for value in claims.values())
     assert len(plan["blockers"]) == 10  # type: ignore[arg-type]
     dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "@sha256:45360d9eb0ff" in dockerfile
     assert "--require-hashes" in dockerfile
+    assert "--only-binary=:all:" in dockerfile
+    assert "--no-binary=gputil" in dockerfile
     assert "USER 65532:65532" in dockerfile
+    assert "HOME=/tmp/asi-runtime-home" in dockerfile
     assert "USER 65532:65532\nRUN --network=none python verify_runtime.py" in dockerfile
     assert "MNIST" not in dockerfile and "CIFAR" not in dockerfile
 

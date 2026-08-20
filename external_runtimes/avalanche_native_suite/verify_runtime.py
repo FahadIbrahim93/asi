@@ -45,14 +45,35 @@ COMPATIBILITY_DEVIATIONS = [
     "the dependency lock resolves upstream's otherwise unbounded setup requirements at "
     "the qualification audit date",
 ]
+SOURCE_BUILD_EXCEPTIONS = [
+    {
+        "distribution": "gputil",
+        "version": "1.4.0",
+        "source_url": (
+            "https://files.pythonhosted.org/packages/ed/0e/"
+            "5c61eedde9f6c87713e89d794f01e378cfd9565847d4576fa627d758c554/"
+            "GPUtil-1.4.0.tar.gz"
+        ),
+        "source_sha256": (
+            "099e52c65e512cdfa8c8763fca67f5a5c2afb63469602d5dcb4d296b3661efb9"
+        ),
+        "source_bytes": 5_545,
+        "build_backend": "legacy distutils setup.py",
+        "declared_license": "MIT",
+        "license_evidence": "package metadata only; the source archive omits license text",
+    }
+]
 FUTURE_INVOCATION_REQUIREMENTS = [
     "reviewed prospective plan authorization",
     "digest-pinned built image",
     "network disabled",
     "read-only root filesystem",
-    "bounded tmpfs",
-    "separately approved exact dataset archives",
-    "NEW create-only output path",
+    "separately approved exact dataset archives mounted read-only",
+    "NEW create-only output path as the only writable bind mount",
+    "protocol-frozen tmpfs byte, mode, path, and ownership values",
+    "all Linux capabilities dropped, no-new-privileges, and no host device mounts",
+    "protocol-frozen CPU affinity and quota, memory and swap, PID, and host wall-clock caps",
+    "CPU-only environment and no visible NVIDIA devices",
 ]
 BLOCKERS = [
     "independent review of this prospective runtime plan",
@@ -61,7 +82,7 @@ BLOCKERS = [
     "Avalanche task membership, class order, transforms, normalization, and augmentation parity",
     "boundary and task information policy",
     "mechanism-off exact reduction and matched controls",
-    "seed, example-order, update, and query budgets",
+    "seed, example-order, update, query, and exact sandbox resource budgets",
     "persistent bytes, data steps, model queries, and timing receipt",
     "create-only durable success and failure receipts",
     "untouched scientific seeds and separate promotion protocol",
@@ -260,6 +281,9 @@ def _validate_plan(plan: dict[str, JsonValue]) -> None:
             "python_implementation",
             "uid",
             "gid",
+            "home",
+            "xdg_cache_home",
+            "matplotlib_config_dir",
             "pip",
             "setuptools",
             "wheel",
@@ -269,6 +293,7 @@ def _validate_plan(plan: dict[str, JsonValue]) -> None:
             "numpy",
             "avalanche",
             "source_install",
+            "source_build_exceptions",
             "compatibility_deviations",
             "future_invocation_requirements",
         ),
@@ -280,9 +305,12 @@ def _validate_plan(plan: dict[str, JsonValue]) -> None:
         "python_implementation": "CPython",
         "uid": 65_532,
         "gid": 65_532,
-        "pip": "24.0",
+        "home": "/tmp/asi-runtime-home",
+        "xdg_cache_home": "/tmp/asi-runtime-cache",
+        "matplotlib_config_dir": "/tmp/asi-matplotlib",
+        "pip": "23.0.1",
         "setuptools": "84.0.0",
-        "wheel": "0.43.0",
+        "wheel": "0.44.0",
         "accelerator": "cpu",
         "torch": "2.2.2+cpu",
         "torchvision": "0.17.2+cpu",
@@ -291,6 +319,7 @@ def _validate_plan(plan: dict[str, JsonValue]) -> None:
         "source_install": (
             "exact read-only archive on PYTHONPATH, not an installed distribution"
         ),
+        "source_build_exceptions": SOURCE_BUILD_EXCEPTIONS,
         "compatibility_deviations": COMPATIBILITY_DEVIATIONS,
         "future_invocation_requirements": FUTURE_INVOCATION_REQUIREMENTS,
     }
@@ -323,6 +352,7 @@ def _validate_plan(plan: dict[str, JsonValue]) -> None:
         plan["claims"],
         (
             "runtime_build_verified",
+            "bit_reproducible_image_claimed",
             "external_workload_executed",
             "execution_attested",
             "negative_outcome_retained",
@@ -335,6 +365,7 @@ def _validate_plan(plan: dict[str, JsonValue]) -> None:
     )
     if claims != {
         "runtime_build_verified": False,
+        "bit_reproducible_image_claimed": False,
         "external_workload_executed": False,
         "execution_attested": False,
         "negative_outcome_retained": False,
@@ -371,7 +402,11 @@ def _validate_source() -> None:
     for relative, expected in REQUIRED_SOURCE_SHA256.items():
         if _sha256(SOURCE_ROOT / relative) != expected:
             raise ValueError(f"official source file differs: {relative}")
-    for candidate in (Path("/data"), Path("/opt/data"), Path("/root/.avalanche")):
+    for candidate in (
+        Path("/data"),
+        Path("/opt/data"),
+        Path(os.environ["HOME"]) / ".avalanche",
+    ):
         if candidate.exists():
             raise ValueError("prospective runtime must not contain benchmark data")
 
@@ -384,12 +419,16 @@ def _validate_runtime(plan: dict[str, JsonValue]) -> None:
         or platform.python_implementation() != "CPython"
         or os.getuid() != 65_532
         or os.getgid() != 65_532
+        or os.environ.get("HOME") != "/tmp/asi-runtime-home"
+        or os.environ.get("XDG_CACHE_HOME") != "/tmp/asi-runtime-cache"
+        or os.environ.get("MPLCONFIGDIR") != "/tmp/asi-matplotlib"
+        or os.environ.get("PYTHON_SETUPTOOLS_VERSION") != "84.0.0"
     ):
         raise ValueError("host runtime differs from the prospective image")
     expected_distributions = {
         **_lock_versions(),
-        "pip": "24.0",
-        "wheel": "0.43.0",
+        "pip": "23.0.1",
+        "wheel": "0.44.0",
     }
     distributions = list(importlib.metadata.distributions())
     installed_distributions = {

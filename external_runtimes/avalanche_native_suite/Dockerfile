@@ -7,6 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /opt/qualification
 COPY requirements.lock requirements.lock
 RUN python -m pip install --no-cache-dir --require-hashes --only-binary=:all: \
+    --no-binary=gputil \
     --requirement requirements.lock
 
 COPY fetch_source.py fetch_source.py
@@ -16,6 +17,10 @@ COPY Dockerfile Dockerfile.source
 COPY requirements.in requirements.in
 COPY qualification-plan.json qualification-plan.json
 COPY verify_runtime.py verify_runtime.py
+ENV HOME=/tmp/asi-runtime-home \
+    XDG_CACHE_HOME=/tmp/asi-runtime-cache \
+    MPLCONFIGDIR=/tmp/asi-matplotlib \
+    PYTHON_SETUPTOOLS_VERSION=84.0.0
 USER 65532:65532
 RUN --network=none python verify_runtime.py
 

@@ -20,11 +20,11 @@
   },
   "qualification_inputs": {
     "base_image_digest": "python:3.10.14-slim-bookworm@sha256:45360d9eb0ff89a954085c2b36883b65b08d1549aa9ede50e48bdcadf34d2f3f",
-    "dockerfile_sha256": "21d4f6b49447e67c9e676956329d30f314eff9a341d944d79106b6a6b88fd7f2",
-    "requirements_in_sha256": "78351dee97842f8526a001ff181be8516f25904302f045913011bf807ffcf821",
+    "dockerfile_sha256": "3a46c739f60952dd71f69cc191632ecd7643a71780a460f8bb48929d24573b9f",
+    "requirements_in_sha256": "ee1999d77202779e6b1e7ea29c23b8ca435a004b91ed6505d7faa210ee545a21",
     "requirements_lock_sha256": "9f9e2943b528d7fa692dc2e91e96f7085d38df879e4e35bdc3958542763e40dd",
     "fetch_source_sha256": "8b0b39cd5b24948f213755d370bd2262188b0ae2b7bf432a66bc8b127203eed5",
-    "verify_runtime_sha256": "1d2cd8a27e6ff9840ca668cb2cb586fa332ccd9b73a26b21d770342793c86e90"
+    "verify_runtime_sha256": "3b2d7d31ee0b2ec9adab8d1e7fdab6c2bacc71965e4985c3187e76cd17c67d0e"
   },
   "runtime": {
     "platform": "linux-x86_64",
@@ -32,15 +32,30 @@
     "python_implementation": "CPython",
     "uid": 65532,
     "gid": 65532,
-    "pip": "24.0",
+    "home": "/tmp/asi-runtime-home",
+    "xdg_cache_home": "/tmp/asi-runtime-cache",
+    "matplotlib_config_dir": "/tmp/asi-matplotlib",
+    "pip": "23.0.1",
     "setuptools": "84.0.0",
-    "wheel": "0.43.0",
+    "wheel": "0.44.0",
     "accelerator": "cpu",
     "torch": "2.2.2+cpu",
     "torchvision": "0.17.2+cpu",
     "numpy": "1.26.4",
     "avalanche": "0.6.0a",
     "source_install": "exact read-only archive on PYTHONPATH, not an installed distribution",
+    "source_build_exceptions": [
+      {
+        "distribution": "gputil",
+        "version": "1.4.0",
+        "source_url": "https://files.pythonhosted.org/packages/ed/0e/5c61eedde9f6c87713e89d794f01e378cfd9565847d4576fa627d758c554/GPUtil-1.4.0.tar.gz",
+        "source_sha256": "099e52c65e512cdfa8c8763fca67f5a5c2afb63469602d5dcb4d296b3661efb9",
+        "source_bytes": 5545,
+        "build_backend": "legacy distutils setup.py",
+        "declared_license": "MIT",
+        "license_evidence": "package metadata only; the source archive omits license text"
+      }
+    ],
     "compatibility_deviations": [
       "pinned audited 2025 source commit identifies itself as 0.6.0a and is not the 0.6.0 PyPI release",
       "qualification fixes a CPU-only Torch 2.2.2, torchvision 0.17.2, and NumPy 1.26.4 compatibility tuple where upstream declares open ranges",
@@ -51,9 +66,12 @@
       "digest-pinned built image",
       "network disabled",
       "read-only root filesystem",
-      "bounded tmpfs",
-      "separately approved exact dataset archives",
-      "NEW create-only output path"
+      "separately approved exact dataset archives mounted read-only",
+      "NEW create-only output path as the only writable bind mount",
+      "protocol-frozen tmpfs byte, mode, path, and ownership values",
+      "all Linux capabilities dropped, no-new-privileges, and no host device mounts",
+      "protocol-frozen CPU affinity and quota, memory and swap, PID, and host wall-clock caps",
+      "CPU-only environment and no visible NVIDIA devices"
     ]
   },
   "prospective_diagnostic": {
@@ -72,6 +90,7 @@
   },
   "claims": {
     "runtime_build_verified": false,
+    "bit_reproducible_image_claimed": false,
     "external_workload_executed": false,
     "execution_attested": false,
     "negative_outcome_retained": false,
@@ -87,7 +106,7 @@
     "Avalanche task membership, class order, transforms, normalization, and augmentation parity",
     "boundary and task information policy",
     "mechanism-off exact reduction and matched controls",
-    "seed, example-order, update, and query budgets",
+    "seed, example-order, update, query, and exact sandbox resource budgets",
     "persistent bytes, data steps, model queries, and timing receipt",
     "create-only durable success and failure receipts",
     "untouched scientific seeds and separate promotion protocol"
