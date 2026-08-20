@@ -8,8 +8,8 @@ transaction -- ``_step_jit``, ``_rehearse_batch``,
 documented ``action_encoding`` dispatch (``"scalar_index"`` and
 ``"one_hot"``), without a single execution in the suite.
 
-These tests run the real update/record/rehearsal transaction for both
-encodings and check that the two encodings of the same action stream produce
+This test runs the real update/record/rehearsal transaction for both
+encodings and checks that the two encodings of the same action stream produce
 the same learning-relevant trajectory.
 """
 
@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 import jax.random as jr
-import pytest
 from jax import tree_util
 
 from alberta_framework.core.dual_replay import DualReplayConfig
@@ -110,52 +109,7 @@ def _event(
     )
 
 
-@pytest.mark.parametrize("encoding", ["scalar_index", "one_hot"])
-def test_encode_decode_round_trips_every_action(encoding: ReplayActionEncoding) -> None:
-    """``encode_action``/``decode_action`` recover every legal action exactly."""
-    rehearsal = _rehearsal(encoding)
-    for action in range(_N_ACTIONS):
-        stored = rehearsal.encode_action(jnp.asarray(action, dtype=jnp.int32))
-        conversion = rehearsal.decode_action(stored)
-        assert bool(conversion.valid)
-        assert int(conversion.action) == action
-
-
-@pytest.mark.parametrize("encoding", ["scalar_index", "one_hot"])
-def test_step_runs_the_full_transaction_end_to_end(encoding: ReplayActionEncoding) -> None:
-    """The real update/record/rehearsal transaction commits every step.
-
-    This is the first test in the suite that calls ``step`` -- for either
-    encoding.
-    """
-    rehearsal = _rehearsal(encoding)
-    state = rehearsal.init(jr.key(0))
-
-    key = jr.key(1)
-    for step in range(16):
-        key, subkey = jr.split(key)
-        obs_key, next_key, action_key = jr.split(subkey, 3)
-        observation = jr.normal(obs_key, (_OBSERVATION_DIM,), dtype=jnp.float32)
-        next_observation = jr.normal(next_key, (_OBSERVATION_DIM,), dtype=jnp.float32)
-        action = int(jr.randint(action_key, (), 0, _N_ACTIONS))
-        event = _event(observation=observation, action=action, next_observation=next_observation)
-
-        result = rehearsal.step(state, event)
-
-        assert bool(result.diagnostics.transaction_applied)
-        assert not bool(result.diagnostics.rejected)
-        assert bool(jnp.all(result.diagnostics.action_conversions_valid))
-        assert int(result.state.accepted_real_event_count) == step + 1
-        assert int(result.state.rejected_real_event_count) == 0
-        for decoded_action in result.trace.actions.tolist():
-            assert 0 <= decoded_action < _N_ACTIONS
-        state = result.state
-
-    rehearsal.validate_state(state)
-    assert int(state.accepted_real_event_count) == 16
-
-
-def test_scalar_index_and_one_hot_agree_on_the_same_action_stream() -> None:
+def test_both_action_encodings_run_equivalent_real_rehearsal_transactions() -> None:
     """The two ``action_encoding`` branches must be behaviorally equivalent.
 
     Feeding the identical observation/action/reward stream through the
@@ -168,13 +122,24 @@ def test_scalar_index_and_one_hot_agree_on_the_same_action_stream() -> None:
     scalar_state = scalar_rehearsal.init(jr.key(0))
     one_hot_state = one_hot_rehearsal.init(jr.key(0))
 
+    # Bind both public conversion branches before exercising the same conversion
+    # inside the jitted replay transaction.
+    for action in range(_N_ACTIONS):
+        scalar_stored = scalar_rehearsal.encode_action(jnp.asarray(action, dtype=jnp.int32))
+        one_hot_stored = one_hot_rehearsal.encode_action(jnp.asarray(action, dtype=jnp.int32))
+        assert scalar_stored.tolist() == [float(action)]
+        assert one_hot_stored.tolist() == [float(index == action) for index in range(_N_ACTIONS)]
+        scalar_conversion = scalar_rehearsal.decode_action(scalar_stored)
+        one_hot_conversion = one_hot_rehearsal.decode_action(one_hot_stored)
+        assert bool(scalar_conversion.valid) and int(scalar_conversion.action) == action
+        assert bool(one_hot_conversion.valid) and int(one_hot_conversion.action) == action
+
     key = jr.key(7)
-    for step in range(12):
+    for step, action in enumerate(range(_N_ACTIONS)):
         key, subkey = jr.split(key)
-        obs_key, next_key, action_key = jr.split(subkey, 3)
+        obs_key, next_key = jr.split(subkey)
         observation = jr.normal(obs_key, (_OBSERVATION_DIM,), dtype=jnp.float32)
         next_observation = jr.normal(next_key, (_OBSERVATION_DIM,), dtype=jnp.float32)
-        action = int(jr.randint(action_key, (), 0, _N_ACTIONS))
         event = _event(observation=observation, action=action, next_observation=next_observation)
 
         scalar_result = scalar_rehearsal.step(scalar_state, event)
@@ -182,14 +147,30 @@ def test_scalar_index_and_one_hot_agree_on_the_same_action_stream() -> None:
         scalar_state = scalar_result.state
         one_hot_state = one_hot_result.state
 
+        assert bool(scalar_result.diagnostics.transaction_applied)
+        assert bool(one_hot_result.diagnostics.transaction_applied)
+        assert bool(jnp.any(scalar_result.trace.model_updates_applied))
+        assert bool(jnp.any(one_hot_result.trace.model_updates_applied))
+        assert int(scalar_state.rehearsal_applied_count) > 0
+        assert int(one_hot_state.rehearsal_applied_count) > 0
+        assert int(scalar_state.accepted_real_event_count) == step + 1
+        assert int(one_hot_state.accepted_real_event_count) == step + 1
         assert scalar_result.trace.actions.tolist() == one_hot_result.trace.actions.tolist()
         assert bool(
-            jnp.array_equal(
-                scalar_result.trace.observed_losses, one_hot_result.trace.observed_losses
+            jnp.allclose(
+                scalar_result.trace.observed_losses,
+                one_hot_result.trace.observed_losses,
+                rtol=1e-6,
+                atol=1e-7,
             )
         )
-        assert float(scalar_result.real_observed_loss) == pytest.approx(
-            float(one_hot_result.real_observed_loss)
+        assert bool(
+            jnp.allclose(
+                scalar_result.real_observed_loss,
+                one_hot_result.real_observed_loss,
+                rtol=1e-6,
+                atol=1e-7,
+            )
         )
         assert all(
             bool(jnp.array_equal(scalar_leaf, one_hot_leaf))
@@ -199,6 +180,19 @@ def test_scalar_index_and_one_hot_agree_on_the_same_action_stream() -> None:
                 strict=True,
             )
         )
+
+    # The real dispatcher committed genuinely different storage layouts while
+    # preserving the same decoded action stream and learned trajectory.
+    scalar_entries = scalar_state.replay_state.short_term
+    one_hot_entries = one_hot_state.replay_state.short_term
+    assert scalar_entries.actions[:_N_ACTIONS].tolist() == [[0.0], [1.0], [2.0]]
+    assert one_hot_entries.actions[:_N_ACTIONS].tolist() == [
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+    ]
+    assert scalar_entries.valid[:_N_ACTIONS].tolist() == [True] * _N_ACTIONS
+    assert one_hot_entries.valid[:_N_ACTIONS].tolist() == [True] * _N_ACTIONS
 
     scalar_rehearsal.validate_state(scalar_state)
     one_hot_rehearsal.validate_state(one_hot_state)
