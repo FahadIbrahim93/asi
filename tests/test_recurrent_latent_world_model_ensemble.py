@@ -664,6 +664,23 @@ def test_exact_observation_action_and_cache_ownership_reject_stale_or_tampered_i
     assert not bool(tampered.diagnostics.cached_prediction_exact)
     _assert_tree_equal(tampered.state, state)
 
+    # A state whose member_parameters were replaced out of band (e.g. an
+    # ensemble-member substitution) without also advancing event_count or
+    # member_hidden_states must not be accepted just because the decision
+    # cache's other ownership fields still match and the replayed
+    # prediction happens to come out identical.
+    first_member = state.member_parameters[0]
+    replaced_first_member = cast(Any, first_member).replace(
+        gate_kernel=first_member.gate_kernel.at[:, 0].add(jnp.float32(1.0))
+    )
+    replaced_state = cast(Any, state).replace(
+        member_parameters=(replaced_first_member, *state.member_parameters[1:])
+    )
+    assert bool(model.state_valid(replaced_state))
+    replaced_parameters_result = model.update(replaced_state, decision, _transition())
+    assert not bool(replaced_parameters_result.diagnostics.ownership_valid)
+    _assert_tree_equal(replaced_parameters_result.state, replaced_state)
+
 
 @pytest.mark.parametrize(
     "mutate",
