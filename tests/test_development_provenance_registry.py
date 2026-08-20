@@ -51,6 +51,12 @@ def test_registry_rejects_large_canonical_payload_after_a_bounded_walk() -> None
         provenance.registry_sha256(payload)
 
 
+def test_registry_applies_string_budget_to_mapping_keys() -> None:
+    key = "k" * (provenance._MAX_REGISTRY_STRING_BYTES + 1)
+    with pytest.raises(ValueError, match="string exceeds the byte limit"):
+        provenance.registry_sha256({key: 1})
+
+
 def test_registry_rejects_deep_or_hostile_values_before_hooks_or_dump() -> None:
     nested: object = None
     for _ in range(provenance._MAX_REGISTRY_DEPTH + 1):

@@ -40,6 +40,16 @@ class _RegistryBudget:
         self.entries += count
 
 
+def _require_registry_string(value: str) -> str:
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("registry string must be valid UTF-8") from exc
+    if len(encoded) > _MAX_REGISTRY_STRING_BYTES:
+        raise ValueError("registry string exceeds the byte limit")
+    return value
+
+
 def _canonical(
     value: object,
     *,
@@ -56,6 +66,8 @@ def _canonical(
         budget.consume(len(mapping))
         if any(type(key) is not str for key in mapping):
             raise TypeError("registry mapping keys must be exact strings")
+        for key in mapping:
+            _require_registry_string(cast(str, key))
         return {
             key: _canonical(item, budget=budget, depth=depth + 1)
             for key, item in sorted(cast(dict[str, object], mapping).items())
@@ -65,13 +77,7 @@ def _canonical(
         budget.consume(len(items))
         return [_canonical(item, budget=budget, depth=depth + 1) for item in items]
     if type(value) is str:
-        try:
-            encoded = value.encode("utf-8")
-        except UnicodeEncodeError as exc:
-            raise ValueError("registry string must be valid UTF-8") from exc
-        if len(encoded) > _MAX_REGISTRY_STRING_BYTES:
-            raise ValueError("registry string exceeds the byte limit")
-        return value
+        return _require_registry_string(value)
     if type(value) is int:
         if value.bit_length() > _MAX_REGISTRY_INTEGER_BITS:
             raise ValueError("registry integer exceeds the scalar limit")
