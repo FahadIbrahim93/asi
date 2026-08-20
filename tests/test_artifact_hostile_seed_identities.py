@@ -1,41 +1,84 @@
-"""Failing-first tests for exact-type hostile-int seed rejection in artifact validators."""
+"""Exact-type hostile-int seed rejection in artifact validators."""
+
 from __future__ import annotations
 
-import pytest
+from collections.abc import Callable
+
+import numpy as np
+
+from alberta_framework.evaluation.continual_multiagent_artifact import (
+    _validate_seed_and_aggregate_consistency,
+)
+from alberta_framework.evaluation.ftl_decision_artifact import (
+    _validate_and_extract_seed_vectors,
+)
+from alberta_framework.evaluation.recurring_feature_artifact import (
+    _extract_seed_metrics,
+)
 
 
-def _multiagent_bad_seed_payload(kind: str) -> dict:
-    return {
-        "seed": {"hostile": True, "numpy_bool": False, "float": 4.0, "string": "4", "int_subclass": type("H", (int,), {"__int__": lambda s: 1/0})(4)}[kind],
-        "conditions": {"active": [0]},
-    }
+class _HostileInt(int):
+    calls = 0
+
+    def _called(self) -> None:
+        type(self).calls += 1
+        raise AssertionError("hostile integer hook ran")
+
+    __bool__ = _called
+    __index__ = _called
+    __int__ = _called
+    __repr__ = _called
+    __str__ = _called
+
+    def __eq__(self, other: object) -> bool:
+        del other
+        self._called()
+
+    __hash__ = int.__hash__
 
 
-def test_multiagent_artifact_rejects_bool_int_float_string_seed_identities() -> None:
-    from alberta_framework.evaluation.continual_multiagent_artifact import (
-        _validate_operational as _validate,
-    )
-    for kind in ("bool", "numpy_bool", "float", "string", "int_subclass"):
-        payload = {"condition_timings": [_multiagent_bad_seed_payload(kind)]}
-        result = _validate(payload)
-        assert "seed must be an integer" in str(result.get("errors"))
+def _invalid_seeds() -> tuple[object, ...]:
+    return (True, np.bool_(False), 4.0, "4", _HostileInt(4))
+
+
+def _assert_each_rejected(validate: Callable[[object, list[str]], None]) -> None:
+    _HostileInt.calls = 0
+    for seed in _invalid_seeds():
+        errors: list[str] = []
+        validate(seed, errors)
+        assert any("seed must be an integer" in error for error in errors)
+    assert _HostileInt.calls == 0
+
+
+def test_multiagent_artifact_rejects_hostile_seed_identities() -> None:
+    def validate(seed: object, errors: list[str]) -> None:
+        _validate_seed_and_aggregate_consistency(
+            {
+                "seed_summaries": [{"seed": seed, "conditions": {}}],
+                "aggregate": {},
+                "configuration": {},
+            },
+            errors,
+        )
+
+    _assert_each_rejected(validate)
 
 
 def test_ftl_decision_artifact_rejects_hostile_seed_identities() -> None:
-    from alberta_framework.evaluation.ftl_decision_artifact import (
-        _validate_ftl_decision_summaries,
-    )
-    for kind in ("bool", "float", "string"):
-        payload = {"seed_summaries": [_multiagent_bad_seed_payload(kind)]}
-        result = _validate_ftl_decision_summaries(payload)
-        assert "seed must be an integer" in str(result.get("errors"))
+    def validate(seed: object, errors: list[str]) -> None:
+        _validate_and_extract_seed_vectors(
+            [{"seed": seed, "conditions": {}}],
+            errors,
+        )
+
+    _assert_each_rejected(validate)
 
 
 def test_recurring_feature_artifact_rejects_hostile_seed_identities() -> None:
-    from alberta_framework.evaluation.recurring_feature_artifact import (
-        _validate_recurring_feature_evidence,
-    )
-    for kind in ("bool", "float", "string"):
-        payload = {"evidence_summaries": [_multiagent_bad_seed_payload(kind)]}
-        result = _validate_recurring_feature_evidence(payload)
-        assert "seed must be an integer" in str(result.get("errors"))
+    def validate(seed: object, errors: list[str]) -> None:
+        _extract_seed_metrics(
+            [{"seed": seed, "retained": {}, "no_retention": {}}],
+            errors,
+        )
+
+    _assert_each_rejected(validate)

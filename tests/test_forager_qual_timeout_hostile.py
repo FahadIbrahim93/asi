@@ -59,8 +59,13 @@ def test_benign_timeout_passes() -> None:
     # Use a short timeout with a command that will finish quickly
     # timeout 1 should not raise for timeout check
     try:
-        _run_bounded_process(["echo", "hi"], timeout=1, maximum_stdout_bytes=100, maximum_stderr_bytes=100)
-    except ValueError as e:
-        assert "finite and positive" not in str(e)
+        _run_bounded_process(
+            ["echo", "hi"],
+            timeout=1,
+            maximum_stdout_bytes=100,
+            maximum_stderr_bytes=100,
+        )
+    except ValueError as error:
+        assert "finite and positive" not in str(error)
     except Exception:
         pass
