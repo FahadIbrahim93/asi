@@ -453,8 +453,9 @@ def test_cli_reserves_exact_shard_before_execution(
     original_load_plan = campaign._load_plan
 
     def load_plan_after_reservation(root: Path) -> dict[str, object]:
-        assert destination.is_file()
-        assert destination.stat().st_size == 0
+        assert not destination.exists()
+        marker = destination.with_name(f".{destination.name}.reservation")
+        assert marker.is_file()
         return original_load_plan(root)
 
     def fail_after_reservation(*args: object, **kwargs: object) -> dict[str, object]:
@@ -511,6 +512,46 @@ def test_cli_reserves_exact_shard_before_execution(
     )
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_replaced_visible_reservation_cannot_publish_shard(
+    tmp_path: Path, tiny_campaign: Any
+) -> None:
+    destination = campaign.campaign_path(
+        tmp_path, "shard", arm="memory_off", seed=157001
+    )
+    reservation = campaign._reserve_shard_destination(destination, root=tmp_path)
+    _, parent_descriptor, _, reservation_name = reservation
+    hidden_name = f"{reservation_name}.held"
+    os.link(
+        reservation_name,
+        hidden_name,
+        src_dir_fd=parent_descriptor,
+        dst_dir_fd=parent_descriptor,
+        follow_symlinks=False,
+    )
+    os.unlink(reservation_name, dir_fd=parent_descriptor)
+    replacement = os.open(
+        reservation_name,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o400,
+        dir_fd=parent_descriptor,
+    )
+    os.close(replacement)
+    try:
+        with pytest.raises(ValueError, match="owned regular marker"):
+            campaign.publish_json(
+                destination,
+                campaign.run_bimu_shard("memory_off", 157001),
+                root=tmp_path,
+                _reservation=reservation,
+            )
+        assert not destination.exists()
+    finally:
+        os.unlink(hidden_name, dir_fd=parent_descriptor)
+        os.unlink(reservation_name, dir_fd=parent_descriptor)
+        campaign._release_shard_reservation(reservation)
+
+
 def test_cli_allows_disposable_plan_preview_but_rejects_relocated_shard(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -548,6 +589,24 @@ def test_cli_allows_disposable_plan_preview_but_rejects_relocated_shard(
     with pytest.raises(ValueError, match="registered repository root"):
         campaign.main(["summarize", "--root", str(preview)])
     assert len(published) == 1
+
+
+def test_public_publisher_rejects_relocated_shard_before_namespace_access(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_campaign: Any
+) -> None:
+    registered = tmp_path / "registered"
+    relocated = tmp_path / "relocated"
+    monkeypatch.setattr(campaign, "REGISTERED_OUTPUT_ROOT", registered)
+    destination = campaign.campaign_path(
+        relocated, "shard", arm="memory_off", seed=157001
+    )
+    with pytest.raises(ValueError, match="registered repository root"):
+        campaign.publish_json(
+            destination,
+            campaign.build_failed_bimu_shard("memory_off", 157001),
+            root=relocated,
+        )
+    assert not relocated.exists()
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")

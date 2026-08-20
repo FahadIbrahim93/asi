@@ -1241,6 +1241,8 @@ def publish_json(
         raise TypeError("path and root must be exact Paths")
     if not _allowed_path(path, root):
         _fail("destination is outside the fixed campaign namespace")
+    if path != campaign_path(root, "plan"):
+        _require_registered_root(root)
 
     def validate(candidate: object) -> None:
         if path == campaign_path(root, "plan"):
@@ -1267,13 +1269,28 @@ def publish_json(
         destination, parent_descriptor = _open_output_parent(path, create=True)
         close_parent = True
     else:
-        destination, parent_descriptor, reservation_descriptor, _ = _reservation
+        (
+            destination,
+            parent_descriptor,
+            reservation_descriptor,
+            reservation_name,
+        ) = _reservation
         close_parent = False
         if destination != Path(os.path.abspath(os.fspath(path))):
             _fail("campaign reservation does not match its exact destination")
         _require_live_parent(destination, parent_descriptor)
         reservation_stat = os.fstat(reservation_descriptor)
-        if not stat.S_ISREG(reservation_stat.st_mode) or reservation_stat.st_nlink != 1:
+        visible_reservation = os.stat(
+            reservation_name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(reservation_stat.st_mode)
+            or reservation_stat.st_nlink != 1
+            or (reservation_stat.st_dev, reservation_stat.st_ino)
+            != (visible_reservation.st_dev, visible_reservation.st_ino)
+        ):
             _fail("campaign shard reservation is not the owned regular marker")
     file_descriptor: int | None = None
     try:
