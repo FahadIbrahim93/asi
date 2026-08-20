@@ -3,7 +3,8 @@
 Provides functions for computing tracking error, learning curves,
 and other metrics useful for evaluating continual learners. Nested
 boolean-trace walks stop at ``_BOOLEAN_TRACE_MAX_DEPTH`` so a hostile nest
-raises ``ValueError`` instead of ``RecursionError``.
+raises ``ValueError`` instead of ``RecursionError``. Host list, tuple, and
+object-array width stops at ``_BOOLEAN_TRACE_MAX_NODES`` before the walk.
 
 The task-matrix metrics in this module use a common convention: rows are
 evaluation checkpoints and columns are tasks or regimes. ``first_exposure[j]``
@@ -27,37 +28,49 @@ import numpy as np
 from numpy.typing import NDArray
 
 _INT32_MAX: int = 2**31 - 1
-# Same ceiling as security._JSON_MAX_DEPTH. An unbounded list/tuple walk
-# RecursionErrors on a ~1200-deep nest and cannot reject the boolean.
+# Bound recursive validation before numeric traces are materialized.
 _BOOLEAN_TRACE_MAX_DEPTH: int = 32
+_BOOLEAN_TRACE_MAX_NODES: int = 1_000_000
+# Dense typed arrays do not consume the Python traversal budget, but they still
+# feed allocation-heavy metric kernels.  ``compute_running_mean`` retains up to
+# twelve float64/int64 vectors while constructing its result, so this separate
+# ceiling keeps that complete envelope below 256 MiB without conflating array
+# compatibility with recursive host-node admission.
+_NUMERIC_TRACE_MAX_VALUES: int = 2_000_000
 
-_ACTUAL_INT_TYPES = frozenset(
-    {
-        int,
-        np.int8,
-        np.int16,
-        np.int32,
-        np.int64,
-        np.uint8,
-        np.uint16,
-        np.uint32,
-        np.uint64,
-        np.longlong,
-        np.ulonglong,
-    }
+_ACTUAL_INT_TYPES = (
+    int,
+    np.int8,
+    np.int16,
+    np.int32,
+    np.int64,
+    np.uint8,
+    np.uint16,
+    np.uint32,
+    np.uint64,
+    np.longlong,
+    np.ulonglong,
 )
-_ACTUAL_FLOAT_TYPES = frozenset(
-    {float, Fraction, *(np.dtype(code).type for code in ("e", "f", "d", "g"))}
+_ACTUAL_FLOAT_TYPES = (
+    float,
+    Fraction,
+    *(np.dtype(code).type for code in ("e", "f", "d", "g")),
 )
-_ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
+_ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES + _ACTUAL_FLOAT_TYPES
+
+
+def _type_is_one_of(actual_type: type[object], allowed: tuple[object, ...]) -> bool:
+    """Use identity dispatch so hostile metaclass equality/hash hooks never run."""
+    return any(actual_type is candidate for candidate in allowed)
 
 
 def _is_bool(value: object) -> bool:
-    return type(value) in (bool, np.bool_)
+    actual_type = type(value)
+    return actual_type is bool or actual_type is np.bool_
 
 
 def _is_index_int(value: object) -> bool:
-    return type(value) in _ACTUAL_INT_TYPES
+    return _type_is_one_of(type(value), _ACTUAL_INT_TYPES)
 
 
 def _require_exact_bool(name: str, value: object) -> bool:
@@ -84,7 +97,7 @@ def _require_positive_builtin_int(name: str, value: object) -> int:
 def _require_finite_real(name: str, value: object) -> float:
     if _is_bool(value):
         raise ValueError(f"{name} must be a finite real number")
-    if type(value) not in _ALLOWED_REAL_TYPES:
+    if not _type_is_one_of(type(value), _ALLOWED_REAL_TYPES):
         raise ValueError(f"{name} must be a finite real number")
     try:
         number = float(cast(float, value))
@@ -96,31 +109,61 @@ def _require_finite_real(name: str, value: object) -> float:
 
 
 def _reject_boolean_numeric_trace(
-    values: object, *, name: str, depth: int = 0
+    values: object,
+    *,
+    name: str,
+    depth: int = 0,
+    _remaining_nodes: list[int] | None = None,
+    _remaining_dense_values: list[int] | None = None,
 ) -> None:
+    if _remaining_nodes is None:
+        _remaining_nodes = [_BOOLEAN_TRACE_MAX_NODES]
+    if _remaining_dense_values is None:
+        _remaining_dense_values = [_NUMERIC_TRACE_MAX_VALUES]
+    _remaining_nodes[0] -= 1
+    if _remaining_nodes[0] < 0:
+        raise ValueError(f"{name} exceeds the boolean-trace value limit")
     if depth > _BOOLEAN_TRACE_MAX_DEPTH:
         raise ValueError(f"{name} exceeds the boolean-trace depth limit")
     if _is_bool(values):
         raise ValueError(f"{name} must not be a boolean")
-    if type(values) in _ALLOWED_REAL_TYPES:
+    actual_type = type(values)
+    if _type_is_one_of(actual_type, _ALLOWED_REAL_TYPES):
         return
-    if type(values) in (list, tuple):
+    if actual_type is list or actual_type is tuple:
         sequence = cast(list[object] | tuple[object, ...], values)
+        if len(sequence) > _remaining_nodes[0]:
+            raise ValueError(f"{name} exceeds the boolean-trace value limit")
         for index, item in enumerate(sequence):
             _reject_boolean_numeric_trace(
-                item, name=f"{name}[{index}]", depth=depth + 1
+                item,
+                name=f"{name}[{index}]",
+                depth=depth + 1,
+                _remaining_nodes=_remaining_nodes,
+                _remaining_dense_values=_remaining_dense_values,
             )
         return
-    if type(values) is np.ndarray:
-        if values.dtype.kind == "b":
+    if actual_type is np.ndarray:
+        array = cast(NDArray[np.generic], values)
+        if array.dtype.kind == "b":
             raise ValueError(f"{name} must not be a boolean array")
-        if values.dtype.kind == "O":
-            for index, item in enumerate(values.flat):
+        if array.dtype.kind == "O":
+            if array.size > _remaining_nodes[0]:
+                raise ValueError(f"{name} exceeds the boolean-trace value limit")
+            for index, item in enumerate(array.flat):
                 _reject_boolean_numeric_trace(
-                    item, name=f"{name}[{index}]", depth=depth + 1
+                    item,
+                    name=f"{name}[{index}]",
+                    depth=depth + 1,
+                    _remaining_nodes=_remaining_nodes,
+                    _remaining_dense_values=_remaining_dense_values,
                 )
-        elif values.dtype.kind not in "iuf":
+        elif array.dtype.kind not in "iuf":
             raise ValueError(f"{name} must contain real numeric values")
+        else:
+            if array.size > _remaining_dense_values[0]:
+                raise ValueError(f"{name} exceeds the dense numeric value limit")
+            _remaining_dense_values[0] -= int(array.size)
         return
     raise ValueError(f"{name} must contain exact real numeric values")
 
@@ -170,12 +213,16 @@ def _require_index_vector(values: object, *, name: str) -> NDArray[np.int64]:
         raise ValueError(f"{name} must be integer indices, not a boolean")
     if type(values) in (list, tuple):
         sequence = cast(list[object] | tuple[object, ...], values)
+        if len(sequence) > _BOOLEAN_TRACE_MAX_NODES:
+            raise ValueError(f"{name} exceeds the boolean-trace value limit")
         for index, item in enumerate(sequence):
             if not _is_index_int(item):
                 raise ValueError(f"{name}[{index}] must be an integer index, not a boolean")
         return np.asarray(values, dtype=np.int64)
     elif type(values) is np.ndarray:
         array = values
+        if array.size > _NUMERIC_TRACE_MAX_VALUES:
+            raise ValueError(f"{name} exceeds the dense numeric value limit")
         if array.size == 0:
             return np.asarray(array, dtype=np.int64)
         if array.dtype.kind not in "iu":
@@ -592,15 +639,28 @@ def _metric_history_values(
     key: str,
     *,
     name: str,
+    _remaining_items: list[int] | None = None,
 ) -> NDArray[np.float64]:
     if type(key) is not str:
         raise ValueError(f"{name} metric key must be an exact string")
     if type(metrics_history) is not list:
         raise ValueError(f"{name} must be an exact list")
+    history = cast(list[object], metrics_history)
+    remaining_items = (
+        [_BOOLEAN_TRACE_MAX_NODES] if _remaining_items is None else _remaining_items
+    )
+    if len(history) > remaining_items[0]:
+        raise ValueError(f"{name} exceeds the boolean-trace value limit")
+    remaining_items[0] -= len(history)
     values: list[float] = []
-    for index, record in enumerate(metrics_history):
+    for index, record in enumerate(history):
         if type(record) is not dict:
             raise ValueError(f"{name}[{index}] must be an exact dictionary")
+        if len(record) > 4_096:
+            raise ValueError(f"{name}[{index}] exceeds the metric-record key limit")
+        if len(record) > remaining_items[0]:
+            raise ValueError(f"{name} exceeds the aggregate metric-record item limit")
+        remaining_items[0] -= len(record)
         if any(type(record_key) is not str for record_key in record):
             raise ValueError(f"{name}[{index}] keys must be exact strings")
         if key not in record:
@@ -756,10 +816,18 @@ def compare_learners(
         raise ValueError("results must be an exact dictionary")
     if not results:
         raise ValueError("results must contain at least one learner")
+    if len(results) > _BOOLEAN_TRACE_MAX_NODES:
+        raise ValueError("results exceeds the learner traversal limit")
     summary = {}
+    remaining_items = [_BOOLEAN_TRACE_MAX_NODES - len(results)]
     for name, metrics_history in results.items():
         _require_exact_str("learner name", name)
-        values = extract_metric(metrics_history, metric)
+        values = _metric_history_values(
+            metrics_history,
+            metric,
+            name="metrics_history",
+            _remaining_items=remaining_items,
+        )
         if values.size == 0:
             raise ValueError(f"learner {name} must contain at least one metric record")
         scale = float(np.max(np.abs(values)))

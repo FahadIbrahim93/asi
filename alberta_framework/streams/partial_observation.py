@@ -21,11 +21,13 @@ just receives less information about the underlying state.
 from __future__ import annotations
 
 import enum
-from typing import TypeVar
+from typing import TypeVar, cast
 
 import chex
+import jax
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, PRNGKeyArray
 
@@ -50,6 +52,30 @@ class MaskMode(enum.Enum):
     PERIODIC = "periodic"
 
 
+# Bound schedule construction by both row count and total boolean payload.
+_MAX_PERIODIC_SCHEDULE_LENGTH = 4_096
+# Cap the final boolean schedule payload at 64 MiB. The schedule is converted
+# in one operation below: converting each row separately makes construction
+# time grow with thousands of JAX dispatches even when every row is a repeated
+# pointer to the same tiny host array.
+_MAX_PERIODIC_SCHEDULE_VALUES = 64 * 1024 * 1024
+
+
+def _trusted_boolean_mask(name: str, value: object, feature_dim: int) -> Array:
+    """Validate mask metadata before JAX conversion can dispatch user hooks."""
+    actual_type = type(value)
+    if actual_type is not np.ndarray and not issubclass(
+        actual_type, (jax.Array, jax.core.Tracer)
+    ):
+        raise ValueError(f"{name} must be an exact NumPy or JAX array")
+    trusted = cast(Array, value)
+    if trusted.shape != (feature_dim,) or trusted.dtype != jnp.dtype(jnp.bool_):
+        raise ValueError(
+            f"{name} must have shape (feature_dim={feature_dim},) and dtype bool"
+        )
+    return trusted
+
+
 def _require_unit_interval_probability(name: str, value: object) -> float:
     """Return a canonical probability valid at the float32 execution sink."""
     return validated_float32_scalar(name, value, lower=0.0, upper=1.0)
@@ -65,6 +91,13 @@ def _require_mode(mode: object) -> MaskMode:
     if type(mode) is not MaskMode:
         raise ValueError("mode must be an exact MaskMode")
     return mode
+
+
+def _require_feature_dim(value: object) -> int:
+    """Reject non-builtin protocol dimensions before resource arithmetic."""
+    if type(value) is not int or not 1 <= value <= 2**31 - 1:
+        raise ValueError("inner.feature_dim must be an integer in [1, 2147483647]")
+    return value
 
 
 # =============================================================================
@@ -101,13 +134,15 @@ class PartialObservationWrapper[InnerStateT]:
             partially masked.
         mode: Exact ``MaskMode`` member (FIXED / RANDOM / PERIODIC).
             Leftover string, bool, and int identities are rejected.
-        fixed_mask: Boolean mask of shape ``(feature_dim,)`` for FIXED.
-            ``True`` means VISIBLE; ``False`` means HIDDEN.
+        fixed_mask: Exact NumPy or JAX boolean array of shape
+            ``(feature_dim,)`` for FIXED. ``True`` means VISIBLE;
+            ``False`` means HIDDEN.
         mask_prob: Per-channel KEEP probability for RANDOM. So
             ``mask_prob = 0.5`` keeps half the channels each step in
             expectation.
-        schedule: Tuple of boolean masks of shape ``(feature_dim,)``;
-            cycled each step under PERIODIC mode.
+        schedule: Non-empty exact tuple of at most 4,096 NumPy or JAX
+            boolean arrays of shape ``(feature_dim,)`` and at most
+            67,108,864 total values; cycled under PERIODIC mode.
         sentinel: Finite real that replaces masked entries (default ``0.0``).
             Boolean and non-finite values are rejected so a hidden channel
             cannot silently become ``1.0``, ``NaN``, or ``Inf``.
@@ -141,31 +176,44 @@ class PartialObservationWrapper[InnerStateT]:
         self._mask_prob = mask_prob
         self._sentinel = validated_float32_scalar("sentinel", sentinel)
 
-        feature_dim = inner.feature_dim
+        feature_dim = _require_feature_dim(inner.feature_dim)
 
         if mode == MaskMode.FIXED:
             if fixed_mask is None:
                 raise ValueError("MaskMode.FIXED requires fixed_mask.")
-            mask = jnp.asarray(fixed_mask, dtype=jnp.bool_)
-            if mask.shape != (feature_dim,):
-                raise ValueError(
-                    f"fixed_mask shape {mask.shape} != (feature_dim={feature_dim},)"
-                )
+            mask = jnp.asarray(
+                _trusted_boolean_mask("fixed_mask shape", fixed_mask, feature_dim)
+            )
             self._fixed_mask: Array | None = mask
         else:
             self._fixed_mask = None
 
         if mode == MaskMode.PERIODIC:
-            if schedule is None or len(schedule) == 0:
+            if type(schedule) is not tuple:
+                raise ValueError("periodic schedule must be an exact tuple")
+            if len(schedule) == 0:
                 raise ValueError(
                     "MaskMode.PERIODIC requires a non-empty schedule."
                 )
-            masks = [jnp.asarray(m, dtype=jnp.bool_) for m in schedule]
-            if any(mask.shape != (feature_dim,) for mask in masks):
+            if len(schedule) > _MAX_PERIODIC_SCHEDULE_LENGTH:
                 raise ValueError(
-                    f"schedule masks must each have shape (feature_dim={feature_dim},)"
+                    "periodic schedule length must be an integer in "
+                    f"[1, {_MAX_PERIODIC_SCHEDULE_LENGTH}]"
                 )
-            sched = jnp.stack(masks, axis=0)
+            schedule_values = len(schedule) * feature_dim
+            if schedule_values > _MAX_PERIODIC_SCHEDULE_VALUES:
+                raise ValueError(
+                    "periodic schedule working set exceeds the bounded "
+                    f"{_MAX_PERIODIC_SCHEDULE_VALUES}-value payload"
+                )
+            for row in schedule:
+                _trusted_boolean_mask("schedule masks", row, feature_dim)
+            # Convert the complete trusted tuple once.  Per-row conversion plus
+            # stacking turns the admitted 4,096-row boundary into thousands of
+            # independent JAX dispatches even for pointer-repeated rows.
+            sched = jnp.asarray(schedule)
+            assert sched.shape == (len(schedule), feature_dim)
+            assert sched.dtype == jnp.dtype(jnp.bool_)
             self._schedule: Array | None = sched
         else:
             self._schedule = None
