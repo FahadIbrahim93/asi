@@ -50,6 +50,7 @@ _EXPECTED_SCRIPT_NAMES = {
     "asi-activation-feature-campaign",
     "asi-activation-feature-ipmnist",
     "asi-adamo-diagnostic",
+    "asi-bimu-matched-development",
     "asi-clear-qualification",
     "asi-coom-qualification-smoke",
     "asi-cora-catalog",
