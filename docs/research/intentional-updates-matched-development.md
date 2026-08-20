@@ -38,4 +38,6 @@ A separate independently reviewed change must authorize execution. An authorized
 the frozen input identity and reserved NEW output path. It acquires an exclusive reservation before
 dataset loading, pins every directory segment without following symlinks, publishes by no-replace
 hard link, fsyncs, and strictly rereads and revalidates the report. Every supported, rejected, or
-inconclusive outcome remains development-only and permanently nonpromoting.
+inconclusive completed comparison remains development-only and permanently nonpromoting. A failure
+after the first consumer dispatch leaves the immutable reservation as a consumed-without-result
+tombstone, so a partially consumed schedule cannot be retried or represented as a retained result.

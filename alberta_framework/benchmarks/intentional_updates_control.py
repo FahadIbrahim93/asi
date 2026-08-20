@@ -195,6 +195,10 @@ def frozen_plan() -> dict[str, object]:
         "development_only": True,
         "scientific_promotion_allowed": False,
         "negative_outcomes_retained": True,
+        "execution_failure_policy": (
+            "a failure after consumer dispatch leaves the immutable reservation as a "
+            "consumed-without-result tombstone and forbids retry"
+        ),
     }
 
 
@@ -1005,7 +1009,9 @@ def _reserve(path: Path) -> _Reservation:
             dir_fd=directory_fd,
         )
         reservation_acquired = True
-        marker = f"reserved:{path.name}\n".encode("ascii")
+        marker = (
+            f"reserved:{path.name}; retained as consumed-without-result after dispatch\n"
+        ).encode("ascii")
         view = memoryview(marker)
         while view:
             written = os.write(descriptor, view)
@@ -1057,6 +1063,26 @@ def _release(reservation: _Reservation) -> None:
             os.fsync(reservation.directory_fd)
     except FileNotFoundError:
         pass
+    finally:
+        os.close(reservation.directory_fd)
+
+
+def _retain_consumed_reservation(reservation: _Reservation) -> None:
+    """Close a dispatched reservation without making the consumed schedule reusable."""
+    try:
+        marker = os.stat(
+            reservation.reservation_name,
+            dir_fd=reservation.directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(marker.st_mode)
+            or marker.st_nlink != 1
+            or (marker.st_dev, marker.st_ino)
+            != (reservation.reservation_device, reservation.reservation_inode)
+        ):
+            raise RuntimeError("consumed reservation identity changed")
+        os.fsync(reservation.directory_fd)
     finally:
         os.close(reservation.directory_fd)
 
@@ -1249,6 +1275,8 @@ def run_campaign(dataset_path: Path, output_path: Path = OUTPUT_PATH) -> dict[st
     if type(dataset_path) is not type(Path()) or type(output_path) is not type(Path()):
         raise ValueError("dataset and output must be exact pathlib.Path values")
     reservation = _reserve(output_path)
+    execution_started = False
+    report_published = False
     try:
         source_before = _current_source()
         runtime_before = _current_runtime()
@@ -1256,6 +1284,7 @@ def run_campaign(dataset_path: Path, output_path: Path = OUTPUT_PATH) -> dict[st
         dataset_provenance = _screening_dataset_provenance(inputs, labels)
         if dataset_provenance != frozen_plan()["dataset"]:
             raise ValueError("dataset numeric payload does not match the frozen reviewed input")
+        execution_started = True
         supervised_records = [
             intentional_updates_development_record(
                 run_screening_config(
@@ -1289,9 +1318,13 @@ def run_campaign(dataset_path: Path, output_path: Path = OUTPUT_PATH) -> dict[st
             execution_source_commit=_execution_commit(),
         )
         _publish_reserved(reservation, report)
+        report_published = True
         return report
     finally:
-        _release(reservation)
+        if report_published or not execution_started:
+            _release(reservation)
+        else:
+            _retain_consumed_reservation(reservation)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

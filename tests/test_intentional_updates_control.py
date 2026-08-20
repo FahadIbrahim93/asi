@@ -478,6 +478,46 @@ def test_strict_reread_converts_deep_json_recursion(
         lane._release(reservation)
 
 
+def test_campaign_failure_after_dispatch_retains_consumed_reservation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    destination = tmp_path / "consumed" / "report.json"
+    monkeypatch.setattr(lane, "OUTPUT_PATH", destination)
+    monkeypatch.setattr(lane, "CAMPAIGN_SEEDS", lane.TEST_ONLY_SEEDS)
+    monkeypatch.setattr(lane, "SEEDS", lane.TEST_ONLY_SEEDS)
+    monkeypatch.setattr(lane, "_REVIEWED_EXECUTION_TRANSITION", True)
+    monkeypatch.setattr(lane, "_EXECUTION_AUTHORIZED", True)
+    monkeypatch.setattr(lane, "_current_source", lambda: {"git_commit": "c" * 40})
+    monkeypatch.setattr(lane, "_current_runtime", lambda: {"backend": "cpu"})
+    monkeypatch.setattr(
+        lane,
+        "_load_dataset",
+        lambda _path: (
+            np.zeros((1, 1), dtype=np.float32),
+            np.zeros(1, dtype=np.int32),
+        ),
+    )
+    monkeypatch.setattr(
+        lane,
+        "_screening_dataset_provenance",
+        lambda _inputs, _labels: lane.frozen_plan()["dataset"],
+    )
+
+    def fail_first_consumer(*_args: object, **_kwargs: object) -> Never:
+        raise RuntimeError("injected consumer failure")
+
+    monkeypatch.setattr(lane, "run_screening_config", fail_first_consumer)
+    with pytest.raises(RuntimeError, match="injected consumer failure"):
+        lane.run_campaign(Path("unused.npz"), destination)
+    marker = destination.parent / ".report.json.reservation"
+    assert marker.read_text(encoding="ascii") == (
+        "reserved:report.json; retained as consumed-without-result after dispatch\n"
+    )
+    assert not destination.exists()
+    with pytest.raises(FileExistsError):
+        lane.run_campaign(Path("unused.npz"), destination)
+
+
 @pytest.mark.parametrize(
     ("horizon", "phase_length"),
     [(0, 1), (10_001, 1), (8, 0), (8, 9), (True, 1)],
