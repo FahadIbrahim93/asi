@@ -20,7 +20,21 @@ from alberta_framework.core.option_search_control import (
 
 class _Agent:
     def __init__(self, n_options: object) -> None:
-        self.config = SimpleNamespace(n_options=n_options)
+        self.config = SimpleNamespace(n_options=n_options, observation_dim=1)
+
+
+class _HostileInt(int):
+    calls = 0
+
+    def __lt__(self, other: object) -> bool:
+        del other
+        type(self).calls += 1
+        raise AssertionError("hostile less-than hook executed")
+
+    def __gt__(self, other: object) -> bool:
+        del other
+        type(self).calls += 1
+        raise AssertionError("hostile greater-than hook executed")
 
 
 def test_documented_protocol_ceiling() -> None:
@@ -35,3 +49,18 @@ def test_last_fit_option_count_is_accepted() -> None:
 def test_rejects_oversized_option_counts_before_slot_product(value: int) -> None:
     with pytest.raises(ValueError, match="n_options must be an integer in"):
         OptionSearchControl(_Agent(value), OptionSearchControlConfig())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", [True, False, _HostileInt(2)])
+def test_rejects_non_exact_option_count_before_comparison_hooks(value: object) -> None:
+    _HostileInt.calls = 0
+    with pytest.raises(ValueError, match="n_options must be an integer in"):
+        OptionSearchControl(_Agent(value), OptionSearchControlConfig())  # type: ignore[arg-type]
+    assert _HostileInt.calls == 0
+
+
+def test_resource_budget_uses_admitted_option_count_snapshot() -> None:
+    agent = _Agent(2)
+    control = OptionSearchControl(agent, OptionSearchControlConfig())  # type: ignore[arg-type]
+    agent.config.n_options = 2**31 - 1
+    assert control.resource_budget.n_options == 2
