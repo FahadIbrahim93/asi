@@ -49,6 +49,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
 )
 
 RESULT_SCHEMA: Final[str] = "asi.activation_feature_ipmnist.result.v1"
+CAMPAIGN_RESULT_SCHEMA: Final[str] = "asi.activation_feature_ipmnist.result.v2"
 COMPARISON_ID: Final[str] = "issue-1566-low-cost-activation-feature-controls"
 DEVELOPMENT_SEEDS: Final[tuple[int, ...]] = (0, 1, 2, 3, 4)
 DEVELOPMENT_OUTCOMES: Final[frozenset[str]] = frozenset(
@@ -447,7 +448,7 @@ def run_activation_feature_arm(
     peak_schedule_bytes = _preflight_activation_feature_resources(
         config, n_train=int(host_x.shape[0])
     )
-    root = jr.key(np.uint32(seed))
+    root = jr.key(np.uint32(seed), impl="threefry2x32")
     _, key_schedule, _ = jr.split(root, 3)
     schedule = build_schedule(key_schedule, config, int(host_x.shape[0]))
     screening = run_screening_config(
@@ -530,10 +531,26 @@ def _parameter_counts(config: IPMNISTConfig, arm: str) -> tuple[int, int]:
     return allocated, active
 
 
-def activation_feature_result_payload(
-    result: ActivationFeatureRunResult, *, outcome: str
+def _validated_seed_protocol(value: object) -> tuple[int, ...]:
+    if (
+        type(value) is not tuple
+        or not 1 <= len(value) <= 64
+        or any(type(seed) is not int or not 0 <= seed <= 2**32 - 1 for seed in value)
+        or len(set(value)) != len(value)
+    ):
+        raise ValueError("development seed protocol must be a unique exact uint32 tuple")
+    return cast(tuple[int, ...], value)
+
+
+def _activation_feature_result_payload(
+    result: ActivationFeatureRunResult,
+    *,
+    outcome: str,
+    schema: str,
+    seed_protocol: tuple[int, ...],
 ) -> dict[str, object]:
-    """Build and validate the strict nonpromotion/resource receipt."""
+    """Build one versioned strict nonpromotion/resource receipt."""
+    checked_seeds = _validated_seed_protocol(seed_protocol)
     if type(result) is not ActivationFeatureRunResult:
         raise ValueError("result must be an exact ActivationFeatureRunResult")
     if type(result.screening) is not ScreeningRunResult:
@@ -564,7 +581,7 @@ def activation_feature_result_payload(
         config = IPMNISTConfig(**config_values)
     except (TypeError, ValueError) as error:
         raise ValueError("result config is invalid") from error
-    if type(result.seed) is not int or result.seed not in DEVELOPMENT_SEEDS:
+    if type(result.seed) is not int or result.seed not in checked_seeds:
         raise ValueError("result seed must belong to the frozen development seed set")
     if (
         type(result.wall_clock_seconds) is not float
@@ -619,7 +636,7 @@ def activation_feature_result_payload(
     if family == "deep_fourier" and result.config_name != "deep_fourier_off":
         gaps.append("parameterization")
     payload: dict[str, object] = {
-        "schema": RESULT_SCHEMA,
+        "schema": schema,
         "comparison_id": COMPARISON_ID,
         "arm": result.config_name,
         "source": dict(ACTIVATION_FEATURE_SOURCES[family]),
@@ -631,7 +648,7 @@ def activation_feature_result_payload(
             "n_train": result.n_train,
         },
         "seed": result.seed,
-        "development_seed_protocol": list(DEVELOPMENT_SEEDS),
+        "development_seed_protocol": list(checked_seeds),
         "config": {
             "n_tasks": config.n_tasks,
             "task_length": config.task_length,
@@ -674,7 +691,36 @@ def activation_feature_result_payload(
         "development_only": True,
         "scientific_promotion_allowed": False,
     }
-    return validate_activation_feature_result(payload)
+    return _validate_activation_feature_result(
+        payload, schema=schema, seed_protocol=checked_seeds
+    )
+
+
+def activation_feature_result_payload(
+    result: ActivationFeatureRunResult, *, outcome: str
+) -> dict[str, object]:
+    """Build the frozen result-v1 receipt without changing its seed protocol."""
+    return _activation_feature_result_payload(
+        result,
+        outcome=outcome,
+        schema=RESULT_SCHEMA,
+        seed_protocol=DEVELOPMENT_SEEDS,
+    )
+
+
+def activation_feature_campaign_result_payload(
+    result: ActivationFeatureRunResult,
+    *,
+    outcome: str,
+    development_seeds: tuple[int, ...],
+) -> dict[str, object]:
+    """Build a result-v2 receipt for an explicitly frozen campaign seed set."""
+    return _activation_feature_result_payload(
+        result,
+        outcome=outcome,
+        schema=CAMPAIGN_RESULT_SCHEMA,
+        seed_protocol=development_seeds,
+    )
 
 
 def _exact_dict(value: object, fields: frozenset[str], context: str) -> dict[str, object]:
@@ -683,10 +729,13 @@ def _exact_dict(value: object, fields: frozenset[str], context: str) -> dict[str
     return cast(dict[str, object], value)
 
 
-def validate_activation_feature_result(payload: object) -> dict[str, object]:
-    """Fail-closed bounded validator; accepts only JSON-builtin containers."""
+def _validate_activation_feature_result(
+    payload: object, *, schema: str, seed_protocol: tuple[int, ...]
+) -> dict[str, object]:
+    """Fail-closed bounded validator for one exact receipt version."""
+    checked_seeds = _validated_seed_protocol(seed_protocol)
     root = _exact_dict(payload, _TOP_FIELDS, "result")
-    if root["schema"] != RESULT_SCHEMA or root["comparison_id"] != COMPARISON_ID:
+    if root["schema"] != schema or root["comparison_id"] != COMPARISON_ID:
         raise ValueError("unsupported result identity")
     arm = root["arm"]
     spec = activation_feature_spec(arm)
@@ -696,9 +745,9 @@ def validate_activation_feature_result(payload: object) -> dict[str, object]:
         raise ValueError("all outcomes, including negative outcomes, must be retained")
     if root["paper_metric_reported"] is not False:
         raise ValueError("paper_metric_reported must remain false")
-    if type(root["seed"]) is not int or root["seed"] not in DEVELOPMENT_SEEDS:
+    if type(root["seed"]) is not int or root["seed"] not in checked_seeds:
         raise ValueError("seed must belong to the frozen development seed set")
-    if root["development_seed_protocol"] != list(DEVELOPMENT_SEEDS):
+    if root["development_seed_protocol"] != list(checked_seeds):
         raise ValueError("development_seed_protocol must match the frozen seed set")
     if type(root["outcome"]) is not str or root["outcome"] not in DEVELOPMENT_OUTCOMES:
         raise ValueError("outcome must be supported, rejected, or inconclusive")
@@ -874,11 +923,37 @@ def validate_activation_feature_result(payload: object) -> dict[str, object]:
     return root
 
 
-def validate_matched_activation_feature_results(payloads: object) -> list[dict[str, object]]:
-    """Validate one complete, same-seed matched development comparison."""
+def validate_activation_feature_result(payload: object) -> dict[str, object]:
+    """Validate the original result-v1 contract and seed set unchanged."""
+    return _validate_activation_feature_result(
+        payload, schema=RESULT_SCHEMA, seed_protocol=DEVELOPMENT_SEEDS
+    )
+
+
+def validate_activation_feature_campaign_result(
+    payload: object, *, development_seeds: tuple[int, ...]
+) -> dict[str, object]:
+    """Validate a result-v2 receipt against its externally frozen seed set."""
+    return _validate_activation_feature_result(
+        payload,
+        schema=CAMPAIGN_RESULT_SCHEMA,
+        seed_protocol=development_seeds,
+    )
+
+
+def _validate_matched_activation_feature_results(
+    payloads: object, *, schema: str, seed_protocol: tuple[int, ...]
+) -> list[dict[str, object]]:
+    """Validate one versioned complete, same-seed matched comparison."""
+    checked_seeds = _validated_seed_protocol(seed_protocol)
     if type(payloads) is not list or len(payloads) != len(ACTIVATION_FEATURE_SPECS):
         raise ValueError("matched comparison must contain every registered arm exactly once")
-    validated = [validate_activation_feature_result(payload) for payload in payloads]
+    validated = [
+        _validate_activation_feature_result(
+            payload, schema=schema, seed_protocol=checked_seeds
+        )
+        for payload in payloads
+    ]
     by_arm = {cast(str, payload["arm"]): payload for payload in validated}
     if len(by_arm) != len(validated) or set(by_arm) != set(ACTIVATION_FEATURE_SPECS):
         raise ValueError("matched comparison must contain every registered arm exactly once")
@@ -908,6 +983,24 @@ def validate_matched_activation_feature_results(payloads: object) -> list[dict[s
             if resources[field] != first_resources[field]:
                 raise ValueError(f"matched comparison differs on resource axis {field}")
     return validated
+
+
+def validate_matched_activation_feature_results(payloads: object) -> list[dict[str, object]]:
+    """Validate the original complete result-v1 comparison unchanged."""
+    return _validate_matched_activation_feature_results(
+        payloads, schema=RESULT_SCHEMA, seed_protocol=DEVELOPMENT_SEEDS
+    )
+
+
+def validate_matched_activation_feature_campaign_results(
+    payloads: object, *, development_seeds: tuple[int, ...]
+) -> list[dict[str, object]]:
+    """Validate one complete same-seed 11-arm result-v2 comparison."""
+    return _validate_matched_activation_feature_results(
+        payloads,
+        schema=CAMPAIGN_RESULT_SCHEMA,
+        seed_protocol=development_seeds,
+    )
 
 
 def _parser() -> argparse.ArgumentParser:
