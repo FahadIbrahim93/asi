@@ -1,17 +1,4 @@
-"""End-to-end coverage for :class:`ModelReplayRehearsal`.
-
-Every other ``model_replay_rehearsal`` test file only constructs and
-validates the configuration, construction, or initialization boundary; none
-of them ever call :meth:`ModelReplayRehearsal.step`. That left the runtime
-transaction -- ``_step_jit``, ``_rehearse_batch``,
-``encode_action``, and ``decode_action`` -- including both branches of the
-documented ``action_encoding`` dispatch (``"scalar_index"`` and
-``"one_hot"``), without a single execution in the suite.
-
-This test runs the real update/record/rehearsal transaction for both
-encodings and checks that the two encodings of the same action stream produce
-the same learning-relevant trajectory.
-"""
+"""Model replay transactions preserve behavior across action encodings."""
 
 from __future__ import annotations
 
