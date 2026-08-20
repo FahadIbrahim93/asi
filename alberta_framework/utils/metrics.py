@@ -35,6 +35,12 @@ _BOOLEAN_TRACE_MAX_DEPTH: int = 32
 # ``tests/test_continual_metrics.py``. Origin walked a pointer-repeat of
 # 15_000_000 host floats with no reject — hang, not leftover INT32 math.
 _BOOLEAN_TRACE_MAX_NODES: int = 1_000_000
+# Dense typed arrays do not consume the Python traversal budget, but they still
+# feed allocation-heavy metric kernels.  ``compute_running_mean`` retains up to
+# twelve float64/int64 vectors while constructing its result, so this separate
+# ceiling keeps that complete envelope below 256 MiB without conflating array
+# compatibility with recursive host-node admission.
+_NUMERIC_TRACE_MAX_VALUES: int = 2_000_000
 
 _ACTUAL_INT_TYPES = (
     int,
@@ -159,6 +165,8 @@ def _reject_boolean_numeric_trace(
 
 def _numeric_array(values: object, *, name: str) -> NDArray[np.float64]:
     _reject_boolean_numeric_trace(values, name=name)
+    if type(values) is np.ndarray and values.size > _NUMERIC_TRACE_MAX_VALUES:
+        raise ValueError(f"{name} exceeds the dense numeric value limit")
     try:
         return np.asarray(values, dtype=np.float64)
     except (OverflowError, TypeError, ValueError) as exc:
@@ -210,6 +218,8 @@ def _require_index_vector(values: object, *, name: str) -> NDArray[np.int64]:
         return np.asarray(values, dtype=np.int64)
     elif type(values) is np.ndarray:
         array = values
+        if array.size > _NUMERIC_TRACE_MAX_VALUES:
+            raise ValueError(f"{name} exceeds the dense numeric value limit")
         if array.size == 0:
             return np.asarray(array, dtype=np.int64)
         if array.dtype.kind not in "iu":

@@ -97,6 +97,15 @@ def test_dense_numeric_array_is_not_a_python_traversal_node_budget(
     np.testing.assert_array_equal(result[1:], np.ones(8, dtype=np.float64))
 
 
+def test_dense_numeric_broadcast_view_rejects_before_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(metrics, "_NUMERIC_TRACE_MAX_VALUES", 8)
+    view = np.broadcast_to(np.asarray(1.0, dtype=np.float64), (9,))
+    with pytest.raises(ValueError, match="dense numeric value limit"):
+        compute_running_mean(view, window_size=2)
+
+
 def test_numeric_trace_rejects_hostile_metaclass_without_hash_or_equality() -> None:
     class HostileMeta(type):
         calls = 0
@@ -131,6 +140,15 @@ def test_dense_index_array_is_not_a_python_traversal_node_budget(
     view = np.arange(9, dtype=np.int64)
     result = metrics._require_index_vector(view, name="indices")
     np.testing.assert_array_equal(result, view)
+
+
+def test_dense_index_broadcast_view_rejects_before_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(metrics, "_NUMERIC_TRACE_MAX_VALUES", 8)
+    view = np.broadcast_to(np.asarray(0, dtype=np.int64), (9,))
+    with pytest.raises(ValueError, match="dense numeric value limit"):
+        metrics._require_index_vector(view, name="indices")
 
 
 def test_compare_learners_shares_one_history_item_budget(
