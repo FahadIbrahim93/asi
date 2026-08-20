@@ -5,7 +5,7 @@ import json
 import tomllib
 from fractions import Fraction
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import jax.numpy as jnp
 import jax.random as jr
@@ -13,6 +13,11 @@ import numpy as np
 import pytest
 
 from alberta_framework.cli import step1_smoke_main, step2_smoke_main
+from alberta_framework.core.normalizers import (
+    EMANormalizer,
+    StreamingBatchNormalizer,
+    WelfordNormalizer,
+)
 from alberta_framework.steps import (
     Step1KernelConfig,
     Step2HybridConfig,
@@ -21,6 +26,7 @@ from alberta_framework.steps import (
     Step2StrictDigitReadoutConfig,
     Step2TemporalContextConfig,
     make_step1_learner,
+    make_step1_normalizer,
     make_step1_optimizer,
     make_step1_stream,
     make_step2_hybrid_learner,
@@ -81,6 +87,49 @@ def test_step1_kernel_all_public_optimizers_smoke(optimizer: str) -> None:
     result = run_step1_smoke(config, steps=12, final_window=3)
     assert result.finite
     assert result.metrics_shape == (12, 4)
+
+
+@pytest.mark.parametrize(
+    ("normalizer", "expected_type", "expected_field", "endpoint"),
+    [
+        ("none", None, None, None),
+        ("ema", EMANormalizer, "decay", 0.0),
+        ("ema", EMANormalizer, "decay", 1.0),
+        ("welford", WelfordNormalizer, None, None),
+        ("streaming_batch", StreamingBatchNormalizer, "momentum", 0.0),
+        ("streaming_batch", StreamingBatchNormalizer, "momentum", 1.0),
+    ],
+)
+def test_step1_kernel_all_public_normalizers_and_selected_endpoints_smoke(
+    normalizer: Literal["none", "ema", "welford", "streaming_batch"],
+    expected_type: type[Any] | None,
+    expected_field: Literal["decay", "momentum"] | None,
+    endpoint: float | None,
+) -> None:
+    """Every public normalizer and selected endpoint reaches the Step 1 loop."""
+    config = Step1KernelConfig(
+        normalizer=normalizer,
+        feature_dim=8,
+        num_relevant=3,
+        ema_decay=endpoint if normalizer == "ema" and endpoint is not None else 0.99,
+        streaming_batch_momentum=(
+            endpoint
+            if normalizer == "streaming_batch" and endpoint is not None
+            else 0.99
+        ),
+    )
+    implementation = make_step1_normalizer(config)
+    if expected_type is None:
+        assert implementation is None
+    else:
+        assert type(implementation) is expected_type
+        if expected_field is not None:
+            assert implementation is not None
+            assert implementation.to_config()[expected_field] == endpoint
+    result = run_step1_smoke(config, steps=12, final_window=3)
+    assert result.finite
+    expected_columns = 3 if config.normalizer == "none" else 4
+    assert result.metrics_shape == (12, expected_columns)
 
 
 def test_step1_kernel_rejects_unpublished_auto_alias() -> None:
