@@ -41,7 +41,7 @@ def test_plan_is_prospective_and_public_execution_is_hard_disabled(
     assert plan["reservation_precedes_execution_and_publication"] is True
     assert plan["pre_dispatch_failure_receipts_retained"] is False
     assert plan["post_dispatch_failure_tombstone_retained"] is True
-    assert plan["post_start_retry_prevention"] is True
+    assert plan["post_dispatch_retry_prevention"] is True
     monkeypatch.setattr(runner, "_REVIEWED_EXECUTION_TRANSITION", True)
     monkeypatch.setattr(runner, "_EXECUTION_AUTHORIZED", True)
     assert runner.frozen_plan() == plan

@@ -57,7 +57,7 @@ _POLICY: Final = {
     "reservation_precedes_execution_and_publication": True,
     "pre_dispatch_failure_receipts_retained": False,
     "post_dispatch_failure_tombstone_retained": True,
-    "post_start_retry_prevention": True,
+    "post_dispatch_retry_prevention": True,
 }
 _MAX_STEPS: Final = 2_000_000
 _MAX_PERSISTENT_BYTES: Final = 256 * 1024 * 1024
@@ -128,7 +128,7 @@ def frozen_plan() -> dict[str, object]:
         "reservation_precedes_execution_and_publication": True,
         "pre_dispatch_failure_receipts_retained": False,
         "post_dispatch_failure_tombstone_retained": True,
-        "post_start_retry_prevention": True,
+        "post_dispatch_retry_prevention": True,
         "output_path": "outputs/bounded_elastic_matched_development/report.v1.json",
     }
 
