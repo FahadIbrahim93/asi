@@ -181,3 +181,22 @@ def test_coom_receipt_validator_rejects_hostile_provider_payloads(
     hostile["resource_receipt"]["environment_steps"] = True
     with pytest.raises(ValueError, match="resource receipt"):
         smoke._validate_receipt(hostile)
+
+
+def test_coom_retained_receipt_loader_is_bounded_and_fail_closed(tmp_path: Path) -> None:
+    smoke = _smoke_module()
+    receipt = tmp_path / "receipt.json"
+    receipt.write_text('{"schema":"first","schema":"second"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate"):
+        smoke._load_receipt(receipt)
+
+    receipt.write_text("NaN", encoding="utf-8")
+    with pytest.raises(ValueError, match="non-finite"):
+        smoke._load_receipt(receipt)
+
+    target = tmp_path / "target.json"
+    target.write_text("{}", encoding="utf-8")
+    receipt.unlink()
+    receipt.symlink_to(target)
+    with pytest.raises(ValueError, match="regular file"):
+        smoke._load_receipt(receipt)

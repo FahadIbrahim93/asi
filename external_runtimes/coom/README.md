@@ -27,6 +27,14 @@ docker run --rm asi-coom-qualification:development > receipt.json
 docker run --rm asi-coom-qualification:development > receipt.second.json
 ```
 
+Validate a retained receipt against the same image-bound schema and input
+manifest without starting COOM:
+
+```bash
+docker run --rm --volume "$PWD/receipt.json:/receipt.json:ro" \
+  asi-coom-qualification:development --validate-receipt /receipt.json
+```
+
 Compare `trace_sha256`, not the telemetry-only elapsed time or platform string.
 The smoke consumes seed 1582000, all eight official CO8 tasks, and two action-0
 steps per task. A matching trace is a deterministic runtime qualification check,

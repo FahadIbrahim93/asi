@@ -7,6 +7,7 @@ runtime qualification receipt, not a performance result.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import importlib.metadata
 import json
@@ -16,7 +17,9 @@ import platform
 import stat
 import sys
 import time
+from collections.abc import Sequence
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 
@@ -45,6 +48,7 @@ SEED = 1_582_000
 STEPS_PER_TASK = 2
 _QUALIFICATION_ROOT = Path("/opt/qualification")
 _MAX_MANIFEST_BYTES = 8192
+_MAX_RECEIPT_BYTES = 1024 * 1024
 
 
 def _array_sha256(value: np.ndarray) -> str:
@@ -187,9 +191,43 @@ def _load_qualification_manifest() -> dict[str, object]:
     return manifest
 
 
+def _load_receipt(path: Path) -> dict[str, object]:
+    """Load one bounded canonical receipt for strict offline validation."""
+    metadata = path.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+        raise ValueError("receipt must be a uniquely linked regular file")
+    if metadata.st_size > _MAX_RECEIPT_BYTES:
+        raise ValueError("receipt exceeds its byte limit")
+    raw = path.read_bytes()
+    if len(raw) != metadata.st_size:
+        raise ValueError("receipt changed while it was being read")
+
+    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in items:
+            if type(key) is not str or key in result:
+                raise ValueError("receipt contains duplicate or non-string keys")
+            result[key] = value
+        return result
+
+    value = json.loads(
+        raw,
+        object_pairs_hook=pairs,
+        parse_constant=lambda token: (_ for _ in ()).throw(
+            ValueError(f"non-finite JSON token {token}")
+        ),
+    )
+    if type(value) is not dict:
+        raise ValueError("receipt root must be an exact object")
+    return value
+
+
 def _trace() -> tuple[list[dict[str, object]], int]:
-    from COOM.env.builder import build_multi_discrete_actions, make_sequence
-    from COOM.utils.config import Sequence
+    from COOM.env.builder import (  # type: ignore[import-not-found]
+        build_multi_discrete_actions,
+        make_sequence,
+    )
+    from COOM.utils.config import Sequence  # type: ignore[import-not-found]
 
     start = time.perf_counter_ns()
     records: list[dict[str, object]] = []
@@ -405,7 +443,7 @@ def _validate_receipt(receipt: object) -> None:
                 or step["observation_dtype"] != "<f8"
                 or step["observation_shape"] != [84, 84, 3]
                 or type(step["reward"]) not in (int, float)
-                or not math.isfinite(float(step["reward"]))
+                or not math.isfinite(float(cast(int | float, step["reward"])))
                 or type(step["terminated"]) is not bool
                 or type(step["truncated"]) is not bool
             ):
@@ -472,7 +510,18 @@ def _validate_receipt(receipt: object) -> None:
         raise ValueError("receipt claims exceed the bounded unattested qualification")
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--validate-receipt",
+        type=Path,
+        help="strictly validate a retained receipt without executing COOM",
+    )
+    arguments = parser.parse_args(argv)
+    if arguments.validate_receipt is not None:
+        _validate_receipt(_load_receipt(arguments.validate_receipt))
+        return
+
     qualification_inputs = _load_qualification_manifest()
     root = Path("/opt/coom")
     if _source_tree_sha1(root) != SOURCE_TREE:
