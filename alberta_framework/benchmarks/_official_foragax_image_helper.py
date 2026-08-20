@@ -41,6 +41,9 @@ SOURCE_ROOT = Path("/opt/continual-foragax-agents")
 RUNTIME_ROOT = Path("/opt/alberta-runtime")
 ATTESTATION_ROOT = Path("/opt/alberta-attestations")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_MAX_RUNTIME_PROBE_BYTES = 8 * 1024 * 1024
+_MAX_RUNTIME_PACKAGES = 4096
+_MAX_DIRECT_URL_BYTES = 64 * 1024
 
 
 def _require_exact_str(name: object, value: object) -> str:
@@ -83,6 +86,18 @@ def _sha256(path: Path) -> str:
 def _strict_json_text(value: str | bytes, *, label: str) -> dict[str, Any]:
     """Decode one strict JSON object from a trusted bounded producer."""
 
+    if type(value) is str:
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            raise ImageHelperError(f"{label} is not UTF-8 JSON") from exc
+    elif type(value) is bytes:
+        encoded = value
+    else:
+        raise ImageHelperError(f"{label} must be exact text or bytes")
+    if len(encoded) > _MAX_RUNTIME_PROBE_BYTES:
+        raise ImageHelperError(f"{label} exceeds the JSON byte limit")
+
     def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in items:
@@ -101,14 +116,14 @@ def _strict_json_text(value: str | bytes, *, label: str) -> dict[str, Any]:
 
     try:
         parsed = json.loads(
-            value,
+            encoded,
             object_pairs_hook=pairs,
             parse_constant=lambda value: (_ for _ in ()).throw(
                 ImageHelperError(f"{label} contains JSON constant")
             ),
             parse_float=parse_float,
         )
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise ImageHelperError(f"{label} is not strict JSON") from exc
     if type(parsed) is not dict:
         raise ImageHelperError(f"{label} must contain a JSON object")
@@ -513,15 +528,20 @@ import hashlib, importlib.metadata, json, os, re, stat, sys
 from pathlib import Path
 root = Path(sys.prefix).resolve()
 packages = []
+package_bytes = 0
 for distribution in importlib.metadata.distributions():
+    if len(packages) >= {_MAX_RUNTIME_PACKAGES}:
+        raise RuntimeError("runtime package count exceeds the qualification limit")
     name = distribution.metadata.get("Name")
     if not name:
         continue
     direct_url = distribution.read_text("direct_url.json")
+    if direct_url is not None and len(direct_url.encode("utf-8")) > {_MAX_DIRECT_URL_BYTES}:
+        raise RuntimeError(f"distribution {{name}} direct_url metadata is oversized")
     if direct_url and ("file:" in direct_url or "/input/" in direct_url or "/build/" in direct_url):
         raise RuntimeError(f"distribution {name} exposes a build path")
     record = distribution.read_text("RECORD")
-    packages.append({
+    package = {
         "SPDXID": "SPDXRef-Package-" + re.sub(r"[^A-Za-z0-9.-]", "-", name),
         "checksums": [] if record is None else [{
             "algorithm": "SHA256",
@@ -532,7 +552,11 @@ for distribution in importlib.metadata.distributions():
         "licenseConcluded": "NOASSERTION",
         "name": name,
         "versionInfo": distribution.version,
-    })
+    }
+    package_bytes += len(json.dumps(package, allow_nan=False, separators=(",", ":")).encode())
+    if package_bytes > {_MAX_RUNTIME_PROBE_BYTES}:
+        raise RuntimeError("runtime package metadata exceeds the qualification byte limit")
+    packages.append(package)
 packages.sort(key=lambda item: (item["name"].casefold(), item["versionInfo"]))
 if any(
     re.sub(r"[-_.]+", "-", item["name"]).casefold()

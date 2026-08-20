@@ -28,6 +28,21 @@ def test_image_runtime_probe_rejects_duplicate_keys(
         image_helper._runtime_probe(Path("/trusted/python"))
 
 
+def test_image_runtime_probe_rejects_oversized_and_deep_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(image_helper, "_MAX_RUNTIME_PROBE_BYTES", 32)
+    with pytest.raises(image_helper.ImageHelperError, match="byte limit"):
+        image_helper._strict_json_text(b'{"padding":"' + b"x" * 32 + b'"}', label="probe")
+
+    monkeypatch.setattr(image_helper, "_MAX_RUNTIME_PROBE_BYTES", 65536)
+    with pytest.raises(image_helper.ImageHelperError, match="not strict JSON"):
+        image_helper._strict_json_text(
+            '{"a":' * 10000 + "0" + "}" * 10000,
+            label="probe",
+        )
+
+
 def test_package_freeze_direct_url_rejects_duplicate_keys() -> None:
     with pytest.raises(
         official_foragax.OfficialForagaxValidationError,
@@ -35,6 +50,19 @@ def test_package_freeze_direct_url_rejects_duplicate_keys() -> None:
     ):
         official_foragax._sanitize_package_freeze_line(
             'pkg==1.0 ; direct_url={"url":"https://first","url":"https://second"}'
+        )
+
+
+def test_package_freeze_direct_url_is_byte_bounded_before_parse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(official_foragax, "OFFICIAL_FORAGAX_MAX_DIRECT_URL_BYTES", 24)
+    with pytest.raises(
+        official_foragax.OfficialForagaxValidationError,
+        match="byte limit",
+    ):
+        official_foragax._sanitize_package_freeze_line(
+            'pkg==1.0 ; direct_url={"url":"too-long"}'
         )
 
 
@@ -48,6 +76,10 @@ def test_generated_distribution_probe_uses_strict_direct_url_decoder() -> None:
         loads('{"url":"https://first","url":"https://second"}')
     with pytest.raises(ValueError, match="non-finite"):
         loads('{"weight":1e999}')
+    with pytest.raises(ValueError, match="byte limit"):
+        loads('{"url":"' + "x" * 65536 + '"}')
+    with pytest.raises(ValueError, match="deeply nested"):
+        loads('{"a":' * 10000 + "0" + "}" * 10000)
 
 
 def test_runtime_probe_embeds_and_calls_the_strict_direct_url_decoder(
@@ -72,3 +104,27 @@ def test_runtime_probe_embeds_and_calls_the_strict_direct_url_decoder(
 
     assert official_foragax._STRICT_DIRECT_URL_HELPER_SOURCE in captured["script"]
     assert "direct_url = _strict_direct_url_loads(direct_url_text)" in captured["script"]
+
+
+def test_package_freeze_bounds_count_before_sanitizing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = official_foragax._PROBE_PREFIX.encode() + json.dumps(
+        {"packages": ["a==1", "b==1"]}
+    ).encode()
+    monkeypatch.setattr(
+        official_foragax,
+        "_run_execution_python",
+        lambda **kwargs: subprocess.CompletedProcess(("python",), 0, payload, b""),
+    )
+    monkeypatch.setattr(official_foragax, "OFFICIAL_FORAGAX_MAX_PACKAGE_COUNT", 1)
+
+    with pytest.raises(
+        official_foragax.OfficialForagaxValidationError,
+        match="too many packages",
+    ):
+        official_foragax._package_freeze(
+            repository=Path("/trusted/repository"),
+            interpreter=Path("/trusted/python"),
+            environment={},
+        )

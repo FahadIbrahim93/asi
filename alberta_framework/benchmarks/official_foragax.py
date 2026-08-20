@@ -97,6 +97,10 @@ OFFICIAL_FORAGAX_ENDORSEMENT_DESCRIPTOR_SHA256 = (
     "2620a972dc5a253deaf06cfe9b9a103fd4367d24432817772284dd73eb6843bf"
 )
 OFFICIAL_FORAGAX_MAX_SEED = (1 << 32) - 1
+OFFICIAL_FORAGAX_MAX_PROBE_BYTES = 8 * 1024 * 1024
+OFFICIAL_FORAGAX_MAX_DIRECT_URL_BYTES = 64 * 1024
+OFFICIAL_FORAGAX_MAX_PACKAGE_COUNT = 4096
+OFFICIAL_FORAGAX_MAX_PACKAGE_FREEZE_BYTES = 4 * 1024 * 1024
 OFFICIAL_FORAGAX_OCI_LAUNCHER_CONTRACT = "oci-read-only-stdout-tar-v4"
 OFFICIAL_FORAGAX_MATCHED_RUNTIME_CLASS = (
     "matched_current_foragax_0_55_cuda12"
@@ -1359,7 +1363,7 @@ def _strict_json_loads(
         )
     except OfficialForagaxValidationError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
         raise OfficialForagaxValidationError(f"{label} is not strict JSON") from exc
 
 
@@ -3688,6 +3692,20 @@ def _validate_oci_scientific_package_inventory(
 
 
 def _sanitize_package_freeze_line(line: str) -> str:
+    if type(line) is not str:
+        raise OfficialForagaxValidationError(
+            "package freeze line must be an exact string"
+        )
+    try:
+        encoded_line = line.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise OfficialForagaxValidationError(
+            "package freeze line is not UTF-8"
+        ) from exc
+    if len(encoded_line) > OFFICIAL_FORAGAX_MAX_DIRECT_URL_BYTES:
+        raise OfficialForagaxValidationError(
+            "package freeze line exceeds the byte limit"
+        )
     prefix, separator, direct_url_text = line.partition(" ; direct_url=")
     if not separator:
         return line
@@ -3725,6 +3743,14 @@ def _sanitize_package_freeze_line(line: str) -> str:
 
 
 def _extract_probe_payload(stdout: bytes) -> Mapping[str, Any]:
+    if type(stdout) is not bytes:
+        raise OfficialForagaxValidationError(
+            "official execution probe output must be exact bytes"
+        )
+    if len(stdout) > OFFICIAL_FORAGAX_MAX_PROBE_BYTES:
+        raise OfficialForagaxValidationError(
+            "official execution probe output exceeds the byte limit"
+        )
     for line in reversed(stdout.decode(errors="replace").splitlines()):
         if line.startswith(_PROBE_PREFIX):
             payload = _strict_json_loads(
@@ -4096,6 +4122,8 @@ sys.stdout.write({_PROBE_PREFIX!r} + json.dumps(payload, sort_keys=True, allow_n
 
 
 _STRICT_DIRECT_URL_HELPER_SOURCE = r'''\
+_MAX_DIRECT_URL_BYTES = 65536
+
 class _DuplicateDirectUrlKey(ValueError):
     pass
 
@@ -4114,14 +4142,25 @@ def _direct_url_float(value):
     return parsed
 
 def _strict_direct_url_loads(value):
-    return json.loads(
-        value,
-        object_pairs_hook=_direct_url_pairs,
-        parse_constant=lambda token: (_ for _ in ()).throw(
-            ValueError("direct_url.json contains a non-finite constant")
-        ),
-        parse_float=_direct_url_float,
-    )
+    if type(value) is not str:
+        raise ValueError("direct_url.json must be exact text")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("direct_url.json is not UTF-8") from exc
+    if len(encoded) > _MAX_DIRECT_URL_BYTES:
+        raise ValueError("direct_url.json exceeds the byte limit")
+    try:
+        return json.loads(
+            encoded,
+            object_pairs_hook=_direct_url_pairs,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError("direct_url.json contains a non-finite constant")
+            ),
+            parse_float=_direct_url_float,
+        )
+    except RecursionError as exc:
+        raise ValueError("direct_url.json is too deeply nested") from exc
 '''
 
 
@@ -4311,7 +4350,7 @@ if direct_url_text:
     try:
         direct_url = _strict_direct_url_loads(direct_url_text)
     except json.JSONDecodeError:
-        direct_url = {{"unparsed": direct_url_text.strip()}}
+        direct_url = {{"unparsed": "<REDACTED>"}}
 
 spec = importlib.util.find_spec("foragax")
 locations = spec.submodule_search_locations if spec is not None else None
@@ -5305,25 +5344,34 @@ def _package_freeze(
 ) -> tuple[str, ...]:
     script = f"""
 import json
+import math
 import sys
 from importlib.metadata import distributions
 
+{_STRICT_DIRECT_URL_HELPER_SOURCE}
+
 packages = []
+package_bytes = 0
 for distribution in distributions():
+    if len(packages) >= {OFFICIAL_FORAGAX_MAX_PACKAGE_COUNT}:
+        raise RuntimeError("package count exceeds the qualification limit")
     name = distribution.metadata.get("Name") or "UNKNOWN"
     line = f"{{name}}=={{distribution.version}}"
     direct_url = distribution.read_text("direct_url.json")
     if direct_url:
         try:
             direct_url = json.dumps(
-                json.loads(direct_url),
+                _strict_direct_url_loads(direct_url),
                 sort_keys=True,
                 separators=(",", ":"),
                 allow_nan=False,
             )
-        except (json.JSONDecodeError, TypeError, ValueError):
-            direct_url = direct_url.strip()
+        except json.JSONDecodeError:
+            direct_url = "<REDACTED>"
         line += f" ; direct_url={{direct_url}}"
+    package_bytes += len(line.encode("utf-8"))
+    if package_bytes > {OFFICIAL_FORAGAX_MAX_PACKAGE_FREEZE_BYTES}:
+        raise RuntimeError("package freeze exceeds the qualification byte limit")
     packages.append(line)
 sys.stdout.write(
     {_PROBE_PREFIX!r}
@@ -5346,6 +5394,20 @@ sys.stdout.write(
     ):
         raise OfficialForagaxValidationError(
             "supplied interpreter returned an invalid package freeze"
+        )
+    if len(packages) > OFFICIAL_FORAGAX_MAX_PACKAGE_COUNT:
+        raise OfficialForagaxValidationError(
+            "supplied interpreter returned too many packages"
+        )
+    try:
+        package_bytes = sum(len(item.encode("utf-8")) for item in packages)
+    except UnicodeEncodeError as exc:
+        raise OfficialForagaxValidationError(
+            "supplied interpreter returned non-UTF-8 package metadata"
+        ) from exc
+    if package_bytes > OFFICIAL_FORAGAX_MAX_PACKAGE_FREEZE_BYTES:
+        raise OfficialForagaxValidationError(
+            "supplied interpreter package metadata exceeds the byte limit"
         )
     return tuple(sorted(_sanitize_package_freeze_line(line) for line in packages))
 
