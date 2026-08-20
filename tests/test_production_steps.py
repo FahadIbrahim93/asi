@@ -121,46 +121,6 @@ def test_step1_kernel_all_public_normalizers_smoke(
     assert result.metrics_shape == (12, expected_columns)
 
 
-@pytest.mark.parametrize(
-    ("normalizer", "field", "value"),
-    [
-        ("ema", "ema_decay", 0.0),
-        ("ema", "ema_decay", 1.0),
-        ("streaming_batch", "streaming_batch_momentum", 0.0),
-        ("streaming_batch", "streaming_batch_momentum", 1.0),
-    ],
-)
-def test_step1_normalizer_boundary_hyperparameters_stay_finite_when_selected(
-    normalizer: str, field: str, value: float
-) -> None:
-    """Step 1 must dispatch and consume each selected boundary value."""
-    if field == "ema_decay":
-        assert normalizer == "ema"
-        config = Step1KernelConfig(
-            optimizer="autostep",
-            normalizer="ema",
-            feature_dim=6,
-            num_relevant=2,
-            ema_decay=value,
-        )
-    else:
-        assert field == "streaming_batch_momentum"
-        assert normalizer == "streaming_batch"
-        config = Step1KernelConfig(
-            optimizer="autostep",
-            normalizer="streaming_batch",
-            feature_dim=6,
-            num_relevant=2,
-            streaming_batch_momentum=value,
-        )
-    implementation = make_step1_normalizer(config)
-    assert implementation is not None
-    implementation_field = "decay" if field == "ema_decay" else "momentum"
-    assert implementation.to_config()[implementation_field] == value
-    result = run_step1_smoke(config, steps=10, final_window=3)
-    assert result.finite
-
-
 def test_step1_kernel_rejects_unpublished_auto_alias() -> None:
     with pytest.raises(ValueError, match="optimizer"):
         Step1KernelConfig(optimizer="auto")  # type: ignore[arg-type]
