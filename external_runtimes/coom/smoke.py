@@ -123,7 +123,9 @@ def _runtime_identity() -> dict[str, object]:
         raise ValueError("COOM qualification requires no capabilities and NoNewPrivs")
 
     distributions: list[tuple[str, str]] = []
-    for distribution in importlib.metadata.distributions():
+    for index, distribution in enumerate(importlib.metadata.distributions()):
+        if index >= len(EXPECTED_DISTRIBUTIONS):
+            raise ValueError("installed distributions exceed the exact runtime roster")
         name = distribution.metadata["Name"]
         version = distribution.version
         distributions.append(

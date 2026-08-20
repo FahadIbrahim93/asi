@@ -470,6 +470,44 @@ def test_runtime_identity_requires_nonroot_sandbox_and_complete_distribution_ros
         smoke._runtime_identity()
 
 
+def test_runtime_identity_rejects_twelfth_distribution_before_metadata_or_thirteenth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _smoke_module()
+    monkeypatch.setattr(smoke.os, "getuid", lambda: 65532)
+    monkeypatch.setattr(smoke.os, "getgid", lambda: 65532)
+    monkeypatch.setattr(
+        smoke.Path,
+        "read_bytes",
+        lambda _self: b"CapEff:\t0000000000000000\nNoNewPrivs:\t1\n",
+    )
+
+    class TwelfthDistribution:
+        metadata_reads = 0
+
+        @property
+        def metadata(self) -> object:
+            type(self).metadata_reads += 1
+            raise AssertionError("twelfth distribution metadata was traversed")
+
+    yielded = 0
+
+    def distributions() -> object:
+        nonlocal yielded
+        for name, version in smoke.EXPECTED_DISTRIBUTIONS:
+            yielded += 1
+            yield SimpleNamespace(metadata={"Name": name}, version=version)
+        yielded += 1
+        yield TwelfthDistribution()
+        raise AssertionError("thirteenth distribution was requested")
+
+    monkeypatch.setattr(smoke.importlib.metadata, "distributions", distributions)
+    with pytest.raises(ValueError, match="installed distributions"):
+        smoke._runtime_identity()
+    assert yielded == len(smoke.EXPECTED_DISTRIBUTIONS) + 1
+    assert TwelfthDistribution.metadata_reads == 0
+
+
 def test_output_path_rejects_subclass_before_filesystem_hook(tmp_path: Path) -> None:
     smoke = _smoke_module()
 
