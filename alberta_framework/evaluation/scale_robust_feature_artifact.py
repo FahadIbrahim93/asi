@@ -1599,14 +1599,14 @@ def load_evidence_artifact(path: Path) -> dict[str, object]:
 
 
 def _finite_number(value: object) -> float | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if type(value) is bool or (type(value) is not int and type(value) is not float):
         return None
     numeric = float(value)
     return numeric if math.isfinite(numeric) else None
 
 
 def _strict_int(value: object) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, int):
+    if type(value) is bool or type(value) is not int:
         return None
     return value
 
@@ -2105,7 +2105,7 @@ def _validate_operational_metadata(
                 errors.append("operational_metadata.generated_at_utc must include timezone")
     git_head = operational.get("git_head")
     if (
-        not isinstance(git_head, str)
+        type(git_head) is not str
         or len(git_head) != 40
         or any(character not in "0123456789abcdef" for character in git_head)
     ):
@@ -2304,7 +2304,7 @@ def validate_evidence_artifact(
             errors.append("content_digest.canonicalization is unsupported")
         recorded = digest.get("sha256")
         if (
-            not isinstance(recorded, str)
+            type(recorded) is not str
             or len(recorded) != 64
             or any(character not in "0123456789abcdef" for character in recorded)
         ):

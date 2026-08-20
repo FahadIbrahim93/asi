@@ -26,7 +26,7 @@ via Disagreement."
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from numbers import Integral
 from typing import Any, cast
 
@@ -36,6 +36,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._scan_resources import ScanBudget, require_scan_steps
 from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core.world_model import (
     OneStepWorldModel,
@@ -50,6 +51,8 @@ from alberta_framework.steps._float32_validation import (
     finite_real_and_float32,
 )
 from alberta_framework.steps._smoke_record_validation import require_step_shape
+
+_STEP8_SMOKE_BUDGET = ScanBudget("Step 8 smoke", maximum_steps=10_000)
 
 
 @dataclass(frozen=True)
@@ -88,10 +91,18 @@ class Step8WorldModelConfig:
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> Step8WorldModelConfig:
         """Reconstruct from :meth:`to_dict` output."""
-        data = dict(payload)
-        hidden_sizes = data.get("hidden_sizes", (64,))
-        if isinstance(hidden_sizes, list):
-            data["hidden_sizes"] = tuple(hidden_sizes)
+        if type(payload) is not dict:
+            raise ValueError("Step8WorldModelConfig payload must be an exact dictionary")
+        raw = cast(dict[object, object], payload)
+        if any(type(key) is not str for key in raw):
+            raise ValueError("Step8WorldModelConfig payload keys must be exact strings")
+        expected = {field.name for field in fields(cls)}
+        if set(raw) != expected:
+            raise ValueError("Step8WorldModelConfig payload fields do not match the schema")
+        if type(raw["hidden_sizes"]) is not list:
+            raise ValueError("hidden_sizes must be an exact list")
+        data = dict(raw)
+        data["hidden_sizes"] = tuple(cast(list[object], data["hidden_sizes"]))
         return cls(**cast(Any, data))
 
     def to_core_config(self) -> WorldModelConfig:
@@ -461,7 +472,7 @@ def run_step8_smoke(
     seed: int = 0,
 ) -> Step8SmokeResult:
     """Run a tiny deterministic Step 8 environment-prediction probe."""
-    steps = _require_int("steps", steps, minimum=1, maximum=_INT32_MAX)
+    steps = require_scan_steps("steps", steps, _STEP8_SMOKE_BUDGET)
 
     cfg = config or Step8WorldModelConfig()
     if cfg.n_actions is None:

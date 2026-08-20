@@ -492,13 +492,13 @@ def test_open_campaign_v2_golden_byte_contract(
             "6a9315cb996fe5698e4c1580d30da9b0524e9875ce085d1399bb975cc5b510a8"
         ),
         "execution-plan.json": (
-            "3a7f51da14a269d2a7b722f982e85f44ef74ea372bc29872b08c88d1dcbe6eb4"
+            "4b7cd24b9554d6fb712d222569963d0dd7b1e736093958c695e05bf77a1c9e93"
         ),
         "source-manifest.json": (
             "9aa2a792a6e48438ed91d3ac180e87348ce3f4781fd6a87a987634593b604f23"
         ),
         "executor-manifest.json": (
-            "bd0068f2c053ffbc4c298b36ee73c1b0ccb3fdb2308b3282bd385d9b80dcb326"
+            "32bf2154d8e766dbec7ea8d7fa24e98b71f6e621d595a20fce5553229de404c2"
         ),
         "qualification-manifest.json": (
             "0ac448b2686c7f7da8cc3f2a489bc764f76e215193de67cd62308ac21d83d24a"
@@ -507,10 +507,10 @@ def test_open_campaign_v2_golden_byte_contract(
             "06cbe35d345bc3e4fdc79d7628a181a0ac126f929e0c0b70c2b25d9ef250d7d5"
         ),
         "live-runtime.json": (
-            "439968e03e99a563f32066e6787083ca633fc8f92b31e97deff5b94403b6215b"
+            "804fadde152cbe7e8cd4a7fe4709865745530f22a0d59a3f7c569498edf2f16f"
         ),
         "campaign.json": (
-            "4cbad0fbc079d8b24859ccbafc04eeb5f69127157e3b5bc7677d432248f5e858"
+            "039533db53869cbae4e78f73c892d6b16296f035babf417ac4e4adfb4354456d"
         ),
     }
     assert frozen_schedule["schedule_sha256"] == (
@@ -530,7 +530,7 @@ def test_open_campaign_v2_golden_byte_contract(
         attempt,
     )
     assert binding_sha256 == (
-        "a2a424e3b5d6f0b8e35dc7f770c4fa484bc338f709741ff25fec94513b7ea85e"
+        "0a3f7c0fbbc317d3b470a0b47d6abccf202e9a92e633a4f6415eb53c74519157"
     )
     artifact = executor.score_seed_archive(
         context.rebuilt.plan,
@@ -551,7 +551,7 @@ def test_open_campaign_v2_golden_byte_contract(
         artifact.to_dict(),
     )
     assert bundle_sha256 == (
-        "a52bcab0809dddc3c8d52e462868ee771cfcfb7790b7a2463ab95fab85f3749b"
+        "a018a85a1847d86dafb06dd277245c2bd1200ba7028ad3957428b8c1968dd76d"
     )
     pointer = campaign._completion_pointer(
         context,
@@ -562,7 +562,7 @@ def test_open_campaign_v2_golden_byte_contract(
         bundle_sha256,
     )
     assert digest(campaign.canonical_json_bytes(pointer)) == (
-        "be9dec9f11a2272ffd87e0aa8b0de96dbce64a0ddfcfcbdd8ee8bdf5b0f54c6a"
+        "502af75684f3d66932af124e79bd8453bd4a2169ffe3dd40025d68d387148050"
     )
     campaign._persist_failure(
         attempt,
@@ -580,16 +580,16 @@ def test_open_campaign_v2_golden_byte_contract(
     _complete_loader_context(completed_context)
     expected_final = {
         "execution-receipt-index.json": (
-            "8aab743e5a6fbc70bdb736f0b4e5283e340a055b7a010676f3cb69acfa4fae5e"
+            "e02b08050a432986620ae8f7f5c3bc24d078b1182b27dbd48a7e027630b91f54"
         ),
         "score-evidence.json": (
-            "bf0ad65eedf80744c6a9b2c3b7ad1d6e144fa76d0ce5c2d1efb9dc1f602d815b"
+            "f9f0c525a66e71376c85e626042c6d91cbff84e679f5bcae69ffe6e04f8a0719"
         ),
         "verification-request.json": (
-            "f878093a9ae49daec11c7b15ea311f12867dda8c293379231b8fdcaee3db85ca"
+            "52d3c2c1963f9589b1420ddeeffbbec2929ed93906c8d7633d1282417b44d95c"
         ),
         "completion-summary.json": (
-            "747cbd3222bab0800d7d5398adf16ca239f07384d8e51a31d20cc98bf48c09e9"
+            "fdd74f093b3981e2727beb9adcb627b94c1c6faf9c2c0a39d813dcdce32d89c5"
         ),
     }
     for name, expected_digest in expected_final.items():
@@ -604,7 +604,7 @@ def test_open_campaign_v2_golden_byte_contract(
     )
     normalized_status = replace(status, output_root=Path("/golden/open-campaign"))
     assert digest(campaign.canonical_json_bytes(normalized_status.to_dict())) == (
-        "279d14a0a524029c39ad619c19b0b04f6dee35a5c7c0898e489fcfc8b1b24b1d"
+        "312f50b322893d741bb9ed7ade589ba52aa5ebe8432a858d8da579fbfe8b89e8"
     )
 
 

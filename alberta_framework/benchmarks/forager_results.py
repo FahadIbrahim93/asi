@@ -264,6 +264,8 @@ def _sqlite_value_matches(actual: Any, expected: Any) -> bool:
 
 
 def _legacy_fov_display_agent(config_agent: str) -> str:
+    if type(config_agent) is not str:
+        raise ValueError("config_agent must be an exact string")
     if config_agent.startswith("DQN-"):
         return "DQN"
     if config_agent == "Greedy":
@@ -274,6 +276,8 @@ def _legacy_fov_display_agent(config_agent: str) -> str:
 
 
 def _legacy_fov_config_aperture(config_agent: str) -> int:
+    if type(config_agent) is not str:
+        raise ValueError("config_agent must be an exact string")
     if config_agent.startswith("DQN-"):
         return int(config_agent.removeprefix("DQN-"))
     if config_agent in {"Greedy", "Greedy-122"}:

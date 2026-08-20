@@ -170,7 +170,7 @@ def test_float_subclass_with_lying_ratio_is_rejected() -> None:
 
 
 def test_step8_smoke_zero_steps_raises() -> None:
-    with pytest.raises(ValueError, match="steps must be positive"):
+    with pytest.raises(ValueError, match="steps must be an integer in"):
         run_step8_smoke(steps=0)
 
 
@@ -211,7 +211,7 @@ def test_step8_smoke_rejects_oversized_steps_before_allocation(
         raise AssertionError(f"jr.normal must not run: {args} {kwargs}")
 
     monkeypatch.setattr("alberta_framework.steps.step8.jr.normal", _spy)
-    with pytest.raises(ValueError, match="steps must be at most int32 max"):
+    with pytest.raises(ValueError, match="Step 8 smoke budget"):
         run_step8_smoke(steps=2**31)
 
 
@@ -222,20 +222,32 @@ def test_step8_smoke_rejects_trillion_steps_before_allocation(
         raise AssertionError(f"jr.normal must not run: {args} {kwargs}")
 
     monkeypatch.setattr("alberta_framework.steps.step8.jr.normal", _spy)
-    with pytest.raises(ValueError, match="steps must be at most int32 max"):
+    with pytest.raises(ValueError, match="Step 8 smoke budget"):
         run_step8_smoke(steps=10**12)
 
 
-def test_step8_smoke_accepts_int32_max_steps_boundary(
+def test_step8_smoke_accepts_declared_last_fit_boundary(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The documented boundary (int32 max) must still pass the gate itself;
-    only the value fed forward is checked here, not a real huge allocation.
-    """
+    """The declared 10,000-step last fit reaches allocation, but larger inputs do not."""
 
     def _spy(*args: object, **kwargs: object) -> Any:
         raise AssertionError(f"jr.normal must not run: {args} {kwargs}")
 
     monkeypatch.setattr("alberta_framework.steps.step8.jr.normal", _spy)
     with pytest.raises(AssertionError, match="jr.normal must not run"):
-        run_step8_smoke(steps=2**31 - 1)
+        run_step8_smoke(steps=10_000)
+
+
+def test_from_dict_rejects_hostile_mapping_and_keys() -> None:
+    class _HostileDict(dict[str, object]):
+        pass
+
+    with pytest.raises(ValueError, match="must be an exact dictionary"):
+        Step8WorldModelConfig.from_dict(_HostileDict())
+
+    payload = Step8WorldModelConfig().to_dict()
+    bad_keys: dict[Any, Any] = dict(payload)
+    bad_keys[_EvilStr("extra")] = 1
+    with pytest.raises(ValueError, match="keys must be exact strings"):
+        Step8WorldModelConfig.from_dict(cast(Any, bad_keys))
