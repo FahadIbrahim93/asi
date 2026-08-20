@@ -888,3 +888,62 @@ class TestCollectTrajectoryValueMode:
         )
 
         assert jnp.allclose(plain, with_estimator)
+
+
+class _TwoStepEpisodeEnv:
+    """Deterministic reset boundary for trajectory-target tests."""
+
+    observation_space = gymnasium.spaces.Box(
+        low=-1_000.0,
+        high=1_000.0,
+        shape=(2,),
+        dtype=np.float32,
+    )
+    action_space = gymnasium.spaces.Discrete(2)
+
+    def __init__(self) -> None:
+        self._episode = -1
+        self._step = 0
+
+    def reset(self, *, seed: int | None = None) -> tuple[np.ndarray, dict[str, object]]:
+        del seed
+        self._episode += 1
+        self._step = 0
+        value = float(100 * self._episode)
+        return np.asarray((value, -value), dtype=np.float32), {}
+
+    def step(
+        self, action: int
+    ) -> tuple[np.ndarray, float, bool, bool, dict[str, object]]:
+        del action
+        self._step += 1
+        value = float(100 * self._episode + self._step)
+        observation = np.asarray((value, -value), dtype=np.float32)
+        return observation, 0.0, self._step == 2, False, {}
+
+
+def test_collect_trajectory_next_state_preserves_terminal_target_across_reset() -> None:
+    """NEXT_STATE targets use post-step observations, including at reset boundaries."""
+    observations, targets = collect_trajectory(
+        _TwoStepEpisodeEnv(),  # type: ignore[arg-type]
+        lambda _observation: 0,
+        num_steps=4,
+        mode=PredictionMode.NEXT_STATE,
+        include_action_in_features=True,
+        seed=42,
+    )
+
+    assert observations.shape == (4, 3)  # observation(2) + action(1)
+    assert targets.shape == (4, 2)
+    matches_next_feature = jnp.all(
+        jnp.isclose(observations[1:, :2], targets[:-1]), axis=1
+    )
+    # The middle target is the terminal [2, -2], while the next feature starts
+    # the reset episode at [100, -100]. The surrounding transitions continue.
+    np.testing.assert_array_equal(
+        np.asarray(matches_next_feature), np.asarray((True, False, True))
+    )
+    np.testing.assert_array_equal(np.asarray(targets[1]), np.asarray((2.0, -2.0)))
+    np.testing.assert_array_equal(
+        np.asarray(observations[2, :2]), np.asarray((100.0, -100.0))
+    )
