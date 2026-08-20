@@ -35,6 +35,7 @@ from alberta_framework.benchmarks.forager_matched_evidence import (
     MATCHED_SELECTION_BOOTSTRAP_RNG_IMPLEMENTATION_SHA256,
     MATCHED_SELECTION_STATISTIC_IMPLEMENTATION_SHA256,
 )
+from alberta_framework.benchmarks.forager_matched_executor import canonical_json_bytes
 from alberta_framework.benchmarks.forager_matched_protocol import (
     AllowedTransform,
     ConfigurationBinding,
@@ -696,3 +697,40 @@ def test_resource_accounting_semantics_fail_closed() -> None:
         builder.build_forager_matched_open_protocol(
             runtime=_runtime(), candidate_qualifications=qualifications
         )
+
+
+_SEALED_CONFIGURATIONS: Final = (
+    Path(__file__).resolve().parents[1]
+    / "outputs/forager/matched_current_qualification_2c3b214c_v1/configurations"
+)
+
+
+@pytest.mark.skipif(
+    not _SEALED_CONFIGURATIONS.is_dir(),
+    reason="sealed matched-current qualification root is not present in this tree",
+)
+def test_rebuilt_alberta_configurations_reproduce_the_sealed_bytes() -> None:
+    """Every locally built Alberta configuration must rebuild the sealed bytes.
+
+    ``matched_current_qualification_2c3b214c_v1`` is immutable, and the
+    campaign's published identity is derived from exactly these payloads.  A
+    build that no longer reproduces them byte-for-byte has changed the identity
+    of a frozen campaign, whatever the cause -- a renamed field, a reordered
+    key, or a derived float that came out one ULP different on this host.
+
+    This is the guard that was missing when
+    ``CausalMapForagerConfig.respawn_quantile_z`` silently became
+    architecture-dependent: nothing in the suite compared a rebuild against the
+    sealed root, so three causal cells drifted without any test noticing.
+    """
+
+    configurations = builder.matched_current_alberta_configurations()
+    assert configurations, "expected a non-empty Alberta configuration set"
+
+    drifted = sorted(
+        candidate_id
+        for candidate_id, configuration in configurations.items()
+        if canonical_json_bytes(configuration)
+        != (_SEALED_CONFIGURATIONS / candidate_id / "original.json").read_bytes()
+    )
+    assert not drifted, f"rebuild no longer reproduces the sealed payloads: {drifted}"
