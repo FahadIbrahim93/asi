@@ -200,19 +200,24 @@ def test_coom_receipt_validator_rejects_hostile_provider_payloads(
     smoke.validate_receipt(receipt)
 
     retained = tmp_path / "receipt.json"
-    smoke.write_new_receipt(retained, receipt)
-    assert smoke.validate_receipt_file(retained) == receipt
-    assert retained.stat().st_mode & 0o222 == 0
-    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+    if not hasattr(smoke.os, "O_TMPFILE"):
+        with pytest.raises(OSError, match="requires Linux O_TMPFILE"):
+            smoke.write_new_receipt(retained, receipt)
+        assert not retained.exists()
+    else:
         smoke.write_new_receipt(retained, receipt)
+        assert smoke.validate_receipt_file(retained) == receipt
+        assert retained.stat().st_mode & 0o222 == 0
+        with pytest.raises(FileExistsError, match="refusing to overwrite"):
+            smoke.write_new_receipt(retained, receipt)
 
-    stalled = tmp_path / "stalled.json"
-    real_write = smoke.os.write
-    monkeypatch.setattr(smoke.os, "write", lambda *_args: 0)
-    with pytest.raises(OSError, match="made no progress"):
-        smoke.write_new_receipt(stalled, receipt)
-    assert not stalled.exists()
-    monkeypatch.setattr(smoke.os, "write", real_write)
+        stalled = tmp_path / "stalled.json"
+        real_write = smoke.os.write
+        monkeypatch.setattr(smoke.os, "write", lambda *_args: 0)
+        with pytest.raises(OSError, match="made no progress"):
+            smoke.write_new_receipt(stalled, receipt)
+        assert not stalled.exists()
+        monkeypatch.setattr(smoke.os, "write", real_write)
 
     duplicate = tmp_path / "duplicate.json"
     encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
@@ -225,8 +230,9 @@ def test_coom_receipt_validator_rejects_hostile_provider_payloads(
     with pytest.raises(ValueError, match="byte limit"):
         smoke.load_receipt(oversized)
 
+    linked_target = retained if retained.exists() else duplicate
     linked = tmp_path / "linked.json"
-    linked.symlink_to(retained)
+    linked.symlink_to(linked_target)
     with pytest.raises(OSError):
         smoke.load_receipt(linked)
 
