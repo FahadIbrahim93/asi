@@ -26,6 +26,7 @@ from typing import TypeVar
 import chex
 import jax.numpy as jnp
 import jax.random as jr
+import numpy as np
 from jax import Array
 from jaxtyping import Bool, PRNGKeyArray
 
@@ -54,10 +55,17 @@ class MaskMode(enum.Enum):
 # ``tests/test_partial_observation.py``. Origin stacked a pointer-repeat of
 # 5_000 identical masks with no reject — hang, not leftover INT32 math.
 _MAX_PERIODIC_SCHEDULE_LENGTH = 4_096
-# Each logical boolean is retained once in the per-row converted masks and
-# once again in the stacked schedule.  Cap the logical payload at 64 MiB so
-# those two runner-owned arrays stay below 128 MiB before allocator overhead.
+# Cap the final boolean schedule payload at 64 MiB.  The schedule is converted
+# in one operation below: converting each row separately makes construction
+# time grow with thousands of JAX dispatches even when every row is a repeated
+# pointer to the same tiny host array.
 _MAX_PERIODIC_SCHEDULE_VALUES = 64 * 1024 * 1024
+
+
+def _is_trusted_mask_array(value: object) -> bool:
+    """Accept only concrete NumPy or JAX array runtime types."""
+    actual_type = type(value)
+    return actual_type is np.ndarray or issubclass(actual_type, Array)
 
 
 def _require_unit_interval_probability(name: str, value: object) -> float:
@@ -75,6 +83,13 @@ def _require_mode(mode: object) -> MaskMode:
     if type(mode) is not MaskMode:
         raise ValueError("mode must be an exact MaskMode")
     return mode
+
+
+def _require_feature_dim(value: object) -> int:
+    """Reject non-builtin protocol dimensions before resource arithmetic."""
+    if type(value) is not int or not 1 <= value <= 2**31 - 1:
+        raise ValueError("inner.feature_dim must be an integer in [1, 2147483647]")
+    return value
 
 
 # =============================================================================
@@ -151,7 +166,7 @@ class PartialObservationWrapper[InnerStateT]:
         self._mask_prob = mask_prob
         self._sentinel = validated_float32_scalar("sentinel", sentinel)
 
-        feature_dim = inner.feature_dim
+        feature_dim = _require_feature_dim(inner.feature_dim)
 
         if mode == MaskMode.FIXED:
             if fixed_mask is None:
@@ -166,7 +181,13 @@ class PartialObservationWrapper[InnerStateT]:
             self._fixed_mask = None
 
         if mode == MaskMode.PERIODIC:
-            if schedule is None or len(schedule) == 0:
+            if schedule is None:
+                raise ValueError(
+                    "MaskMode.PERIODIC requires a non-empty schedule."
+                )
+            if type(schedule) is not tuple:
+                raise ValueError("periodic schedule must be an exact tuple")
+            if len(schedule) == 0:
                 raise ValueError(
                     "MaskMode.PERIODIC requires a non-empty schedule."
                 )
@@ -181,12 +202,16 @@ class PartialObservationWrapper[InnerStateT]:
                     "periodic schedule working set exceeds the bounded "
                     f"{_MAX_PERIODIC_SCHEDULE_VALUES}-value payload"
                 )
-            masks = [jnp.asarray(m, dtype=jnp.bool_) for m in schedule]
-            if any(mask.shape != (feature_dim,) for mask in masks):
+            if any(
+                not _is_trusted_mask_array(mask)
+                or mask.shape != (feature_dim,)
+                for mask in schedule
+            ):
                 raise ValueError(
                     f"schedule masks must each have shape (feature_dim={feature_dim},)"
                 )
-            sched = jnp.stack(masks, axis=0)
+            sched = jnp.asarray(schedule, dtype=jnp.bool_)
+            assert sched.shape == (len(schedule), feature_dim)
             self._schedule: Array | None = sched
         else:
             self._schedule = None

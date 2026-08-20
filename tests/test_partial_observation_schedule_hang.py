@@ -48,6 +48,45 @@ def test_periodic_schedule_rejects_pointer_repeat_origin_hang_n() -> None:
     assert time.perf_counter() - started < 0.25
 
 
+def test_periodic_schedule_rejects_non_tuple_without_len_hook() -> None:
+    class HostileTuple(tuple[object, ...]):
+        def __len__(self) -> int:
+            raise AssertionError("untrusted length hook executed")
+
+        def __repr__(self) -> str:
+            raise AssertionError("untrusted repr hook executed")
+
+    with pytest.raises(ValueError, match="exact tuple"):
+        PartialObservationWrapper(
+            _inner(),
+            mode=MaskMode.PERIODIC,
+            schedule=HostileTuple((np.array([True, False]),)),  # type: ignore[arg-type]
+        )
+
+
+def test_periodic_schedule_rejects_hostile_feature_dim_before_arithmetic() -> None:
+    class HostileInt(int):
+        calls = 0
+
+        def __mul__(self, other: object) -> int:
+            type(self).calls += 1
+            raise AssertionError("untrusted multiplication hook executed")
+
+        def __le__(self, other: object) -> bool:
+            type(self).calls += 1
+            raise AssertionError("untrusted comparison hook executed")
+
+    inner = _inner()
+    object.__setattr__(inner, "_feature_dim", HostileInt(2))
+    with pytest.raises(ValueError, match="inner.feature_dim"):
+        PartialObservationWrapper(
+            inner,
+            mode=MaskMode.PERIODIC,
+            schedule=(np.array([True, False], dtype=bool),),
+        )
+    assert HostileInt.calls == 0
+
+
 def test_periodic_schedule_accepts_public_last_fit() -> None:
     row_a = np.array([True, False], dtype=bool)
     row_b = np.array([False, True], dtype=bool)
@@ -57,6 +96,29 @@ def test_periodic_schedule_accepts_public_last_fit() -> None:
         schedule=(row_a, row_b, row_a),
     )
     assert wrapper.mode is MaskMode.PERIODIC
+
+
+def test_periodic_schedule_maximum_uses_one_array_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The admitted maximum must not restore one JAX dispatch per row."""
+    row = np.array([True, False], dtype=bool)
+    original_asarray = partial_observation.jnp.asarray
+    calls = 0
+
+    def counted_asarray(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        return original_asarray(*args, **kwargs)
+
+    monkeypatch.setattr(partial_observation.jnp, "asarray", counted_asarray)
+    wrapper = PartialObservationWrapper(
+        _inner(),
+        mode=MaskMode.PERIODIC,
+        schedule=(row,) * _MAX_PERIODIC_SCHEDULE_LENGTH,
+    )
+    assert wrapper.mode is MaskMode.PERIODIC
+    assert calls == 1
 
 
 def test_periodic_schedule_rejects_large_rows_before_array_conversion(
@@ -76,4 +138,22 @@ def test_periodic_schedule_rejects_large_rows_before_array_conversion(
             RandomWalkStream(feature_dim=feature_dim, drift_rate=0.0, noise_std=0.0),
             mode=MaskMode.PERIODIC,
             schedule=(row,) * schedule_length,
+        )
+
+
+def test_periodic_schedule_rejects_wrong_large_row_before_array_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A huge caller-owned row is checked by metadata before conversion."""
+    row = np.zeros((1_000_000,), dtype=bool)
+
+    def fail_asarray(*args: object, **kwargs: object) -> object:
+        raise AssertionError("array conversion ran before the row-shape gate")
+
+    monkeypatch.setattr(partial_observation.jnp, "asarray", fail_asarray)
+    with pytest.raises(ValueError, match="schedule masks"):
+        PartialObservationWrapper(
+            _inner(),
+            mode=MaskMode.PERIODIC,
+            schedule=(row,),
         )
