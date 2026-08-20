@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import numpy as np
 import pytest
 
@@ -104,7 +106,7 @@ def test_nested_dense_view_rejects_before_coercion(
     def fail_asarray(*args: object, **kwargs: object) -> object:
         raise AssertionError("coercion ran before the nested dense-value gate")
 
-    monkeypatch.setattr(metrics.np, "asarray", fail_asarray)
+    monkeypatch.setattr(cast(Any, metrics).np, "asarray", fail_asarray)
     with pytest.raises(ValueError, match="dense numeric value limit"):
         metrics._numeric_array([view], name="values")
 
