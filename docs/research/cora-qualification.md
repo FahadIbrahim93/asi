@@ -29,6 +29,15 @@ replay inserts/samples/peak bytes, persistent numeric bytes, logical calls and t
 nanoseconds. Validators recompute all counters and all three metric summaries. Results are permanently
 nonpromoting, task-information use is explicit, and negative outcomes must be retained.
 
+`cora_external_qualification.py` adds a separate, provider-neutral contract for a future isolated
+official Procgen smoke. It freezes the official paper/code identity, source/runtime/asset manifests,
+six-task train/evaluation seed order, fixed action, observation layout, resource fields, and strict
+receipt validation. It does not import or launch CORA or Procgen. Its array builder accepts a trace
+supplied by its caller and therefore records `external_runtime_execution_verified=false`; neither
+valid arrays nor a matching content hash establish external execution. The blocker manifest keeps
+the checkout, image lock, Procgen assets and rights, actual provider trace, metric parity, matched
+learning baselines, published-scale run, and separate execution authorization open.
+
 Protocol gaps before external comparison include environment/ROM/assets checksums and licenses;
 the exact historical PyTorch/CUDA/runtime lock; observation preprocessing, frame stacking, action
 unification, episode truncation and stochastic seeding; actor/learner concurrency; continual-test
