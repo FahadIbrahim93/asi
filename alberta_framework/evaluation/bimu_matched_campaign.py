@@ -468,6 +468,9 @@ def run_bimu_shard(
     )
     if cast(dict[str, object], plan_doc["policy"])["execution_authorized"] is not True:
         raise PermissionError("the bound campaign plan is not authorized for execution")
+    execution_identity = _current_identity()
+    if not _json_exact_equal(plan_doc["identity"], execution_identity):
+        _fail("campaign identity changed after the plan was validated")
     arrays = load_frozen_bimu_dataset(data_home)
     started_wall = time.perf_counter()
     started_cpu = time.process_time()
@@ -476,6 +479,8 @@ def run_bimu_shard(
     cpu_seconds = time.process_time() - started_cpu
     if _dataset_sha256(*arrays) != FROZEN_BIMU_MATCHED_PLAN.dataset_sha256:
         _fail("campaign dataset changed during shard execution")
+    if not _json_exact_equal(_current_identity(), execution_identity):
+        _fail("campaign source, runtime, or dependencies changed during shard execution")
     validate_bimu_result(result)
     payload: dict[str, object] = {
         "schema": SHARD_SCHEMA,
@@ -483,7 +488,7 @@ def run_bimu_shard(
         "plan_sha256": plan_doc["plan_sha256"],
         "spec": {"arm": arm, "seed": seed},
         "identity": {
-            **_current_identity(),
+            **execution_identity,
             "dataset_sha256": FROZEN_BIMU_MATCHED_PLAN.dataset_sha256,
             "process": _process_identity(),
         },
@@ -678,6 +683,7 @@ def validate_bimu_shard_by_reexecution(
 ) -> dict[str, object]:
     """Reexecute one shard and compare every deterministic result field."""
 
+    replay_identity = _current_identity()
     root = validate_bimu_shard(value)
     arrays = _validated_arrays(
         train_x,
@@ -703,6 +709,8 @@ def validate_bimu_shard_by_reexecution(
         _fail("shard result does not match strict seed/arm reexecution")
     if _dataset_sha256(*arrays) != FROZEN_BIMU_MATCHED_PLAN.dataset_sha256:
         _fail("campaign dataset changed during strict shard reexecution")
+    if not _json_exact_equal(_current_identity(), replay_identity):
+        _fail("campaign source, runtime, or dependencies changed during shard reexecution")
     return root
 
 
@@ -1010,7 +1018,7 @@ def _open_output_parent(path: Path, *, create: bool) -> tuple[Path, int]:
             os.close(descriptor)
             descriptor = next_descriptor
         return destination, descriptor
-    except Exception:
+    except BaseException:
         os.close(descriptor)
         raise
 
@@ -1031,6 +1039,17 @@ def _link_unnamed_file(file_descriptor: int, parent_descriptor: int, name: str) 
         if error == errno.EEXIST:
             raise FileExistsError(error, os.strerror(error), name)
         raise OSError(error, os.strerror(error), name)
+
+
+def _require_live_parent(destination: Path, parent_descriptor: int) -> None:
+    _, live_descriptor = _open_output_parent(destination, create=False)
+    try:
+        pinned = os.fstat(parent_descriptor)
+        live = os.fstat(live_descriptor)
+        if (pinned.st_dev, pinned.st_ino) != (live.st_dev, live.st_ino):
+            raise RuntimeError("campaign publication parent changed during publication")
+    finally:
+        os.close(live_descriptor)
 
 
 def _reserve_shard_destination(path: Path, *, root: Path) -> tuple[Path, int, int]:
@@ -1060,16 +1079,10 @@ def publish_json(
     root: Path,
     _reservation: tuple[Path, int, int] | None = None,
 ) -> None:
-    """Publish one canonical file without replacement and verify its held inode.
-
-    Plans and aggregates link a complete anonymous inode atomically. A shard's
-    exact final name is instead reserved before execution; an interrupted or
-    failed run intentionally leaves that non-result reservation occupied.
-    """
+    """Publish one validated canonical campaign file without replacement."""
 
     if type(path) is not type(Path()) or type(root) is not type(Path()):
         raise TypeError("path and root must be exact Paths")
-    _require_registered_root(root)
     if not _allowed_path(path, root):
         _fail("destination is outside the fixed campaign namespace")
 
@@ -1091,15 +1104,31 @@ def publish_json(
     )
     _, shard_parent_descriptor = _open_output_parent(shard_path, create=True)
     os.close(shard_parent_descriptor)
-    if _reservation is None:
+    owns_descriptors = _reservation is None
+    if owns_descriptors:
         destination, parent_descriptor = _open_output_parent(path, create=True)
         file_descriptor: int | None = None
     else:
+        assert _reservation is not None
         destination, parent_descriptor, file_descriptor = _reservation
         if destination != Path(os.path.abspath(os.fspath(path))):
             _fail("campaign reservation does not match its exact destination")
+        _require_live_parent(destination, parent_descriptor)
+        reserved = os.fstat(file_descriptor)
+        visible = os.stat(
+            destination.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(reserved.st_mode)
+            or reserved.st_nlink != 1
+            or reserved.st_size != 0
+            or (reserved.st_dev, reserved.st_ino) != (visible.st_dev, visible.st_ino)
+        ):
+            raise RuntimeError("campaign shard reservation changed before publication")
     try:
-        if _reservation is None:
+        if owns_descriptors:
             try:
                 os.stat(destination.name, dir_fd=parent_descriptor, follow_symlinks=False)
             except FileNotFoundError:
@@ -1126,7 +1155,7 @@ def publish_json(
             written += count
         os.fsync(file_descriptor)
         os.fchmod(file_descriptor, 0o444)
-        if _reservation is None:
+        if owns_descriptors:
             try:
                 _link_unnamed_file(file_descriptor, parent_descriptor, destination.name)
             except FileExistsError as exc:
@@ -1179,18 +1208,12 @@ def publish_json(
             raise RuntimeError("published campaign artifact is not strict JSON") from exc
         validate(decoded)
         os.fsync(parent_descriptor)
-        _, live_parent_descriptor = _open_output_parent(destination, create=False)
-        try:
-            pinned = os.fstat(parent_descriptor)
-            live = os.fstat(live_parent_descriptor)
-            if (pinned.st_dev, pinned.st_ino) != (live.st_dev, live.st_ino):
-                raise RuntimeError("campaign publication parent changed during publication")
-        finally:
-            os.close(live_parent_descriptor)
+        _require_live_parent(destination, parent_descriptor)
     finally:
-        if file_descriptor is not None:
-            os.close(file_descriptor)
-        os.close(parent_descriptor)
+        if owns_descriptors:
+            if file_descriptor is not None:
+                os.close(file_descriptor)
+            os.close(parent_descriptor)
 
 
 def _load_plan(root: Path) -> dict[str, object]:
@@ -1279,7 +1302,6 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     root = cast(Path, args.root)
-    _require_registered_root(root)
     if args.command == "plan":
         document = build_plan_document()
         publish_json(campaign_path(root, "plan"), document, root=root)
@@ -1312,8 +1334,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 data_home=args.data_home,
                 plan_document=plan,
             )
-            publish_json(destination, shard, root=root, _reservation=reservation)
-            reservation = None
+            publish_json(
+                destination,
+                shard,
+                root=root,
+                _reservation=reservation,
+            )
         finally:
             if reservation is not None:
                 _, parent_descriptor, file_descriptor = reservation
@@ -1354,17 +1380,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             "shards": [],
             "aggregate": None,
         }
-        shards: list[dict[str, object]] = []
+        replayed_shards: list[dict[str, object]] | None = None
         if any_shards:
             arrays = load_frozen_bimu_dataset(args.data_home)
-            shards = _load_shards(root, arrays)
-            result["shards"] = [shard["shard_sha256"] for shard in shards]
+            replayed_shards = _load_shards(root, arrays)
+            result["shards"] = [shard["shard_sha256"] for shard in replayed_shards]
         if aggregate_path.exists():
             aggregate = validate_bimu_aggregate(
                 load_json_strict(aggregate_path, byte_ceiling=MAX_AGGREGATE_BYTES)
             )
-            if any_shards and aggregate["shards"] != shards:
-                _fail("aggregate does not contain the exact retained shard roster")
+            if replayed_shards is None or not _json_exact_equal(
+                aggregate["shards"], replayed_shards
+            ):
+                _fail("aggregate shards do not match the dataset-reexecuted shard files")
             result["aggregate"] = aggregate["aggregate_sha256"]
         _print_json(result)
         return 0

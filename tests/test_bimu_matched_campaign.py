@@ -208,6 +208,30 @@ def test_strict_shard_validator_reexecutes_final_state(tiny_campaign: Any) -> No
         campaign.validate_bimu_shard_by_reexecution(forged, *arrays)
 
 
+def test_shard_execution_rejects_identity_drift(
+    tiny_campaign: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stable = campaign._current_identity()
+    drifted = copy.deepcopy(stable)
+    drifted["source_sha256"] = {
+        **cast(dict[str, str], drifted["source_sha256"]),
+        "changed.py": "0" * 64,
+    }
+    original_run = campaign.run_bimu_development
+    changed = False
+
+    def run_then_drift(*args: object, **kwargs: object) -> dict[str, object]:
+        nonlocal changed
+        result = original_run(*args, **kwargs)
+        changed = True
+        return result
+
+    monkeypatch.setattr(campaign, "run_bimu_development", run_then_drift)
+    monkeypatch.setattr(campaign, "_current_identity", lambda: drifted if changed else stable)
+    with pytest.raises(ValueError, match="changed during shard execution"):
+        campaign.run_bimu_shard("memory_off", 157001)
+
+
 def _six_shards() -> list[dict[str, Any]]:
     return [
         campaign.run_bimu_shard(arm, seed)
@@ -261,6 +285,39 @@ def test_aggregate_rejects_cross_pair_schedule_or_resource_drift(tiny_campaign: 
     _resign(forged[1])
     with pytest.raises(ValueError, match="resource|accounting"):
         campaign.summarize_bimu_shards(forged)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_cli_validate_cross_binds_aggregate_to_reexecuted_shard_files(
+    tmp_path: Path, tiny_campaign: Any
+) -> None:
+    campaign.publish_json(
+        campaign.campaign_path(tmp_path, "plan"),
+        campaign.build_plan_document(),
+        root=tmp_path,
+    )
+    retained_shards = _six_shards()
+    for shard in retained_shards:
+        spec = cast(dict[str, Any], shard["spec"])
+        campaign.publish_json(
+            campaign.campaign_path(
+                tmp_path,
+                "shard",
+                arm=cast(str, spec["arm"]),
+                seed=cast(int, spec["seed"]),
+            ),
+            shard,
+            root=tmp_path,
+        )
+    different_valid_aggregate = campaign.summarize_bimu_shards(_six_shards())
+    campaign.publish_json(
+        campaign.campaign_path(tmp_path, "aggregate"),
+        different_valid_aggregate,
+        root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="dataset-reexecuted shard files"):
+        campaign.main(["validate", "--root", str(tmp_path)])
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
@@ -423,15 +480,33 @@ def test_cli_reserves_exact_shard_before_execution(
     assert destination.stat().st_size == 0
 
 
-def test_cli_rejects_relocated_root_before_namespace_access(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_cli_completes_and_revalidates_reserved_shard(
+    tmp_path: Path, tiny_campaign: Any
 ) -> None:
-    registered = tmp_path / "registered"
-    relocated = tmp_path / "relocated"
-    monkeypatch.setattr(campaign, "REGISTERED_OUTPUT_ROOT", registered)
-    with pytest.raises(ValueError, match="registered repository root"):
-        campaign.main(["validate", "--root", str(relocated)])
-    assert not relocated.exists()
+    campaign.publish_json(
+        campaign.campaign_path(tmp_path, "plan"),
+        campaign.build_plan_document(),
+        root=tmp_path,
+    )
+    destination = campaign.campaign_path(tmp_path, "shard", arm="bimu", seed=157003)
+
+    assert campaign.main(
+        [
+            "run-shard",
+            "--root",
+            str(tmp_path),
+            "--arm",
+            "bimu",
+            "--seed",
+            "157003",
+        ]
+    ) == 0
+
+    assert destination.stat().st_mode & 0o777 == 0o444
+    campaign.validate_bimu_shard(
+        campaign.load_json_strict(destination, byte_ceiling=campaign.MAX_SHARD_BYTES)
+    )
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
