@@ -53,6 +53,7 @@ from alberta_framework.evaluation.bimu_matched_nonpromoting import (
 
 PLAN_DOCUMENT_SCHEMA: Final = "asi.bimu.matched-campaign-plan.v1"
 SHARD_SCHEMA: Final = "asi.bimu.matched-campaign-shard.v1"
+FAILED_SHARD_SCHEMA: Final = "asi.bimu.matched-campaign-failed-shard.v1"
 AGGREGATE_SCHEMA: Final = "asi.bimu.matched-campaign-aggregate.v1"
 PROCESS_SCHEMA: Final = "asi.bimu.fresh-process.v1"
 
@@ -88,8 +89,9 @@ _POLICY: Final = {
     "sota_claim_allowed": False,
     "paper_comparable": False,
     "completed_outcomes_retained": True,
-    "execution_failure_receipts_retained": False,
-    "failed_attempt_reservation_retained": True,
+    "ordinary_exception_failure_receipts_retained": True,
+    "failed_attempt_reservation_retained": False,
+    "base_exception_failure_retention_guaranteed": False,
 }
 _TIMING_POLICY: Final = {
     "qualified": False,
@@ -676,6 +678,108 @@ def validate_bimu_shard(value: object) -> dict[str, object]:
     return root
 
 
+def build_failed_bimu_shard(arm: str, seed: int) -> dict[str, object]:
+    """Build one generic receipt for an ordinary failed shard attempt."""
+
+    if type(arm) is not str or arm not in _ARMS:
+        _fail("failed shard arm is outside the frozen roster")
+    if type(seed) is not int or seed not in FROZEN_BIMU_MATCHED_PLAN.seeds:
+        _fail("failed shard seed is outside the frozen roster")
+    payload: dict[str, object] = {
+        "schema": FAILED_SHARD_SCHEMA,
+        "status": "failed",
+        "plan_sha256": _sha256(frozen_plan_payload()),
+        "spec": {"arm": arm, "seed": seed},
+        "identity": {**_current_identity(), "process": _process_identity()},
+        "policy": {
+            **_POLICY,
+            "execution_authorized": True,
+            "used_for_outcome": False,
+            "retry_authorized": False,
+        },
+        "failure": {
+            "classification": "ordinary_execution_or_validation_failure",
+            "exception_type_retained": False,
+            "exception_message_retained": False,
+            "exception_repr_retained": False,
+            "base_exception_retention_guaranteed": False,
+        },
+    }
+    payload["failure_sha256"] = _sha256(payload)
+    validate_failed_bimu_shard(payload)
+    return payload
+
+
+def validate_failed_bimu_shard(value: object) -> dict[str, object]:
+    """Strictly validate one generic, non-outcome failed-attempt receipt."""
+
+    _validate_json_tree(value)
+    root = _exact_object(
+        value,
+        {
+            "schema",
+            "status",
+            "plan_sha256",
+            "spec",
+            "identity",
+            "policy",
+            "failure",
+            "failure_sha256",
+        },
+        "failed BiMU shard",
+    )
+    if root["schema"] != FAILED_SHARD_SCHEMA or root["status"] != "failed":
+        _fail("failed BiMU shard identity or status drifted")
+    if root["plan_sha256"] != _sha256(frozen_plan_payload()):
+        _fail("failed BiMU shard plan digest drifted")
+    spec = _exact_object(root["spec"], {"arm", "seed"}, "failed shard spec")
+    if type(spec["arm"]) is not str or spec["arm"] not in _ARMS:
+        _fail("failed shard arm is outside the frozen roster")
+    if type(spec["seed"]) is not int or spec["seed"] not in FROZEN_BIMU_MATCHED_PLAN.seeds:
+        _fail("failed shard seed is outside the frozen roster")
+    identity = _exact_object(
+        root["identity"],
+        {
+            "source_sha256",
+            "runtime",
+            "dependencies",
+            "consistency_not_attestation",
+            "process",
+        },
+        "failed shard identity",
+    )
+    if not _json_exact_equal(
+        {key: item for key, item in identity.items() if key != "process"},
+        _current_identity(),
+    ):
+        _fail("failed shard source or runtime identity drifted")
+    _validate_process(identity["process"])
+    expected_policy = {
+        **_POLICY,
+        "execution_authorized": True,
+        "used_for_outcome": False,
+        "retry_authorized": False,
+    }
+    if not _json_exact_equal(root["policy"], expected_policy):
+        _fail("failed shard policy drifted")
+    if not _json_exact_equal(
+        root["failure"],
+        {
+            "classification": "ordinary_execution_or_validation_failure",
+            "exception_type_retained": False,
+            "exception_message_retained": False,
+            "exception_repr_retained": False,
+            "base_exception_retention_guaranteed": False,
+        },
+    ):
+        _fail("failed shard disclosure boundary drifted")
+    if root["failure_sha256"] != digest_without(root, "failure_sha256"):
+        _fail("failed shard digest drifted")
+    if len(_canonical(root)) > MAX_SHARD_BYTES:
+        _fail("failed shard exceeds byte ceiling")
+    return root
+
+
 def validate_bimu_shard_by_reexecution(
     value: object,
     train_x: object,
@@ -1054,24 +1158,69 @@ def _require_live_parent(destination: Path, parent_descriptor: int) -> None:
         os.close(live_descriptor)
 
 
-def _reserve_shard_destination(path: Path, *, root: Path) -> tuple[Path, int, int]:
+ShardReservation = tuple[Path, int, int, str]
+
+
+def _reserve_shard_destination(path: Path, *, root: Path) -> ShardReservation:
     """Reserve one exact shard path before dataset load or execution."""
 
     _require_registered_root(root)
     if not _allowed_path(path, root) or path.parent.name != "shards":
         _fail("only one canonical shard destination may be reserved")
     destination, parent_descriptor = _open_output_parent(path, create=True)
+    reservation_name = f".{destination.name}.reservation"
     try:
-        file_descriptor = os.open(
-            destination.name,
+        try:
+            os.stat(destination.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(
+                f"refusing to replace existing campaign artifact: {destination}"
+            )
+        reservation_descriptor = os.open(
+            reservation_name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-            0o000,
+            0o400,
             dir_fd=parent_descriptor,
         )
+        marker = b"asi-bimu-matched-shard-reservation-v1\n"
+        written = os.write(reservation_descriptor, marker)
+        if written != len(marker):
+            raise OSError("campaign reservation write made no progress")
+        os.fsync(reservation_descriptor)
+        os.fsync(parent_descriptor)
     except BaseException:
-        os.close(parent_descriptor)
+        if "reservation_descriptor" in locals():
+            _release_shard_reservation(
+                (destination, parent_descriptor, reservation_descriptor, reservation_name)
+            )
+        else:
+            os.close(parent_descriptor)
         raise
-    return destination, parent_descriptor, file_descriptor
+    return destination, parent_descriptor, reservation_descriptor, reservation_name
+
+
+def _release_shard_reservation(reservation: ShardReservation) -> None:
+    destination, parent_descriptor, reservation_descriptor, reservation_name = reservation
+    del destination
+    try:
+        owned = os.fstat(reservation_descriptor)
+        try:
+            current = os.stat(
+                reservation_name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            if (current.st_dev, current.st_ino) == (owned.st_dev, owned.st_ino):
+                os.unlink(reservation_name, dir_fd=parent_descriptor)
+                os.fsync(parent_descriptor)
+    finally:
+        os.close(reservation_descriptor)
+        os.close(parent_descriptor)
 
 
 def publish_json(
@@ -1079,13 +1228,13 @@ def publish_json(
     value: object,
     *,
     root: Path,
-    _reservation: tuple[Path, int, int] | None = None,
+    _reservation: ShardReservation | None = None,
 ) -> None:
-    """Publish one validated canonical file and verify its held inode.
+    """Publish one canonical file without replacement and verify its held inode.
 
-    Plans and aggregates link a complete anonymous inode atomically. A shard's
-    final name is reserved before execution; failure intentionally leaves that
-    zero-byte non-result reservation occupied.
+    Every final path receives a complete anonymous inode atomically. Shard work
+    additionally holds a separate, owned reservation marker until either a
+    complete result or a generic failed-attempt receipt is durably published.
     """
 
     if type(path) is not type(Path()) or type(root) is not type(Path()):
@@ -1100,7 +1249,10 @@ def publish_json(
         elif path == campaign_path(root, "aggregate"):
             validate_bimu_aggregate(candidate)
         else:
-            validate_bimu_shard(candidate)
+            if type(candidate) is dict and candidate.get("schema") == FAILED_SHARD_SCHEMA:
+                validate_failed_bimu_shard(candidate)
+            else:
+                validate_bimu_shard(candidate)
 
     validate(value)
     raw = _canonical(value) + b"\n"
@@ -1112,48 +1264,36 @@ def publish_json(
     )
     _, shard_parent_descriptor = _open_output_parent(shard_path, create=True)
     os.close(shard_parent_descriptor)
-    owns_descriptors = _reservation is None
-    if owns_descriptors:
+    if _reservation is None:
         destination, parent_descriptor = _open_output_parent(path, create=True)
-        file_descriptor: int | None = None
+        close_parent = True
     else:
-        assert _reservation is not None
-        destination, parent_descriptor, file_descriptor = _reservation
+        destination, parent_descriptor, reservation_descriptor, _ = _reservation
+        close_parent = False
         if destination != Path(os.path.abspath(os.fspath(path))):
             _fail("campaign reservation does not match its exact destination")
         _require_live_parent(destination, parent_descriptor)
-        reserved = os.fstat(file_descriptor)
-        visible = os.stat(
-            destination.name,
-            dir_fd=parent_descriptor,
-            follow_symlinks=False,
-        )
-        if (
-            not stat.S_ISREG(reserved.st_mode)
-            or reserved.st_nlink != 1
-            or reserved.st_size != 0
-            or (reserved.st_dev, reserved.st_ino) != (visible.st_dev, visible.st_ino)
-        ):
-            raise RuntimeError("campaign shard reservation changed before publication")
+        reservation_stat = os.fstat(reservation_descriptor)
+        if not stat.S_ISREG(reservation_stat.st_mode) or reservation_stat.st_nlink != 1:
+            _fail("campaign shard reservation is not the owned regular marker")
+    file_descriptor: int | None = None
     try:
-        if owns_descriptors:
-            try:
-                os.stat(destination.name, dir_fd=parent_descriptor, follow_symlinks=False)
-            except FileNotFoundError:
-                pass
-            else:
-                raise FileExistsError(
-                    f"refusing to replace existing campaign artifact: {destination}"
-                )
-            if not hasattr(os, "O_TMPFILE"):
-                raise OSError("immutable publication requires Linux O_TMPFILE support")
-            file_descriptor = os.open(
-                ".",
-                os.O_WRONLY | os.O_CLOEXEC | os.O_TMPFILE,
-                0o600,
-                dir_fd=parent_descriptor,
+        try:
+            os.stat(destination.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(
+                f"refusing to replace existing campaign artifact: {destination}"
             )
-        assert file_descriptor is not None
+        if not hasattr(os, "O_TMPFILE"):
+            raise OSError("immutable publication requires Linux O_TMPFILE support")
+        file_descriptor = os.open(
+            ".",
+            os.O_WRONLY | os.O_CLOEXEC | os.O_TMPFILE,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
         view = memoryview(raw)
         written = 0
         while written < len(view):
@@ -1163,13 +1303,12 @@ def publish_json(
             written += count
         os.fsync(file_descriptor)
         os.fchmod(file_descriptor, 0o444)
-        if owns_descriptors:
-            try:
-                _link_unnamed_file(file_descriptor, parent_descriptor, destination.name)
-            except FileExistsError as exc:
-                raise FileExistsError(
-                    f"refusing to replace existing campaign artifact: {destination}"
-                ) from exc
+        try:
+            _link_unnamed_file(file_descriptor, parent_descriptor, destination.name)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"refusing to replace existing campaign artifact: {destination}"
+            ) from exc
         read_descriptor = os.open(
             destination.name,
             os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
@@ -1218,9 +1357,9 @@ def publish_json(
         os.fsync(parent_descriptor)
         _require_live_parent(destination, parent_descriptor)
     finally:
-        if owns_descriptors:
-            if file_descriptor is not None:
-                os.close(file_descriptor)
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        if close_parent:
             os.close(parent_descriptor)
 
 
@@ -1332,28 +1471,31 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 2
         destination = campaign_path(root, "shard", arm=args.arm, seed=args.seed)
-        reservation: tuple[Path, int, int] | None = _reserve_shard_destination(
-            destination, root=root
-        )
+        reservation = _reserve_shard_destination(destination, root=root)
         try:
-            plan = _load_plan(root)
-            shard = run_bimu_shard(
-                args.arm,
-                args.seed,
-                data_home=args.data_home,
-                plan_document=plan,
-            )
-            publish_json(
-                destination,
-                shard,
-                root=root,
-                _reservation=reservation,
-            )
+            try:
+                plan = _load_plan(root)
+                shard = run_bimu_shard(
+                    args.arm,
+                    args.seed,
+                    data_home=args.data_home,
+                    plan_document=plan,
+                )
+                publish_json(destination, shard, root=root, _reservation=reservation)
+            except Exception:
+                failed = build_failed_bimu_shard(args.arm, args.seed)
+                publish_json(destination, failed, root=root, _reservation=reservation)
+                _print_json(
+                    {
+                        "status": "failed",
+                        "failure_retained": True,
+                        "retry_authorized": False,
+                        "shard": str(destination),
+                    }
+                )
+                return 1
         finally:
-            if reservation is not None:
-                _, parent_descriptor, file_descriptor = reservation
-                os.close(file_descriptor)
-                os.close(parent_descriptor)
+            _release_shard_reservation(reservation)
         _print_json({"status": "complete", "shard": str(destination)})
         return 0
     if args.command == "summarize":

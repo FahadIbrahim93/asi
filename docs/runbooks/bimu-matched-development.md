@@ -34,14 +34,15 @@ the authorized revision before any shard starts. That review must also update
 the literal `FROZEN_PLAN_SHA256`; an authorization flip without the matching
 reviewed plan digest fails closed.
 
-Inspect the currently unauthorized plan in a disposable root. Do not publish it
-under the repository's immutable output namespace:
+Inspect the currently unauthorized plan without publishing an artifact:
 
 ```bash
-campaign_root=$(mktemp -d)
-.venv/bin/asi-bimu-matched-development plan --root "$campaign_root"
-.venv/bin/asi-bimu-matched-development validate --root "$campaign_root"
+.venv/bin/python -c 'import json; from alberta_framework.evaluation.bimu_matched_campaign import build_plan_document; print(json.dumps(build_plan_document(), sort_keys=True))'
 ```
+
+The mutating CLI accepts only the registered repository root. Do not invoke its
+`plan` command until a reviewed authorization transition is ready to publish
+the source-bound plan in the new immutable namespace.
 
 If any file already exists in `development.v1`, the authorization change must
 advance the namespace rather than replace that file.
@@ -63,13 +64,11 @@ Once all six fixed shard paths exist, summarize and revalidate:
 
 All files publish without replacement under
 `outputs/bimu_matched/development.v1/`. Keep supported, rejected, and
-inconclusive aggregates. Source, runtime, dependency, process, dataset,
-resource, and telemetry digests are consistency bindings, not authenticated
-execution attestation.
-
-Each shard's final path is reserved before plan admission, dataset load, or
-execution. A crash or execution failure intentionally leaves a zero-byte,
-mode-000 non-result reservation at that path: it consumes that attempt and is
-not a valid shard or permission to retry. Successful publication fills the
-same held inode, makes it read-only, rereads bounded bytes without following
-links, and strictly validates them before reporting completion.
+inconclusive aggregates. An ordinary `Exception` during shard execution or
+strict validation publishes one generic failed-attempt receipt atomically at
+that shard's canonical path and returns nonzero. The receipt retains no
+exception type, message, or representation, cannot enter aggregation, and
+forbids retry in this namespace. `BaseException`, process death, and failure to
+publish the failure receipt remain outside this retention guarantee. Source,
+runtime, dependency, process, dataset, resource, and telemetry digests are
+consistency bindings, not authenticated execution attestation.

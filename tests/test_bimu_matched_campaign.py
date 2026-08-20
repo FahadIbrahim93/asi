@@ -458,26 +458,57 @@ def test_cli_reserves_exact_shard_before_execution(
         return original_load_plan(root)
 
     def fail_after_reservation(*args: object, **kwargs: object) -> dict[str, object]:
-        assert destination.is_file()
-        assert destination.stat().st_size == 0
+        assert not destination.exists()
+        marker = destination.with_name(f".{destination.name}.reservation")
+        assert marker.is_file()
         raise RuntimeError("simulated execution failure")
 
     monkeypatch.setattr(campaign, "_load_plan", load_plan_after_reservation)
     monkeypatch.setattr(campaign, "run_bimu_shard", fail_after_reservation)
-    with pytest.raises(RuntimeError, match="execution failure"):
-        campaign.main(
-            [
-                "run-shard",
-                "--root",
-                str(tmp_path),
-                "--arm",
-                "memory_off",
-                "--seed",
-                "157001",
-            ]
-        )
+    assert campaign.main(
+        [
+            "run-shard",
+            "--root",
+            str(tmp_path),
+            "--arm",
+            "memory_off",
+            "--seed",
+            "157001",
+        ]
+    ) == 1
     assert destination.is_file()
-    assert destination.stat().st_size == 0
+    assert destination.stat().st_mode & 0o777 == 0o444
+    assert not destination.with_name(f".{destination.name}.reservation").exists()
+    failed = campaign.validate_failed_bimu_shard(
+        campaign.load_json_strict(destination, byte_ceiling=campaign.MAX_SHARD_BYTES)
+    )
+    assert failed["status"] == "failed"
+    encoded = destination.read_text(encoding="utf-8")
+    assert "simulated execution failure" not in encoded
+    assert "RuntimeError" not in encoded
+    with pytest.raises(ValueError, match="fields|identity|status"):
+        campaign.summarize_bimu_shards([failed] * 6)
+
+    invalid_destination = campaign.campaign_path(
+        tmp_path, "shard", arm="bimu", seed=157001
+    )
+    monkeypatch.setattr(campaign, "run_bimu_shard", lambda *args, **kwargs: {"invalid": True})
+    assert campaign.main(
+        [
+            "run-shard",
+            "--root",
+            str(tmp_path),
+            "--arm",
+            "bimu",
+            "--seed",
+            "157001",
+        ]
+    ) == 1
+    campaign.validate_failed_bimu_shard(
+        campaign.load_json_strict(
+            invalid_destination, byte_ceiling=campaign.MAX_SHARD_BYTES
+        )
+    )
 
 
 def test_cli_rejects_relocated_root_before_namespace_access(
