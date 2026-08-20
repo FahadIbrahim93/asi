@@ -134,13 +134,25 @@ def test_step1_normalizer_boundary_hyperparameters_stay_finite_when_selected(
     normalizer: str, field: str, value: float
 ) -> None:
     """Step 1 must dispatch and consume each selected boundary value."""
-    config = Step1KernelConfig(
-        optimizer="autostep",
-        normalizer=normalizer,  # type: ignore[arg-type]
-        feature_dim=6,
-        num_relevant=2,
-        **{field: value},
-    )
+    if field == "ema_decay":
+        assert normalizer == "ema"
+        config = Step1KernelConfig(
+            optimizer="autostep",
+            normalizer="ema",
+            feature_dim=6,
+            num_relevant=2,
+            ema_decay=value,
+        )
+    else:
+        assert field == "streaming_batch_momentum"
+        assert normalizer == "streaming_batch"
+        config = Step1KernelConfig(
+            optimizer="autostep",
+            normalizer="streaming_batch",
+            feature_dim=6,
+            num_relevant=2,
+            streaming_batch_momentum=value,
+        )
     implementation = make_step1_normalizer(config)
     assert implementation is not None
     implementation_field = "decay" if field == "ema_decay" else "momentum"
