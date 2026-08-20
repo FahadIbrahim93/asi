@@ -52,9 +52,7 @@ class MaskMode(enum.Enum):
     PERIODIC = "periodic"
 
 
-# Public last-fit is the three-mask cycling schedule in
-# ``tests/test_partial_observation.py``. Origin stacked a pointer-repeat of
-# 5_000 identical masks with no reject — hang, not leftover INT32 math.
+# Bound schedule construction by both row count and total boolean payload.
 _MAX_PERIODIC_SCHEDULE_LENGTH = 4_096
 # Cap the final boolean schedule payload at 64 MiB. The schedule is converted
 # in one operation below: converting each row separately makes construction
@@ -136,13 +134,15 @@ class PartialObservationWrapper[InnerStateT]:
             partially masked.
         mode: Exact ``MaskMode`` member (FIXED / RANDOM / PERIODIC).
             Leftover string, bool, and int identities are rejected.
-        fixed_mask: Boolean mask of shape ``(feature_dim,)`` for FIXED.
-            ``True`` means VISIBLE; ``False`` means HIDDEN.
+        fixed_mask: Exact NumPy or JAX boolean array of shape
+            ``(feature_dim,)`` for FIXED. ``True`` means VISIBLE;
+            ``False`` means HIDDEN.
         mask_prob: Per-channel KEEP probability for RANDOM. So
             ``mask_prob = 0.5`` keeps half the channels each step in
             expectation.
-        schedule: Tuple of boolean masks of shape ``(feature_dim,)``;
-            cycled each step under PERIODIC mode.
+        schedule: Non-empty exact tuple of at most 4,096 NumPy or JAX
+            boolean arrays of shape ``(feature_dim,)`` and at most
+            67,108,864 total values; cycled under PERIODIC mode.
         sentinel: Finite real that replaces masked entries (default ``0.0``).
             Boolean and non-finite values are rejected so a hidden channel
             cannot silently become ``1.0``, ``NaN``, or ``Inf``.

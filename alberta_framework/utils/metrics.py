@@ -28,12 +28,8 @@ import numpy as np
 from numpy.typing import NDArray
 
 _INT32_MAX: int = 2**31 - 1
-# Same ceiling as security._JSON_MAX_DEPTH. An unbounded list/tuple walk
-# RecursionErrors on a ~1200-deep nest and cannot reject the boolean.
+# Bound recursive validation before numeric traces are materialized.
 _BOOLEAN_TRACE_MAX_DEPTH: int = 32
-# Public last-fit is the 6-step running-mean fixture in
-# ``tests/test_continual_metrics.py``. Origin walked a pointer-repeat of
-# 15_000_000 host floats with no reject — hang, not leftover INT32 math.
 _BOOLEAN_TRACE_MAX_NODES: int = 1_000_000
 # Dense typed arrays do not consume the Python traversal budget, but they still
 # feed allocation-heavy metric kernels.  ``compute_running_mean`` retains up to

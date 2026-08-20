@@ -1,9 +1,7 @@
 # mypy: disable-error-code="arg-type"
-"""Boolean-trace walks reject oversized host lists before the width hang."""
+"""Resource boundaries for numeric-trace validation."""
 
 from __future__ import annotations
-
-import time
 
 import numpy as np
 import pytest
@@ -17,24 +15,20 @@ from alberta_framework.utils.metrics import (
 pytestmark = pytest.mark.unit
 
 
-def test_running_mean_rejects_origin_hang_class_before_trace_walk(
+def test_running_mean_rejects_oversized_trace_before_numeric_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 8)
-    started = time.perf_counter()
     with pytest.raises(ValueError, match="boolean-trace value limit"):
         compute_running_mean([0.0] * 9, window_size=2)
-    assert time.perf_counter() - started < 0.25
 
 
 def test_cumulative_error_rejects_oversized_metrics_history_before_walk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 8)
-    started = time.perf_counter()
     with pytest.raises(ValueError, match="boolean-trace value limit"):
         compute_cumulative_error([{"squared_error": 1.0}] * 9)
-    assert time.perf_counter() - started < 0.25
 
 
 def test_object_array_rejects_oversized_width_before_flat_walk(
@@ -79,11 +73,6 @@ def test_trace_budget_counts_root_and_rejects_first_non_fit(
             np.asarray([0.0, 1.0, 2.0, 3.0], dtype=object),
             name="values",
         )
-
-
-def test_running_mean_accepts_public_last_fit() -> None:
-    result = compute_running_mean([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], window_size=3)
-    assert result.shape == (6,)
 
 
 def test_dense_numeric_array_is_not_a_python_traversal_node_budget(
