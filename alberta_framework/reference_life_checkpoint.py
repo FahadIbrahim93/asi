@@ -48,6 +48,12 @@ from alberta_framework.prototype_reference_adapter import (
     PrototypeReferenceState,
 )
 from alberta_framework.reference_agent import (
+    _MAX_ARRAY_ELEMENTS as _MAX_ARRAY_VALUE_ELEMENTS,
+)
+from alberta_framework.reference_agent import (
+    _SUPPORTED_DTYPES as _ARRAY_VALUE_SUPPORTED_DTYPES,
+)
+from alberta_framework.reference_agent import (
     ArrayValue,
     Decision,
     ReferenceTransactionState,
@@ -380,15 +386,20 @@ def _decode_float(value: Any, *, path: str) -> float:
     return result
 
 
-def _bounded_element_count(shape: tuple[int, ...], *, path: str) -> int:
+def _bounded_element_count(
+    shape: tuple[int, ...],
+    *,
+    path: str,
+    maximum_elements: int = _MAX_ARRAY_ELEMENTS,
+) -> int:
     """Return ``prod(shape)`` or fail before a host hex walk can start."""
 
     elements = 1
     for dimension in shape:
-        if dimension > 0 and elements > _MAX_ARRAY_ELEMENTS // dimension:
+        if dimension > 0 and elements > maximum_elements // dimension:
             _fail(f"{path}.shape exceeds the element limit")
         elements *= dimension
-        if elements > _MAX_ARRAY_ELEMENTS:
+        if elements > maximum_elements:
             _fail(f"{path}.shape exceeds the element limit")
     return elements
 
@@ -446,9 +457,13 @@ def _decode_array_value(value: Any, *, path: str) -> ArrayValue:
         dtype = np.dtype(dtype_name)
     except TypeError as exc:
         raise ValueError(f"{path}.dtype is unsupported") from exc
-    if dtype.name != dtype_name:
-        _fail(f"{path}.dtype is not a canonical numeric dtype")
-    elements = _bounded_element_count(shape, path=path)
+    if dtype.name != dtype_name or dtype_name not in _ARRAY_VALUE_SUPPORTED_DTYPES:
+        _fail(f"{path}.dtype is not a portable canonical numeric dtype")
+    elements = _bounded_element_count(
+        shape,
+        path=path,
+        maximum_elements=_MAX_ARRAY_VALUE_ELEMENTS,
+    )
     expected_bytes = elements * dtype.itemsize
     payload_hex = _require_str(data["payload_hex"], path=f"{path}.payload_hex")
     payload = _decode_hex_payload(

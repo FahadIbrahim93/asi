@@ -32,6 +32,10 @@ class _ForbiddenPattern:
         raise AssertionError("payload characters were inspected before its length")
 
 
+def _forbidden_decode(*_args: object, **_kwargs: object) -> bytes:
+    raise AssertionError("payload was inspected before ArrayValue metadata")
+
+
 def test_array_value_rejects_mismatched_hex_before_charset_walk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -49,7 +53,7 @@ def test_array_value_rejects_mismatched_hex_before_charset_walk(
 def test_array_value_rejects_semantic_id_before_charset_walk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    payload = dict(_SCALAR_FLOAT32)
+    payload: dict[str, object] = dict(_SCALAR_FLOAT32)
     payload["semantic_id"] = 1
     monkeypatch.setattr(checkpoint_module, "_LOWER_HEX_PATTERN", _ForbiddenPattern())
     with pytest.raises(ValueError, match="semantic_id must be a string"):
@@ -67,6 +71,26 @@ def test_array_value_rejects_uppercase_hex_of_matching_length() -> None:
     payload = dict(_SCALAR_FLOAT32)
     payload["payload_hex"] = "0000803F"
     with pytest.raises(ValueError, match="lowercase hexadecimal"):
+        _decode_array_value(payload, path="observation")
+
+
+def test_array_value_rejects_unsupported_dtype_before_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = dict(_SCALAR_FLOAT32)
+    payload["dtype"] = "complex64"
+    monkeypatch.setattr(checkpoint_module, "_decode_hex_payload", _forbidden_decode)
+    with pytest.raises(ValueError, match="portable canonical numeric dtype"):
+        _decode_array_value(payload, path="observation")
+
+
+def test_array_value_rejects_first_oversized_shape_before_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = dict(_SCALAR_FLOAT32)
+    payload["shape"] = [(1 << 20) + 1]
+    monkeypatch.setattr(checkpoint_module, "_decode_hex_payload", _forbidden_decode)
+    with pytest.raises(ValueError, match="shape exceeds the element limit"):
         _decode_array_value(payload, path="observation")
 
 
