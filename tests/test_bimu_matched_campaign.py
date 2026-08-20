@@ -438,7 +438,7 @@ def test_publication_parent_swap_never_writes_through_replacement(
         campaign.publish_json(path, campaign.build_plan_document(), root=tmp_path)
 
     assert path.read_bytes() == replacement_bytes
-    assert (retired / path.name).is_file()
+    assert not (retired / path.name).exists()
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
@@ -471,7 +471,24 @@ def test_publication_race_retains_concurrent_destination(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
-def test_publication_revalidates_readback_without_unlinking_visible_inode(
+def test_shard_publisher_does_not_run_unreceipted_reexecution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_campaign: Any
+) -> None:
+    destination = campaign.campaign_path(
+        tmp_path, "shard", arm="memory_off", seed=157001
+    )
+    shard = campaign.run_bimu_shard("memory_off", 157001)
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        raise AssertionError("publisher performed an unreceipted learner replay")
+
+    monkeypatch.setattr(campaign, "validate_bimu_shard_by_reexecution", forbidden)
+    campaign.publish_json(destination, shard, root=tmp_path)
+    assert destination.is_file()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_publication_revalidation_failure_removes_published_inode(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_campaign: Any
 ) -> None:
     monkeypatch.setattr(campaign, "REGISTERED_OUTPUT_ROOT", tmp_path)
@@ -491,8 +508,32 @@ def test_publication_revalidates_readback_without_unlinking_visible_inode(
     monkeypatch.setattr(campaign, "validate_plan_document", fail_readback)
     with pytest.raises(ValueError, match="readback rejection"):
         campaign.publish_json(plan_path, document, root=tmp_path)
-    assert plan_path.is_file()
-    assert plan_path.stat().st_mode & 0o777 == 0o444
+    assert not plan_path.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_post_link_replacement_is_not_removed_on_validation_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_campaign: Any
+) -> None:
+    plan_path = campaign.campaign_path(tmp_path, "plan")
+    document = campaign.build_plan_document()
+    competitor = b"concurrent replacement"
+    original = campaign.validate_plan_document
+    calls = 0
+
+    def replace_before_rejection(value: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            plan_path.unlink()
+            plan_path.write_bytes(competitor)
+            raise ValueError("simulated replacement rejection")
+        return original(value)
+
+    monkeypatch.setattr(campaign, "validate_plan_document", replace_before_rejection)
+    with pytest.raises(ValueError, match="replacement rejection"):
+        campaign.publish_json(plan_path, document, root=tmp_path)
+    assert plan_path.read_bytes() == competitor
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")

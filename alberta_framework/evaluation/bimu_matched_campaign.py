@@ -1283,7 +1283,7 @@ def publish_json(
             if type(candidate) is dict and candidate.get("schema") == FAILED_SHARD_SCHEMA:
                 validate_failed_bimu_shard(candidate)
             else:
-                validate_bimu_shard_by_reexecution(candidate, *load_frozen_bimu_dataset())
+                validate_bimu_shard(candidate)
 
     owns_reservation = _reservation is None
     reservation = _reserve_destination(path, root=root) if _reservation is None else _reservation
@@ -1305,6 +1305,7 @@ def publish_json(
     ):
         _fail("campaign reservation is not the owned regular marker")
     file_descriptor: int | None = None
+    published_identity: tuple[int, int] | None = None
     try:
         validate(value)
         raw = _canonical(value) + b"\n"
@@ -1345,13 +1346,14 @@ def publish_json(
             raise FileExistsError(
                 f"refusing to replace existing campaign artifact: {destination}"
             ) from exc
+        source_stat = os.fstat(file_descriptor)
+        published_identity = (source_stat.st_dev, source_stat.st_ino)
         read_descriptor = os.open(
             destination.name,
             os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
             dir_fd=parent_descriptor,
         )
         try:
-            source_stat = os.fstat(file_descriptor)
             before = os.fstat(read_descriptor)
             if (
                 not stat.S_ISREG(before.st_mode)
@@ -1392,6 +1394,20 @@ def publish_json(
         validate(decoded)
         os.fsync(parent_descriptor)
         _require_live_parent(destination, parent_descriptor)
+    except BaseException:
+        if published_identity is not None:
+            try:
+                visible = os.stat(
+                    destination.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (visible.st_dev, visible.st_ino) == published_identity:
+                    os.unlink(destination.name, dir_fd=parent_descriptor)
+                    os.fsync(parent_descriptor)
+            except FileNotFoundError:
+                pass
+        raise
     finally:
         if file_descriptor is not None:
             os.close(file_descriptor)
