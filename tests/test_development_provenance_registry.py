@@ -45,6 +45,12 @@ def test_registry_budget_is_aggregate_not_per_container() -> None:
         provenance.registry_sha256(payload)
 
 
+def test_registry_rejects_large_canonical_payload_after_a_bounded_walk() -> None:
+    payload = ["x" * provenance._MAX_REGISTRY_STRING_BYTES] * 300
+    with pytest.raises(ValueError, match="canonical JSON byte limit"):
+        provenance.registry_sha256(payload)
+
+
 def test_registry_rejects_deep_or_hostile_values_before_hooks_or_dump() -> None:
     nested: object = None
     for _ in range(provenance._MAX_REGISTRY_DEPTH + 1):
