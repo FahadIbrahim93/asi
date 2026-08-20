@@ -1,10 +1,4 @@
-"""Checkpoint array hex is sized from shape/dtype before the host charset walk.
-
-Origin ``_decode_array_value`` / ``_decode_jax_array`` scanned every character of
-``payload_hex`` with a Python ``any(c not in ...)`` test before comparing the
-decoded length to the declared shape. A cheap ``'a' * (2 * 64 MiB)`` scalar
-float32 payload took 3.057s on origin/main.
-"""
+"""Checkpoint payloads are bounded by their declared shape and dtype."""
 
 from __future__ import annotations
 
