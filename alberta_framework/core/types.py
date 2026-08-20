@@ -9,6 +9,7 @@ import math
 import operator
 import time
 from collections.abc import Sequence
+from itertools import islice
 from numbers import Real
 from typing import Any, SupportsIndex, cast
 
@@ -749,6 +750,9 @@ _GVF_SPEC_FIELDS: frozenset[str] = frozenset(
     }
 )
 _HORDE_SPEC_FIELDS: frozenset[str] = frozenset({"demons"})
+# Origin HordeSpec.from_config reconstructed every demon dict before any count
+# bound. A cheap ``[spec] * 400_000`` pointer-repeat took 3.736s on origin/main.
+_MAX_HORDE_DEMONS = 4096
 
 
 def _require_payload(
@@ -880,9 +884,13 @@ class HordeSpec:
     lamdas: Float[Array, " n_demons"]
 
     def __post_init__(self) -> None:
-        """Reject an empty or type-spoofed demon collection."""
+        """Reject an empty, oversized, or type-spoofed demon collection."""
         if type(self.demons) is not tuple or not self.demons:
             raise ValueError("demons must be a nonempty tuple of GVFSpec")
+        if len(self.demons) > _MAX_HORDE_DEMONS:
+            raise ValueError(
+                f"demons must contain at most {_MAX_HORDE_DEMONS} GVFSpec entries"
+            )
         if any(type(demon) is not GVFSpec for demon in self.demons):
             raise ValueError("demons must be a nonempty tuple of GVFSpec")
 
@@ -914,6 +922,10 @@ class HordeSpec:
         raw_demons = payload["demons"]
         if type(raw_demons) is not list:
             raise ValueError("HordeSpec demons must be an exact list")
+        if len(raw_demons) > _MAX_HORDE_DEMONS:
+            raise ValueError(
+                f"demons must contain at most {_MAX_HORDE_DEMONS} GVFSpec entries"
+            )
         demons = [GVFSpec.from_config(d) for d in raw_demons]
         return create_horde_spec(demons)
 
@@ -929,7 +941,18 @@ def create_horde_spec(demons: Sequence[GVFSpec]) -> HordeSpec:
     Returns:
         HordeSpec with pre-computed arrays
     """
-    demons_tuple = tuple(demons)
+    if type(demons) in (list, tuple) and len(demons) > _MAX_HORDE_DEMONS:
+        raise ValueError(
+            f"demons must contain at most {_MAX_HORDE_DEMONS} GVFSpec entries"
+        )
+    if type(demons) in (list, tuple):
+        demons_tuple = tuple(demons)
+    else:
+        demons_tuple = tuple(islice(iter(demons), _MAX_HORDE_DEMONS + 1))
+    if len(demons_tuple) > _MAX_HORDE_DEMONS:
+        raise ValueError(
+            f"demons must contain at most {_MAX_HORDE_DEMONS} GVFSpec entries"
+        )
     if not demons_tuple or any(type(demon) is not GVFSpec for demon in demons_tuple):
         raise ValueError("demons must be a nonempty sequence of GVFSpec")
     gammas = jnp.array([d.gamma for d in demons_tuple], dtype=jnp.float32)

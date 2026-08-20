@@ -32,6 +32,7 @@ DEV_SEEDS = (0, 1, 2, 3, 4)
 MAX_MANIFEST_BYTES = 1 << 20
 MAX_ARCHIVES = 8
 MAX_SAMPLES_PER_BUCKET = 10_000_000
+MAX_METRIC_MATRIX_ROWS = len(BUCKETS)
 MAX_RESULT_BYTES = 1 << 20
 
 
@@ -333,7 +334,11 @@ def qualification_plan(receipt: ClearDatasetReceipt) -> Mapping[str, object]:
 
 
 def _metric_values(matrix: list[list[float]]) -> Mapping[str, float]:
-    rows = len(matrix)
+    if type(matrix) is not list or len(matrix) != MAX_METRIC_MATRIX_ROWS:
+        raise ClearQualificationError("accuracy matrix must be an exact 10x10 list")
+    if any(type(row) is not list or len(row) != len(BUCKETS) for row in matrix):
+        raise ClearQualificationError("accuracy matrix must be an exact 10x10 list")
+    rows = MAX_METRIC_MATRIX_ROWS
     diagonal = [matrix[index][index] for index in range(rows)]
     lower = [matrix[i][j] for i in range(rows) for j in range(i)]
     upper = [matrix[i][j] for i in range(rows) for j in range(i + 1, rows)]

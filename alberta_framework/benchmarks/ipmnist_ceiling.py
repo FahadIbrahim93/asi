@@ -379,7 +379,9 @@ def run_batch_reference(
         raise ValueError(
             f"batch run exceeds the {_MAX_BATCH_UPDATES} optimizer-update bound"
         )
-    import optax  # type: ignore[import-not-found]
+    import importlib
+
+    optax = importlib.import_module("optax")
     from sklearn.datasets import fetch_openml  # type: ignore[import-untyped]
 
     output_dir.mkdir(parents=True, exist_ok=True)

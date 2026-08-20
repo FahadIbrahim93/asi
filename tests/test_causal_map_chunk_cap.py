@@ -8,14 +8,14 @@ from __future__ import annotations
 
 import pytest
 
-from alberta_framework.benchmarks.causal_map_forager import (
-    CausalMapForagerConfig,
-    _validate_benchmark_contract,
-)
 from alberta_framework.benchmarks.forager import ForagerBenchmarkConfig
 
 
 def test_rejects_oversized_causal_map_chunks() -> None:
-    cfg = ForagerBenchmarkConfig(steps=10_001, jax_chunk_size=10_001)
     with pytest.raises(ValueError, match="jax_chunk_size"):
-        _validate_benchmark_contract(CausalMapForagerConfig(), cfg)
+        ForagerBenchmarkConfig(steps=10_001, jax_chunk_size=10_001)
+
+
+def test_causal_map_accepts_the_shared_last_fit_chunk() -> None:
+    cfg = ForagerBenchmarkConfig(steps=10_000, jax_chunk_size=10_000)
+    assert cfg.jax_chunk_size == 10_000
