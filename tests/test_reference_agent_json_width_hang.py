@@ -66,6 +66,24 @@ def test_canonical_config_counts_escaped_string_bytes_before_encoding(
         canonical_config_sha256(payload)
 
 
+def test_canonical_config_counts_del_escape_before_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def encoding_must_not_run(*args: object, **kwargs: object) -> str:
+        raise AssertionError("oversized config reached json.dumps")
+
+    monkeypatch.setattr(json, "dumps", encoding_must_not_run)
+    count = ((_MAX_CONFIG_BYTES - 8) // 6) + 1
+    with pytest.raises(ValueError, match="canonical config exceeds"):
+        canonical_config_sha256({"k": "\x7f" * count})
+
+
+def test_canonical_config_rejects_huge_integer_before_decimal_conversion() -> None:
+    integer = 1 << (((_MAX_CONFIG_BYTES * 10) // 3) + 2)
+    with pytest.raises(ValueError, match="canonical config exceeds"):
+        canonical_config_sha256({"k": integer})
+
+
 def test_canonical_config_preserves_exact_byte_limit_boundary() -> None:
     assert len(canonical_config_sha256({"k": "x" * (_MAX_CONFIG_BYTES - 8)})) == 64
     with pytest.raises(ValueError, match="canonical config exceeds"):
@@ -106,5 +124,5 @@ class _HostileDict(dict[str, object]):
 def test_canonical_config_rejects_hook_bearing_containers_without_dispatch(
     payload: Any,
 ) -> None:
-    with pytest.raises(ValueError, match="canonical JSON value|JSON mapping"):
+    with pytest.raises(ValueError, match="canonical JSON value|exact JSON object"):
         canonical_config_sha256(payload)

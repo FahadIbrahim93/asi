@@ -138,7 +138,7 @@ def _charge_json_string(encoded_bytes: list[int], text: str) -> None:
             size += 2
         elif codepoint < 32:
             size += 6
-        elif codepoint < 128:
+        elif codepoint <= 0x7E:
             size += 1
         elif codepoint <= 0xFFFF:
             size += 6
@@ -176,8 +176,11 @@ def _validate_json_value(
         _charge_json_bytes(_encoded_bytes, 4 if value else 5)
         return nodes
     if value_type is int:
+        integer = cast(int, value)
+        if integer.bit_length() > (_MAX_CONFIG_BYTES * 10) // 3 + 1:
+            raise ValueError(f"canonical config exceeds {_MAX_CONFIG_BYTES} bytes")
         try:
-            _charge_json_bytes(_encoded_bytes, len(str(value)))
+            _charge_json_bytes(_encoded_bytes, len(str(integer)))
         except ValueError as exc:
             raise ValueError(f"{path} must have a finite canonical JSON encoding") from exc
         return nodes
@@ -228,7 +231,7 @@ def _validate_json_value(
 
 def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
     if type(value) is not dict:
-        raise ValueError("config must be a JSON mapping")
+        raise ValueError("config must be an exact JSON object")
     _validate_json_value(value, path="config")
     try:
         encoded = json.dumps(
