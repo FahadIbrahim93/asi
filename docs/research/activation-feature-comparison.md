@@ -119,13 +119,11 @@ directory descriptors, reserves the destination with deterministic `O_EXCL`
 before dataset access or execution, publishes without replacement, fsyncs, and
 strictly rereads and validates the linked file. No retained campaign result exists.
 
-For either stage, plan creation is the only enabled campaign mutation:
-
-```bash
-stage=cheap_screen  # or full_confirmation
-.venv/bin/asi-activation-feature-campaign plan --stage "$stage"
-```
-
-`run-shard` intentionally fails closed. There is no executable shard command
-to copy from this frozen-plan change; independent review and a separate
-authorization transition must precede any dataset load or campaign execution.
+No campaign mutation is enabled by this freeze. `plan`, `run-shard`, and
+`summarize` all fail before output reservation or dataset access while the
+literal authorization gate is false. This is necessary because a plan binds
+this module's exact source bytes: publishing it before the separately reviewed
+authorization transition would make it stale while permanently occupying its
+no-replace namespace. Read-only `validate` remains available for retained
+documents. The authorization transition must precede plan publication, dataset
+load, and campaign execution.

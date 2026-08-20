@@ -1712,6 +1712,8 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI for plan publication, fresh-process shards, and atomic reports."""
     args = _parser().parse_args(argv)
+    if args.command != "validate":
+        _require_execution_authorized()
     if args.command == "plan":
         output = args.output or _namespace_path(args.stage, "plan.json")
         with _reserved_new_output(output) as target:
@@ -1720,7 +1722,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             _publish_reserved_json(target, plan)
         return 0
     if args.command == "run-shard":
-        _require_execution_authorized()
         output = args.output or _namespace_path(
             args.stage, "shards", f"seed-{args.seed}.{args.arm}.json"
         )
