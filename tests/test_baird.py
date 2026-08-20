@@ -271,12 +271,19 @@ class TestRhoZeroInvariance:
         # The canonical per-decision trace z = rho * (...) vanishes.
         chex.assert_trees_all_close(result.state.eligibility_traces, jnp.zeros(N_FEATURES))
 
-    def test_etd_weights_invariant_and_follow_on_resets(self) -> None:
+    def test_etd_weights_invariant_and_follow_on_uses_previous_rho(self) -> None:
+        """A dashed (rho=0) transition must not move the primary weights or
+        contaminate the eligibility trace. But F_t = rho_{t-1} * gamma_t *
+        F_{t-1} + i_t (Sutton, Mahmood & White 2016, eq. 20) only depends on
+        the PRIOR transition's ratio -- it must not collapse just because
+        the CURRENT transition happens to be dashed.
+        """
         learner = ETDLinearLearner(step_size=0.1, trace_decay=0.0)
         state = learner.init(N_FEATURES).replace(
             weights=jnp.asarray(W_INIT),
             bias=jnp.float32(0.5),
             follow_on_trace=jnp.float32(3.0),
+            previous_rho=jnp.float32(RHO_SOLID),
         )
         result = learner.update(
             state,
@@ -288,9 +295,13 @@ class TestRhoZeroInvariance:
         )
         chex.assert_trees_all_equal(result.state.weights, state.weights)
         chex.assert_trees_all_equal(result.state.bias, state.bias)
-        # The follow-on recursion F = rho * gamma * F_prev + i resets to interest.
-        chex.assert_trees_all_close(result.state.follow_on_trace, jnp.float32(1.0))
-        # e = rho * (...) vanishes, so nothing can leak into the next update.
+        # F = previous_rho(=RHO_SOLID) * gamma * F_prev + i -- unaffected by
+        # the current call's dashed (rho=0) transition.
+        expected_follow_on = RHO_SOLID * GAMMA * 3.0 + 1.0
+        chex.assert_trees_all_close(
+            result.state.follow_on_trace, jnp.float32(expected_follow_on)
+        )
+        # e = rho_t * (...) vanishes when the CURRENT transition is dashed.
         chex.assert_trees_all_close(result.state.eligibility_traces, jnp.zeros(N_FEATURES))
 
     def test_gradient_td_primary_weights_invariant(self) -> None:
