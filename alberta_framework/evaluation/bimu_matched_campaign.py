@@ -9,13 +9,14 @@ never contributes to the paired outcome.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import math
 import os
 import secrets
 import stat
-import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -472,6 +473,8 @@ def run_bimu_shard(
     result = run_bimu_development(*arrays, config=config, seed=seed)
     wall_seconds = time.perf_counter() - started_wall
     cpu_seconds = time.process_time() - started_cpu
+    if _dataset_sha256(*arrays) != FROZEN_BIMU_MATCHED_PLAN.dataset_sha256:
+        _fail("campaign dataset changed during shard execution")
     validate_bimu_result(result)
     payload: dict[str, object] = {
         "schema": SHARD_SCHEMA,
@@ -662,6 +665,43 @@ def validate_bimu_shard(value: object) -> dict[str, object]:
         _fail("shard digest drifted")
     if len(_canonical(root)) > MAX_SHARD_BYTES:
         _fail("shard exceeds byte ceiling")
+    return root
+
+
+def validate_bimu_shard_by_reexecution(
+    value: object,
+    train_x: object,
+    train_y: object,
+    test_x: object,
+    test_y: object,
+) -> dict[str, object]:
+    """Reexecute one shard and compare every deterministic result field."""
+
+    root = validate_bimu_shard(value)
+    arrays = _validated_arrays(
+        train_x,
+        train_y,
+        test_x,
+        test_y,
+        plan=FROZEN_BIMU_MATCHED_PLAN,
+    )
+    spec = cast(dict[str, object], root["spec"])
+    config = _arm_config(FROZEN_BIMU_MATCHED_PLAN, cast(str, spec["arm"]))
+    replay = run_bimu_development(
+        *arrays,
+        config=config,
+        seed=cast(int, spec["seed"]),
+    )
+    validate_bimu_result(replay)
+    reported = cast(dict[str, object], root["result"])
+    deterministic_fields = set(replay) - {"timing"}
+    if set(reported) - {"timing"} != deterministic_fields or any(
+        not _json_exact_equal(reported[field], replay[field])
+        for field in deterministic_fields
+    ):
+        _fail("shard result does not match strict seed/arm reexecution")
+    if _dataset_sha256(*arrays) != FROZEN_BIMU_MATCHED_PLAN.dataset_sha256:
+        _fail("campaign dataset changed during strict shard reexecution")
     return root
 
 
@@ -942,6 +982,56 @@ def _allowed_path(path: Path, root: Path) -> bool:
     return path in candidates
 
 
+def _open_output_parent(path: Path) -> tuple[Path, int]:
+    """Create and descriptor-pin an absolute output parent without following links."""
+
+    destination = Path(os.path.abspath(os.fspath(path)))
+    if destination.name in {"", ".", ".."}:
+        _fail("campaign output must name one file")
+    if not all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_TMPFILE")):
+        raise OSError("immutable campaign publication requires Linux descriptor support")
+    descriptor = os.open(os.path.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for component in destination.parent.parts[1:]:
+            if component in {"", ".", ".."}:
+                _fail("campaign output contains an unsafe directory component")
+            try:
+                os.mkdir(component, mode=0o755, dir_fd=descriptor)
+            except FileExistsError:
+                pass
+            next_descriptor = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return destination, descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _link_unnamed_file(file_fd: int, parent_fd: int, name: str) -> None:
+    """Give one fully written anonymous inode its immutable destination name."""
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    linkat = libc.linkat
+    linkat.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    )
+    linkat.restype = ctypes.c_int
+    if linkat(file_fd, b"", parent_fd, os.fsencode(name), 0x1000) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), name)
+        raise OSError(error, os.strerror(error), name)
+
+
 def publish_json(path: Path, value: object, *, root: Path) -> None:
     """Atomically publish one canonical campaign file without replacement."""
 
@@ -956,40 +1046,52 @@ def publish_json(path: Path, value: object, *, root: Path) -> None:
     else:
         validate_bimu_shard(value)
     raw = _canonical(value) + b"\n"
-    root.mkdir(parents=True, exist_ok=True)
-    namespace = root / OUTPUT_NAMESPACE
-    namespace.mkdir(parents=True, exist_ok=True)
-    (namespace / "shards").mkdir(exist_ok=True)
-    for component in (root, *namespace.parents, namespace, path.parent):
-        if component.exists() and component.is_symlink():
-            _fail("campaign publication path contains a symlink")
-    if os.path.lexists(path):
-        raise FileExistsError(f"refusing to replace existing campaign artifact: {path}")
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    temporary = Path(temporary_name)
-    published = False
+    destination, parent_fd = _open_output_parent(path)
+    file_fd: int | None = None
     try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.link(temporary, path, follow_symlinks=False)
-        published = True
-        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        namespace = Path(os.path.abspath(os.fspath(root / OUTPUT_NAMESPACE)))
+        if destination.parent == namespace:
+            try:
+                os.mkdir("shards", mode=0o755, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            shards_fd = os.open(
+                "shards",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
+            )
+            os.close(shards_fd)
         try:
-            os.fsync(directory_descriptor)
-        finally:
-            os.close(directory_descriptor)
-    except BaseException:
-        if published:
-            path.unlink(missing_ok=True)
-        raise
+            os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(
+                f"refusing to replace existing campaign artifact: {destination}"
+            )
+        file_fd = os.open(
+            ".",
+            os.O_WRONLY | os.O_CLOEXEC | os.O_TMPFILE,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        view = memoryview(raw)
+        written = 0
+        while written < len(view):
+            written += os.write(file_fd, view[written:])
+        os.fsync(file_fd)
+        os.fchmod(file_fd, 0o444)
+        try:
+            _link_unnamed_file(file_fd, parent_fd, destination.name)
+        except FileExistsError as error:
+            raise FileExistsError(
+                f"refusing to replace existing campaign artifact: {destination}"
+            ) from error
+        os.fsync(parent_fd)
     finally:
-        temporary.unlink(missing_ok=True)
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(parent_fd)
 
 
 def _load_plan(root: Path) -> dict[str, object]:
@@ -1029,16 +1131,24 @@ def _validate_namespace(
         _fail("campaign shard namespace contains an unexpected entry")
 
 
-def _load_shards(root: Path) -> list[dict[str, object]]:
+def _load_shards(
+    root: Path,
+    arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None,
+) -> list[dict[str, object]]:
     return [
-        validate_bimu_shard(
-            load_json_strict(
-                campaign_path(root, "shard", arm=arm, seed=seed),
-                byte_ceiling=MAX_SHARD_BYTES,
-            )
+        (
+            validate_bimu_shard(loaded)
+            if arrays is None
+            else validate_bimu_shard_by_reexecution(loaded, *arrays)
         )
         for seed in FROZEN_BIMU_MATCHED_PLAN.seeds
         for arm in _ARMS
+        for loaded in (
+            load_json_strict(
+                campaign_path(root, "shard", arm=arm, seed=seed),
+                byte_ceiling=MAX_SHARD_BYTES,
+            ),
+        )
     ]
 
 
@@ -1054,6 +1164,8 @@ def _parser() -> argparse.ArgumentParser:
     for name in ("plan", "summarize", "validate"):
         command = subparsers.add_parser(name)
         command.add_argument("--root", type=Path, required=True)
+        if name in {"summarize", "validate"}:
+            command.add_argument("--data-home", type=Path)
     shard = subparsers.add_parser("run-shard")
     shard.add_argument("--root", type=Path, required=True)
     shard.add_argument("--arm", choices=_ARMS, required=True)
@@ -1105,7 +1217,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             require_aggregate=False,
         )
         _load_plan(root)
-        aggregate = summarize_bimu_shards(_load_shards(root))
+        arrays = load_frozen_bimu_dataset(args.data_home)
+        aggregate = summarize_bimu_shards(_load_shards(root, arrays))
         destination = campaign_path(root, "aggregate")
         publish_json(destination, aggregate, root=root)
         _print_json(cast(dict[str, object], aggregate["outcome"]))
@@ -1131,7 +1244,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "aggregate": None,
         }
         if any_shards:
-            shards = _load_shards(root)
+            arrays = load_frozen_bimu_dataset(args.data_home)
+            shards = _load_shards(root, arrays)
             result["shards"] = [shard["shard_sha256"] for shard in shards]
         if aggregate_path.exists():
             aggregate = validate_bimu_aggregate(

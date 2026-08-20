@@ -191,6 +191,20 @@ def test_shard_validator_rejects_forged_nested_receipts_and_hostile_trees(
         campaign.validate_plan_document(plan)
 
 
+def test_strict_shard_validator_reexecutes_final_state(tiny_campaign: Any) -> None:
+    arrays = _slice_data()
+    shard = campaign.run_bimu_shard("bimu", 157002)
+    assert campaign.validate_bimu_shard_by_reexecution(shard, *arrays) == shard
+
+    forged = copy.deepcopy(shard)
+    forged["result"]["final_state_sha256"] = "0" * 64
+    forged["result"]["resources"]["state_changed"] = True
+    _resign(forged)
+    assert campaign.validate_bimu_shard(forged) == forged
+    with pytest.raises(ValueError, match="reexecution"):
+        campaign.validate_bimu_shard_by_reexecution(forged, *arrays)
+
+
 def _six_shards() -> list[dict[str, Any]]:
     return [
         campaign.run_bimu_shard(arm, seed)
@@ -268,6 +282,23 @@ def test_fixed_namespace_publication_is_append_only(
     (plan_path.parent / "unexpected.json").write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError, match="unexpected"):
         campaign.main(["validate", "--root", str(tmp_path)])
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_publication_is_read_only_and_rejects_symlinked_parent(tmp_path: Path) -> None:
+    plan_path = campaign.campaign_path(tmp_path, "plan")
+    campaign.publish_json(plan_path, campaign.build_plan_document(), root=tmp_path)
+    assert plan_path.stat().st_mode & 0o777 == 0o444
+    assert plan_path.stat().st_nlink == 1
+
+    redirected = tmp_path / "redirected"
+    redirected.mkdir()
+    linked_root = tmp_path / "linked-root"
+    linked_root.symlink_to(redirected, target_is_directory=True)
+    linked_path = campaign.campaign_path(linked_root, "plan")
+    with pytest.raises(OSError):
+        campaign.publish_json(linked_path, campaign.build_plan_document(), root=linked_root)
+    assert not campaign.campaign_path(redirected, "plan").exists()
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign file validation is Linux-only")
