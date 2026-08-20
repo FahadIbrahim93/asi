@@ -46,6 +46,7 @@ FROZEN_MATCHED_DEVELOPMENT_SEEDS = (9156001, 9156002, 9156003, 9156004)
 _ALLOWED_SEED_SCHEDULES = frozenset(
     {FROZEN_DEVELOPMENT_SEEDS, FROZEN_MATCHED_DEVELOPMENT_SEEDS}
 )
+_MATCHED_EXECUTION_CAPABILITY = object()
 _MAX_DATASET_BYTES = 256 * 1024 * 1024
 _HEX = frozenset("0123456789abcdef")
 _MAX_RECEIPT_NODES = 100_000
@@ -191,13 +192,37 @@ def _arm_payload(
 def run_adamo_diagnostic(
     inputs: np.ndarray, labels: np.ndarray, *, profile: str, seed: int,
 ) -> dict[str, object]:
-    """Run the public diagnostic with the already-consumed qualification schedule."""
+    """Run only the consumed contract-smoke qualification surface."""
+    if type(profile) is not str or profile != "contract-smoke":
+        raise ValueError("public AdamO diagnostics are restricted to contract-smoke")
     return _run_adamo_diagnostic_schedule(
         inputs,
         labels,
         profile=profile,
         seed=seed,
         seed_schedule=FROZEN_DEVELOPMENT_SEEDS,
+    )
+
+
+def _run_matched_adamo_diagnostic(
+    inputs: np.ndarray,
+    labels: np.ndarray,
+    *,
+    profile: str,
+    seed: int,
+    capability: object,
+) -> dict[str, object]:
+    """Private matched executor reachable only after the aggregate authorization gate."""
+    if capability is not _MATCHED_EXECUTION_CAPABILITY:
+        raise RuntimeError("matched AdamO execution capability is unavailable")
+    if type(profile) is not str or profile != "bounded-development":
+        raise ValueError("matched AdamO execution requires bounded-development")
+    return _run_adamo_diagnostic_schedule(
+        inputs,
+        labels,
+        profile=profile,
+        seed=seed,
+        seed_schedule=FROZEN_MATCHED_DEVELOPMENT_SEEDS,
     )
 
 
@@ -209,7 +234,7 @@ def _run_adamo_diagnostic_schedule(
     seed: int,
     seed_schedule: tuple[int, ...],
 ) -> dict[str, object]:
-    """Run all four matched arms under one exact registered seed schedule."""
+    """Run all four matched arms through the current IPMNIST screening runner."""
     if type(profile) is not str or profile not in PROFILES:
         raise ValueError("profile must name one registered AdamO diagnostic profile")
     if (
@@ -655,7 +680,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--catalog", action="store_true")
     parser.add_argument("--dataset", type=Path)
-    parser.add_argument("--profile", choices=tuple(PROFILES), default="contract-smoke")
+    parser.add_argument("--profile", choices=("contract-smoke",), default="contract-smoke")
     parser.add_argument("--seed", type=int)
     args = parser.parse_args(argv)
     if args.catalog:
@@ -663,10 +688,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("--catalog and --dataset are mutually exclusive")
         print(json.dumps({
             "schema": SCHEMA, "paper_revision": ADAMO_PAPER_REVISION,
-            "official_code": None, "profiles": {name: asdict(value.config)
-                                                   for name, value in PROFILES.items()},
+            "official_code": None,
+            "profiles": {"contract-smoke": asdict(PROFILES["contract-smoke"].config)},
             "arms": list(ARMS), "frozen_development_seeds": list(FROZEN_DEVELOPMENT_SEEDS),
-            "frozen_matched_development_seeds": list(FROZEN_MATCHED_DEVELOPMENT_SEEDS),
             "development_only": True, "negative_outcomes_retained": True,
             "scientific_promotion_allowed": False,
         }, sort_keys=True))

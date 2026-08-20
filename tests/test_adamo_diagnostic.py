@@ -116,7 +116,7 @@ def test_contract_and_matched_seed_schedules_are_disjoint(
             profile="contract-smoke",
             seed=FROZEN_MATCHED_DEVELOPMENT_SEEDS[0],
         )
-    with pytest.raises(ValueError, match="selected frozen"):
+    with pytest.raises(ValueError, match="contract-smoke"):
         run_adamo_diagnostic(
             *tiny_data,
             profile="bounded-development",
@@ -162,6 +162,27 @@ def test_public_cli_cannot_consume_reserved_matched_seed_before_loading(
                 "--profile", "bounded-development",
                 "--seed", str(FROZEN_MATCHED_DEVELOPMENT_SEEDS[0]),
             ]
+        )
+    assert calls == 0
+
+
+def test_private_matched_executor_requires_exact_capability_before_run(
+    tiny_data: tuple[np.ndarray, np.ndarray], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def forbidden_run(*args: object, **kwargs: object) -> Never:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("unauthorized private execution must not start")
+
+    monkeypatch.setattr(diagnostic, "run_screening_config", forbidden_run)
+    with pytest.raises(RuntimeError, match="capability"):
+        diagnostic._run_matched_adamo_diagnostic(
+            *tiny_data,
+            profile="bounded-development",
+            seed=FROZEN_MATCHED_DEVELOPMENT_SEEDS[0],
+            capability=object(),
         )
     assert calls == 0
 

@@ -152,6 +152,7 @@ def test_atomic_publication_refuses_overwrite(
 
 
 def test_execution_gate_is_closed_until_plan_review() -> None:
+    assert not hasattr(matched, "run_adamo_diagnostic")
     with pytest.raises(RuntimeError, match="not authorized"):
         matched.run_campaign(Path("unused.npz"), Path("unused.json"))
 

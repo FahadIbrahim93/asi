@@ -18,13 +18,14 @@ from pathlib import Path
 from typing import Any, Final, cast
 
 from alberta_framework.benchmarks.adamo_diagnostic import (
+    _MATCHED_EXECUTION_CAPABILITY,
     ARMS,
     COMPARISON_ID,
     FROZEN_MATCHED_DEVELOPMENT_SEEDS,
     OFFICIAL_CODE,
     OFFICIAL_CODE_SEARCH_DATE,
     PAPER_URL,
-    _run_adamo_diagnostic_schedule,
+    _run_matched_adamo_diagnostic,
     validate_adamo_diagnostic,
 )
 from alberta_framework.benchmarks.ipmnist_screening import (
@@ -728,8 +729,12 @@ def run_campaign(
         inputs, labels = load_mnist_train(data_home)
         dataset_before = _screening_dataset_provenance(inputs, labels)
         receipts = [
-            _run_adamo_diagnostic_schedule(
-                inputs, labels, profile=PROFILE, seed=seed, seed_schedule=SEEDS
+            _run_matched_adamo_diagnostic(
+                inputs,
+                labels,
+                profile=PROFILE,
+                seed=seed,
+                capability=_MATCHED_EXECUTION_CAPABILITY,
             )
             for seed in SEEDS
         ]
