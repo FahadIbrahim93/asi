@@ -24,7 +24,7 @@ import math
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -95,6 +95,10 @@ CONDITION_NAMES = (
 EARLY_WINDOW_STEPS = 200
 TAIL_WINDOW_STEPS = 500
 ASYMPTOTIC_WINDOW_STEPS = 1_500
+# Host-provided pair collections share the repository's 4,096-item traversal
+# ceiling. This leaves more than 45x headroom over the frozen 91-pair candidate
+# archive and more than 170x over each 24-pair active bank.
+_MAX_INTEGER_PAIRS = 4096
 
 FROZEN_STREAM_CONFIGURATION: dict[str, int | float] = {
     "relevant_dim": 8,
@@ -226,20 +230,54 @@ def _finite_float(value: object, *, name: str) -> float:
     return nonnegative_finite_real(name, value)
 
 
+def _bounded_pair_sequence_length(
+    value: object,
+    *,
+    name: str,
+    allow_list: bool = False,
+) -> int:
+    """Return a pair-sequence length after rejecting oversized host collections."""
+
+    value_type = type(value)
+    if value_type is not tuple and (not allow_list or value_type is not list):
+        kind = "tuple or list" if allow_list else "tuple"
+        raise TypeError(f"{name} must be an exact {kind}")
+    count = len(cast(tuple[object, ...] | list[object], value))
+    if count > _MAX_INTEGER_PAIRS:
+        raise ValueError(f"{name} exceeds the {_MAX_INTEGER_PAIRS}-pair limit")
+    return count
+
+
 def _integer_pairs(
-    value: object, *, name: str
+    value: object, *, name: str, allow_list: bool = False
 ) -> tuple[tuple[int, int], ...]:
-    if type(value) is not tuple:
-        raise TypeError(f"{name} must be an exact tuple")
+    _bounded_pair_sequence_length(value, name=name, allow_list=allow_list)
     pairs: list[tuple[int, int]] = []
-    for index, pair in enumerate(value):
-        if type(pair) is not tuple or len(pair) != 2:
+    sequence = cast(tuple[object, ...] | list[object], value)
+    for index, pair in enumerate(sequence):
+        if type(pair) is not tuple or tuple.__len__(pair) != 2:
             raise ValueError(f"{name}[{index}] must be an exact integer pair")
         left, right = pair
         if type(left) is not int or type(right) is not int:
             raise ValueError(f"{name}[{index}] must contain integers")
         pairs.append((left, right))
     return tuple(pairs)
+
+
+def _pair_counter_dimensions(*, relevant_dim: object, input_dim: object) -> tuple[int, int]:
+    """Admit exact nonnegative dimensions before pair comparisons."""
+
+    if type(relevant_dim) is not int:
+        raise TypeError("relevant_dim must be an exact int")
+    if type(input_dim) is not int:
+        raise TypeError("input_dim must be an exact int")
+    normalized_relevant_dim = relevant_dim
+    normalized_input_dim = input_dim
+    if normalized_relevant_dim < 0:
+        raise ValueError("relevant_dim must be nonnegative")
+    if normalized_input_dim < normalized_relevant_dim:
+        raise ValueError("input_dim must be at least relevant_dim")
+    return normalized_relevant_dim, normalized_input_dim
 
 
 def _resource_accounting_map(value: object) -> dict[str, dict[str, int | bool]]:
@@ -496,30 +534,38 @@ def make_condition_learner(condition: str) -> FixedBudgetInteractionLearner:
 
 
 def count_relevant_context_pairs(
-    pairs: Sequence[tuple[int, int]],
+    pairs: tuple[tuple[int, int], ...] | list[tuple[int, int]],
     *,
     relevant_dim: int = 8,
     input_dim: int = 12,
 ) -> int:
     """Count unique canonical context products over relevant input channels."""
 
+    relevant_dim, input_dim = _pair_counter_dimensions(
+        relevant_dim=relevant_dim, input_dim=input_dim
+    )
+    normalized_pairs = _integer_pairs(pairs, name="pairs", allow_list=True)
     relevant_pairs = {
         (min(left, right), max(left, right))
-        for left, right in pairs
+        for left, right in normalized_pairs
         if ((left >= input_dim) ^ (right >= input_dim)) and min(left, right) < relevant_dim
     }
     return len(relevant_pairs)
 
 
 def count_relevant_context_pairs_by_task(
-    pairs: Sequence[tuple[int, int]],
+    pairs: tuple[tuple[int, int], ...] | list[tuple[int, int]],
     *,
     relevant_dim: int = 8,
     input_dim: int = 12,
 ) -> tuple[int, int]:
     """Count unique relevant products for the supplied C and D cues separately."""
 
-    canonical_pairs = {(min(left, right), max(left, right)) for left, right in pairs}
+    relevant_dim, input_dim = _pair_counter_dimensions(
+        relevant_dim=relevant_dim, input_dim=input_dim
+    )
+    normalized_pairs = _integer_pairs(pairs, name="pairs", allow_list=True)
+    canonical_pairs = {(min(left, right), max(left, right)) for left, right in normalized_pairs}
     counts = tuple(
         sum(
             1
