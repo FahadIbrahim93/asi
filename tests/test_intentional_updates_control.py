@@ -7,8 +7,14 @@ from pathlib import Path
 from typing import Never
 
 import pytest
+import numpy as np
 
 from alberta_framework.benchmarks import intentional_updates_control as lane
+from alberta_framework.benchmarks.ipmnist_screening import (
+    ScreeningRunResult,
+    intentional_updates_development_record,
+    screening_spec,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -118,6 +124,88 @@ def test_validator_rejects_resource_result_identity_and_policy_forgery() -> None
 def test_campaign_execution_is_closed_before_independent_review() -> None:
     with pytest.raises(RuntimeError, match="not authorized"):
         lane.run_campaign(Path("unused.npz"), Path("unused.json"))
+
+
+def _synthetic_supervised_records() -> list[dict[str, object]]:
+    records = []
+    for seed in lane.SEEDS:
+        for arm, offset in (
+            ("intentional_updates_off", 0.0),
+            ("intentional_updates_ipmnist", 0.01),
+        ):
+            spec = screening_spec(arm)
+            result = ScreeningRunResult(
+                config_name=arm,
+                base_learner=spec.base_learner,
+                hyperparameters=spec.hyperparameters,
+                seed=seed,
+                config=lane.SUPERVISED_CONFIG,
+                per_task_accuracy=np.full(8, 0.5 + offset, dtype=np.float64),
+                per_task_loss=np.full(8, 0.7 - offset, dtype=np.float64),
+                per_task_plasticity=np.full(8, 0.4 + offset, dtype=np.float64),
+                wall_clock_seconds=0.125,
+            )
+            records.append(intentional_updates_development_record(result))
+    return records
+
+
+@pytest.fixture(scope="module")
+def complete_records() -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    supervised = _synthetic_supervised_records()
+    control = [
+        lane.run_control_shard(arm, seed=seed)
+        for seed in lane.SEEDS
+        for arm in lane.CONTROL_ARMS
+    ]
+    return supervised, control
+
+
+def test_report_recomputes_all_four_bonferroni_paired_questions(
+    complete_records: tuple[list[dict[str, object]], list[dict[str, object]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lane, "_current_source", lambda: {"git_commit": "c" * 40})
+    monkeypatch.setattr(lane, "_current_runtime", lambda: {"backend": "cpu"})
+    report = lane.build_report(
+        *complete_records,
+        dataset_file_sha256=lane.DATASET_FILE_SHA256,
+        dataset_semantic_sha256=lane.DATASET_SEMANTIC_SHA256,
+        execution_source_commit="c" * 40,
+    )
+    assert set(report["paired_comparisons"]) == {
+        "supervised_ipmnist", "td0", "trace", "q_lambda"
+    }
+    assert all(
+        item["outcome"] in {"supported", "rejected", "inconclusive"}
+        for item in report["paired_comparisons"].values()
+    )
+    assert lane.validate_report(report, require_current_source=True) == report
+
+
+def test_report_rejects_missing_shard_arithmetic_and_promotion(
+    complete_records: tuple[list[dict[str, object]], list[dict[str, object]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lane, "_current_source", lambda: {"git_commit": "c" * 40})
+    monkeypatch.setattr(lane, "_current_runtime", lambda: {"backend": "cpu"})
+    report = lane.build_report(
+        *complete_records,
+        dataset_file_sha256=lane.DATASET_FILE_SHA256,
+        dataset_semantic_sha256=lane.DATASET_SEMANTIC_SHA256,
+        execution_source_commit="c" * 40,
+    )
+    missing = copy.deepcopy(report)
+    missing["runs"][0]["control"].pop()
+    with pytest.raises(ValueError, match="complete"):
+        lane.validate_report(missing, require_current_source=True)
+    forged = copy.deepcopy(report)
+    forged["paired_comparisons"]["td0"]["mean_delta"] = 9.0
+    with pytest.raises(ValueError, match="paired arithmetic"):
+        lane.validate_report(forged, require_current_source=True)
+    promoting = copy.deepcopy(report)
+    promoting["policy"]["scientific_promotion_allowed"] = True
+    with pytest.raises(ValueError, match="nonpromoting"):
+        lane.validate_report(promoting, require_current_source=True)
 
 
 @pytest.mark.parametrize(
