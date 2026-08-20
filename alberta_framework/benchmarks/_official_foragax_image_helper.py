@@ -41,6 +41,12 @@ SOURCE_ROOT = Path("/opt/continual-foragax-agents")
 RUNTIME_ROOT = Path("/opt/alberta-runtime")
 ATTESTATION_ROOT = Path("/opt/alberta-attestations")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_MAX_RUNTIME_PROBE_BYTES = 4 * 1024 * 1024
+_MAX_RUNTIME_PACKAGES = 4096
+_MAX_RUNTIME_PACKAGE_TEXT_BYTES = 4 * 1024 * 1024
+_MAX_RUNTIME_RECORD_TEXT_BYTES = 16 * 1024 * 1024
+_MAX_RUNTIME_DIRECT_URL_BYTES = 64 * 1024
+_MAX_JSON_DEPTH = 64
 
 
 def _require_exact_str(name: object, value: object) -> str:
@@ -106,7 +112,7 @@ def _strict_json(path: Path) -> dict[str, Any]:
             ),
             parse_float=parse_float,
         )
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise ImageHelperError(f"{path} is not strict JSON") from exc
     if type(value) is not dict:
         raise ImageHelperError(f"{path} must contain a JSON object")
@@ -498,19 +504,44 @@ def _runtime_probe(python: Path) -> dict[str, Any]:
     hashes), the ffmpeg identity, and the interpreter identity consumed by
     :func:`finalize_image`.
     """
-    script = r"""
+    script = (
+        f"MAX_PACKAGES = {_MAX_RUNTIME_PACKAGES}\n"
+        f"MAX_PACKAGE_TEXT_BYTES = {_MAX_RUNTIME_PACKAGE_TEXT_BYTES}\n"
+        f"MAX_RECORD_TEXT_BYTES = {_MAX_RUNTIME_RECORD_TEXT_BYTES}\n"
+        f"MAX_DIRECT_URL_BYTES = {_MAX_RUNTIME_DIRECT_URL_BYTES}\n"
+        + r"""
 import hashlib, importlib.metadata, json, os, re, stat, sys
 from pathlib import Path
 root = Path(sys.prefix).resolve()
 packages = []
+package_text_bytes = 0
+record_text_bytes = 0
 for distribution in importlib.metadata.distributions():
     name = distribution.metadata.get("Name")
+    if name is None:
+        continue
+    version = distribution.version
+    if type(name) is not str or type(version) is not str:
+        raise RuntimeError("runtime package identity must use exact strings")
     if not name:
         continue
+    package_text_bytes += len(name.encode("utf-8")) + len(version.encode("utf-8"))
+    if len(packages) >= MAX_PACKAGES or package_text_bytes > MAX_PACKAGE_TEXT_BYTES:
+        raise RuntimeError("runtime package inventory exceeds its resource limit")
     direct_url = distribution.read_text("direct_url.json")
+    if direct_url is not None and type(direct_url) is not str:
+        raise RuntimeError("runtime package direct_url.json must be an exact string")
+    if direct_url and len(direct_url.encode("utf-8")) > MAX_DIRECT_URL_BYTES:
+        raise RuntimeError("runtime package direct_url.json exceeds the byte limit")
     if direct_url and ("file:" in direct_url or "/input/" in direct_url or "/build/" in direct_url):
         raise RuntimeError(f"distribution {name} exposes a build path")
     record = distribution.read_text("RECORD")
+    if record is not None:
+        if type(record) is not str:
+            raise RuntimeError("runtime package RECORD must be an exact string")
+        record_text_bytes += len(record.encode("utf-8"))
+        if record_text_bytes > MAX_RECORD_TEXT_BYTES:
+            raise RuntimeError("runtime package RECORD inventory exceeds its resource limit")
     packages.append({
         "SPDXID": "SPDXRef-Package-" + re.sub(r"[^A-Za-z0-9.-]", "-", name),
         "checksums": [] if record is None else [{
@@ -521,7 +552,7 @@ for distribution in importlib.metadata.distributions():
         "filesAnalyzed": False,
         "licenseConcluded": "NOASSERTION",
         "name": name,
-        "versionInfo": distribution.version,
+        "versionInfo": version,
     })
 packages.sort(key=lambda item: (item["name"].casefold(), item["versionInfo"]))
 if any(
@@ -557,6 +588,7 @@ payload = {
 }
 print(json.dumps(payload, allow_nan=False, separators=(",", ":"), sort_keys=True))
 """
+    )
     completed = subprocess.run(
         (str(python), "-I", "-B", "-c", script),
         check=False,
@@ -576,12 +608,62 @@ print(json.dumps(payload, allow_nan=False, separators=(",", ":"), sort_keys=True
         raise ImageHelperError(
             "runtime package probe failed: " + completed.stderr.strip()
         )
+    if type(completed.stdout) is not str:
+        raise ImageHelperError("runtime package probe returned non-text output")
+    if len(completed.stdout.encode("utf-8")) > _MAX_RUNTIME_PROBE_BYTES:
+        raise ImageHelperError("runtime package probe exceeds its byte ceiling")
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in completed.stdout:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+        elif character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > _MAX_JSON_DEPTH:
+                raise ImageHelperError("runtime package probe exceeds its nesting ceiling")
+        elif character in "]}":
+            depth -= 1
+
+    def probe_pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in items:
+            if key in result:
+                raise ImageHelperError("runtime package probe repeats a JSON key")
+            result[key] = item
+        return result
+
+    def probe_float(value: str) -> float:
+        parsed = float(value)
+        if not math.isfinite(parsed):
+            raise ImageHelperError("runtime package probe contains a non-finite JSON number")
+        return parsed
+
     try:
-        value = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
+        value = json.loads(
+            completed.stdout,
+            object_pairs_hook=probe_pairs,
+            parse_constant=lambda _: (_ for _ in ()).throw(
+                ImageHelperError("runtime package probe contains a non-finite JSON constant")
+            ),
+            parse_float=probe_float,
+        )
+    except ImageHelperError:
+        raise
+    except (json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise ImageHelperError("runtime package probe returned invalid JSON") from exc
     if type(value) is not dict:
         raise ImageHelperError("runtime package probe returned a non-object")
+    packages = value.get("packages")
+    if type(packages) is not list or len(packages) > _MAX_RUNTIME_PACKAGES:
+        raise ImageHelperError("runtime package probe exceeds its package ceiling")
     return value
 
 

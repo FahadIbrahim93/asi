@@ -97,6 +97,12 @@ OFFICIAL_FORAGAX_ENDORSEMENT_DESCRIPTOR_SHA256 = (
     "2620a972dc5a253deaf06cfe9b9a103fd4367d24432817772284dd73eb6843bf"
 )
 OFFICIAL_FORAGAX_MAX_SEED = (1 << 32) - 1
+_MAX_DIRECT_URL_BYTES = 64 * 1024
+_MAX_PACKAGE_FREEZE_PACKAGES = 4096
+_MAX_PACKAGE_FREEZE_TEXT_BYTES = 4 * 1024 * 1024
+_MAX_STRICT_JSON_BYTES = 8 * 1024 * 1024
+_MAX_EXECUTION_PROBE_BYTES = _MAX_STRICT_JSON_BYTES
+_MAX_STRICT_JSON_DEPTH = 64
 OFFICIAL_FORAGAX_OCI_LAUNCHER_CONTRACT = "oci-read-only-stdout-tar-v4"
 OFFICIAL_FORAGAX_MATCHED_RUNTIME_CLASS = (
     "matched_current_foragax_0_55_cuda12"
@@ -214,6 +220,10 @@ OFFICIAL_FORAGAX_RESULTS_DB_COLUMNS = (
 
 class OfficialForagaxValidationError(ValueError):
     """Raised when provenance or artifact verification fails closed."""
+
+
+class _NonFiniteJsonError(OfficialForagaxValidationError):
+    """Distinguish non-finite input from redacted malformed metadata."""
 
 
 def _require_string(value: Any, *, label: str) -> str:
@@ -1325,41 +1335,75 @@ def _strict_json_loads(
     *,
     label: str,
 ) -> Any:
-    """Decode JSON while rejecting duplicate keys and non-finite constants."""
+    """Decode bounded-depth JSON while rejecting duplicate/non-finite values."""
+
+    if type(value) is bytes:
+        if len(value) > _MAX_STRICT_JSON_BYTES:
+            raise OfficialForagaxValidationError(f"{label} exceeds JSON byte ceiling")
+        try:
+            text = value.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise OfficialForagaxValidationError(f"{label} is not strict JSON") from exc
+    elif type(value) is str:
+        text = value
+        try:
+            byte_size = len(text.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise OfficialForagaxValidationError(f"{label} is not strict JSON") from exc
+        if byte_size > _MAX_STRICT_JSON_BYTES:
+            raise OfficialForagaxValidationError(f"{label} exceeds JSON byte ceiling")
+    else:
+        raise OfficialForagaxValidationError(f"{label} must be exact JSON text")
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+        elif character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > _MAX_STRICT_JSON_DEPTH:
+                raise OfficialForagaxValidationError(f"{label} exceeds JSON nesting ceiling")
+        elif character in "]}":
+            depth -= 1
 
     def object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, item in pairs:
             if key in result:
                 raise OfficialForagaxValidationError(
-                    f"{label} contains duplicate object key {key!r}"
+                    f"{label} contains duplicate object key"
                 )
             result[key] = item
         return result
 
     def reject_constant(constant: str) -> Any:
-        raise OfficialForagaxValidationError(
-            f"{label} contains non-finite JSON constant {constant}"
-        )
+        del constant
+        raise _NonFiniteJsonError(f"{label} contains non-finite JSON constant")
 
     def parse_float(value: str) -> float:
         parsed = float(value)
         if not math.isfinite(parsed):
-            raise OfficialForagaxValidationError(
-                f"{label} contains non-finite JSON number {value}"
-            )
+            raise _NonFiniteJsonError(f"{label} contains non-finite JSON number")
         return parsed
 
     try:
         return json.loads(
-            value,
+            text,
             object_pairs_hook=object_pairs,
             parse_constant=reject_constant,
             parse_float=parse_float,
         )
     except OfficialForagaxValidationError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError) as exc:
         raise OfficialForagaxValidationError(f"{label} is not strict JSON") from exc
 
 
@@ -3688,12 +3732,26 @@ def _validate_oci_scientific_package_inventory(
 
 
 def _sanitize_package_freeze_line(line: str) -> str:
+    if type(line) is not str:
+        raise OfficialForagaxValidationError("package freeze line must be an exact string")
+    try:
+        line_bytes = len(line.encode("utf-8"))
+    except UnicodeEncodeError as exc:
+        raise OfficialForagaxValidationError("package freeze line is not UTF-8 text") from exc
+    if line_bytes > _MAX_DIRECT_URL_BYTES:
+        raise OfficialForagaxValidationError("package freeze line exceeds its byte ceiling")
     prefix, separator, direct_url_text = line.partition(" ; direct_url=")
     if not separator:
         return line
     try:
-        direct_url = json.loads(direct_url_text)
-    except json.JSONDecodeError:
+        direct_url = _strict_json_loads(direct_url_text, label="package freeze direct_url")
+    except _NonFiniteJsonError as exc:
+        raise OfficialForagaxValidationError(
+            "package freeze direct_url is not finite JSON"
+        ) from exc
+    except OfficialForagaxValidationError as exc:
+        if "duplicate object key" in str(exc):
+            raise
         return prefix + " ; direct_url=<REDACTED>"
     if isinstance(direct_url, dict):
         url = direct_url.get("url")
@@ -3716,6 +3774,8 @@ def _sanitize_package_freeze_line(line: str) -> str:
 
 
 def _extract_probe_payload(stdout: bytes) -> Mapping[str, Any]:
+    if type(stdout) is not bytes or len(stdout) > _MAX_EXECUTION_PROBE_BYTES:
+        raise OfficialForagaxValidationError("official execution probe exceeds its byte ceiling")
     for line in reversed(stdout.decode(errors="replace").splitlines()):
         if line.startswith(_PROBE_PREFIX):
             payload = _strict_json_loads(
@@ -4086,6 +4146,71 @@ sys.stdout.write({_PROBE_PREFIX!r} + json.dumps(payload, sort_keys=True, allow_n
     return _extract_probe_payload(result.stdout)
 
 
+_STRICT_DIRECT_URL_HELPER_SOURCE = r'''\
+_MAX_DIRECT_URL_BYTES = 65536
+
+class _RedactedDirectUrl(ValueError):
+    pass
+
+class _DuplicateDirectUrlKey(ValueError):
+    pass
+
+def _direct_url_pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise _DuplicateDirectUrlKey("direct_url.json contains a duplicate key")
+        result[key] = value
+    return result
+
+def _direct_url_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("direct_url.json contains a non-finite number")
+    return parsed
+
+def _strict_direct_url_loads(value):
+    if type(value) is not str:
+        raise _RedactedDirectUrl("direct_url.json must be exact text")
+    try:
+        encoded = value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise _RedactedDirectUrl("direct_url.json is not UTF-8") from exc
+    if len(encoded) > _MAX_DIRECT_URL_BYTES:
+        raise _RedactedDirectUrl("direct_url.json exceeds the byte limit")
+    depth = 0
+    in_string = False
+    escaped = False
+    for character in value:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                in_string = False
+        elif character == '"':
+            in_string = True
+        elif character in "[{":
+            depth += 1
+            if depth > 64:
+                raise _RedactedDirectUrl("direct_url.json is too deeply nested")
+        elif character in "]}":
+            depth -= 1
+    try:
+        return json.loads(
+            encoded,
+            object_pairs_hook=_direct_url_pairs,
+            parse_constant=lambda token: (_ for _ in ()).throw(
+                ValueError("direct_url.json contains a non-finite constant")
+            ),
+            parse_float=_direct_url_float,
+        )
+    except RecursionError as exc:
+        raise _RedactedDirectUrl("direct_url.json is too deeply nested") from exc
+'''
+
+
 def _probe_runtime(
     *,
     repository: Path,
@@ -4250,6 +4375,7 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import math
 import os
 import platform
 import re
@@ -4261,15 +4387,17 @@ from pathlib import Path
 import jax
 import numpy
 
+{_STRICT_DIRECT_URL_HELPER_SOURCE}
+
 distribution_name = "continual-foragax"
 distribution = importlib.metadata.distribution(distribution_name)
 direct_url_text = distribution.read_text("direct_url.json")
 direct_url = None
 if direct_url_text:
     try:
-        direct_url = json.loads(direct_url_text)
-    except json.JSONDecodeError:
-        direct_url = {{"unparsed": direct_url_text.strip()}}
+        direct_url = _strict_direct_url_loads(direct_url_text)
+    except (json.JSONDecodeError, _RedactedDirectUrl, RecursionError):
+        direct_url = {{"unparsed": "<REDACTED>"}}
 
 spec = importlib.util.find_spec("foragax")
 locations = spec.submodule_search_locations if spec is not None else None
@@ -5263,25 +5391,41 @@ def _package_freeze(
 ) -> tuple[str, ...]:
     script = f"""
 import json
+import math
 import sys
 from importlib.metadata import distributions
 
+{_STRICT_DIRECT_URL_HELPER_SOURCE}
+
 packages = []
+package_text_bytes = 0
 for distribution in distributions():
-    name = distribution.metadata.get("Name") or "UNKNOWN"
-    line = f"{{name}}=={{distribution.version}}"
+    if len(packages) >= {_MAX_PACKAGE_FREEZE_PACKAGES}:
+        raise RuntimeError("package freeze exceeds its package ceiling")
+    name = distribution.metadata.get("Name")
+    if name is None:
+        name = "UNKNOWN"
+    version = distribution.version
+    if type(name) is not str or type(version) is not str:
+        raise RuntimeError("package freeze identity must use exact strings")
+    line = f"{{name}}=={{version}}"
     direct_url = distribution.read_text("direct_url.json")
+    if direct_url is not None and type(direct_url) is not str:
+        raise RuntimeError("direct_url.json must be an exact string")
     if direct_url:
         try:
             direct_url = json.dumps(
-                json.loads(direct_url),
+                _strict_direct_url_loads(direct_url),
                 sort_keys=True,
                 separators=(",", ":"),
                 allow_nan=False,
             )
-        except (json.JSONDecodeError, TypeError, ValueError):
-            direct_url = direct_url.strip()
+        except (json.JSONDecodeError, _RedactedDirectUrl, RecursionError):
+            direct_url = "<REDACTED>"
         line += f" ; direct_url={{direct_url}}"
+    package_text_bytes += len(line.encode("utf-8"))
+    if package_text_bytes > {_MAX_PACKAGE_FREEZE_TEXT_BYTES}:
+        raise RuntimeError("package freeze exceeds its byte ceiling")
     packages.append(line)
 sys.stdout.write(
     {_PROBE_PREFIX!r}
@@ -5299,13 +5443,24 @@ sys.stdout.write(
     )
     payload = _extract_probe_payload(result.stdout)
     packages = payload.get("packages")
-    if not isinstance(packages, list) or not all(
-        type(item) is str and item for item in packages
-    ):
+    if type(packages) is not list or len(packages) > _MAX_PACKAGE_FREEZE_PACKAGES:
         raise OfficialForagaxValidationError(
             "supplied interpreter returned an invalid package freeze"
         )
-    return tuple(sorted(_sanitize_package_freeze_line(line) for line in packages))
+    total_bytes = 0
+    checked_packages: list[str] = []
+    for item in packages:
+        if type(item) is not str or not item:
+            raise OfficialForagaxValidationError(
+                "supplied interpreter returned an invalid package freeze"
+            )
+        total_bytes += len(item.encode("utf-8"))
+        if total_bytes > _MAX_PACKAGE_FREEZE_TEXT_BYTES:
+            raise OfficialForagaxValidationError(
+                "supplied interpreter package freeze exceeds its byte ceiling"
+            )
+        checked_packages.append(item)
+    return tuple(sorted(_sanitize_package_freeze_line(line) for line in checked_packages))
 
 
 def _claim(
