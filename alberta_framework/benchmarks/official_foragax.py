@@ -3692,9 +3692,18 @@ def _sanitize_package_freeze_line(line: str) -> str:
     if not separator:
         return line
     try:
-        direct_url = json.loads(direct_url_text)
-    except json.JSONDecodeError:
-        return prefix + " ; direct_url=<REDACTED>"
+        direct_url = _strict_json_loads(
+            direct_url_text,
+            label="package freeze direct_url",
+        )
+    except OfficialForagaxValidationError as exc:
+        if isinstance(exc.__cause__, json.JSONDecodeError):
+            return prefix + " ; direct_url=<REDACTED>"
+        if "duplicate object key" in str(exc):
+            raise
+        raise OfficialForagaxValidationError(
+            "package freeze direct_url is not finite JSON"
+        ) from exc
     if isinstance(direct_url, dict):
         url = direct_url.get("url")
         if isinstance(url, str):
@@ -4086,6 +4095,36 @@ sys.stdout.write({_PROBE_PREFIX!r} + json.dumps(payload, sort_keys=True, allow_n
     return _extract_probe_payload(result.stdout)
 
 
+_STRICT_DIRECT_URL_HELPER_SOURCE = r'''\
+class _DuplicateDirectUrlKey(ValueError):
+    pass
+
+def _direct_url_pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise _DuplicateDirectUrlKey("direct_url.json contains a duplicate key")
+        result[key] = value
+    return result
+
+def _direct_url_float(value):
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError("direct_url.json contains a non-finite number")
+    return parsed
+
+def _strict_direct_url_loads(value):
+    return json.loads(
+        value,
+        object_pairs_hook=_direct_url_pairs,
+        parse_constant=lambda token: (_ for _ in ()).throw(
+            ValueError("direct_url.json contains a non-finite constant")
+        ),
+        parse_float=_direct_url_float,
+    )
+'''
+
+
 def _probe_runtime(
     *,
     repository: Path,
@@ -4250,6 +4289,7 @@ import hashlib
 import importlib.metadata
 import importlib.util
 import json
+import math
 import os
 import platform
 import re
@@ -4261,13 +4301,15 @@ from pathlib import Path
 import jax
 import numpy
 
+{_STRICT_DIRECT_URL_HELPER_SOURCE}
+
 distribution_name = "continual-foragax"
 distribution = importlib.metadata.distribution(distribution_name)
 direct_url_text = distribution.read_text("direct_url.json")
 direct_url = None
 if direct_url_text:
     try:
-        direct_url = json.loads(direct_url_text)
+        direct_url = _strict_direct_url_loads(direct_url_text)
     except json.JSONDecodeError:
         direct_url = {{"unparsed": direct_url_text.strip()}}
 

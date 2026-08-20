@@ -80,13 +80,15 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _strict_json(path: Path) -> dict[str, Any]:
+def _strict_json_text(value: str | bytes, *, label: str) -> dict[str, Any]:
+    """Decode one strict JSON object from a trusted bounded producer."""
+
     def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
         for key, value in items:
             host_key = _require_exact_str("key", key)
             if host_key in result:
-                raise ImageHelperError(f"{path} repeats JSON key")
+                raise ImageHelperError(f"{label} repeats JSON key")
             result[host_key] = value
         return result
 
@@ -94,23 +96,31 @@ def _strict_json(path: Path) -> dict[str, Any]:
         host_value = _require_exact_str("value", value)
         parsed = float(host_value)
         if not math.isfinite(parsed):
-            raise ImageHelperError(f"{path} contains non-finite JSON number")
+            raise ImageHelperError(f"{label} contains non-finite JSON number")
         return parsed
 
     try:
-        value = json.loads(
-            path.read_bytes(),
+        parsed = json.loads(
+            value,
             object_pairs_hook=pairs,
             parse_constant=lambda value: (_ for _ in ()).throw(
-                ImageHelperError(f"{path} contains JSON constant")
+                ImageHelperError(f"{label} contains JSON constant")
             ),
             parse_float=parse_float,
         )
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ImageHelperError(f"{label} is not strict JSON") from exc
+    if type(parsed) is not dict:
+        raise ImageHelperError(f"{label} must contain a JSON object")
+    return parsed
+
+
+def _strict_json(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
         raise ImageHelperError(f"{path} is not strict JSON") from exc
-    if type(value) is not dict:
-        raise ImageHelperError(f"{path} must contain a JSON object")
-    return value
+    return _strict_json_text(raw, label=str(path))
 
 
 def _safe_relative(value: str, *, label: str) -> PurePosixPath:
@@ -576,13 +586,7 @@ print(json.dumps(payload, allow_nan=False, separators=(",", ":"), sort_keys=True
         raise ImageHelperError(
             "runtime package probe failed: " + completed.stderr.strip()
         )
-    try:
-        value = json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise ImageHelperError("runtime package probe returned invalid JSON") from exc
-    if type(value) is not dict:
-        raise ImageHelperError("runtime package probe returned a non-object")
-    return value
+    return _strict_json_text(completed.stdout, label="runtime package probe")
 
 
 def _write(path: Path, value: Any) -> None:
