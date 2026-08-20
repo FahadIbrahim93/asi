@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import replace
 
 import pytest
@@ -170,6 +171,50 @@ def test_decision_revalidates_and_cross_binds_memory_budget() -> None:
     )
     with pytest.raises(ValueError, match="capacities must match"):
         mismatched.decision()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        (
+            lambda result: object.__setattr__(
+                result.retained.seeds[0].phase_evidence[0], "task", "B"
+            ),
+            "phase evidence must match",
+        ),
+        (
+            lambda result: object.__setattr__(
+                result.retained.seeds[0].task_recovery[0], "recurrence_steps", ()
+            ),
+            "task recovery must summarize",
+        ),
+        (
+            lambda result: object.__setattr__(
+                result.retained.seeds[0], "active_pairs", ((0, 1), (0, 1), (0, 2))
+            ),
+            "active pairs must be unique members",
+        ),
+    ),
+)
+def test_decision_cross_binds_seed_evidence_to_protocol(
+    mutation: Callable[[RecurringFeatureGateResult], None],
+    message: str,
+) -> None:
+    result = _decision_result()
+    mutation(result)
+
+    with pytest.raises(ValueError, match=message):
+        result.decision()
+
+
+def test_decision_rejects_duplicate_seed_identities() -> None:
+    result = _decision_result()
+    duplicate = result.retained.seeds[0]
+    object.__setattr__(result.retained, "seeds", (duplicate, duplicate))
+    object.__setattr__(result.no_retention, "seeds", (duplicate, duplicate))
+
+    with pytest.raises(ValueError, match="seed identities must be unique"):
+        result.decision()
 
 
 def test_decision_preflights_forged_nested_lengths_before_snapshot() -> None:

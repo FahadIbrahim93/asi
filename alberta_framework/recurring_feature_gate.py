@@ -716,6 +716,59 @@ def _validated_variant_evidence(value: object) -> RecurringFeatureVariantEvidenc
     )
 
 
+def _validate_seed_cross_fields(
+    variant: RecurringFeatureVariantEvidence,
+    protocol: RecurringFeatureProtocol,
+) -> None:
+    """Bind nested evidence identities to the frozen stream and pair universe."""
+    seed_ids = tuple(seed.seed for seed in variant.seeds)
+    if len(set(seed_ids)) != len(seed_ids):
+        raise ValueError(f"{variant.name} seed identities must be unique")
+
+    expected_pairs = {
+        (left, right)
+        for left in range(protocol.feature_dim)
+        for right in range(left + 1, protocol.feature_dim)
+    }
+    occurrences: dict[TaskName, int] = {task: 0 for task in TASK_NAMES}
+    expected_phases: list[tuple[int, TaskName, int]] = []
+    for phase_index, task in enumerate(PHASE_TASKS):
+        occurrences[task] += 1
+        expected_phases.append((phase_index, task, occurrences[task]))
+    expected_phase_tuple = tuple(expected_phases)
+
+    for seed in variant.seeds:
+        actual_phases = tuple(
+            (phase.phase_index, phase.task, phase.occurrence) for phase in seed.phase_evidence
+        )
+        if actual_phases != expected_phase_tuple:
+            raise ValueError(
+                f"{variant.name} seed {seed.seed} phase evidence must match the frozen stream"
+            )
+
+        expected_recoveries = []
+        for task in TASK_NAMES:
+            recoveries = tuple(
+                phase.recovery_steps for phase in seed.phase_evidence if phase.task == task
+            )
+            expected_recoveries.append((task, recoveries[0], recoveries[1:]))
+        actual_recoveries = tuple(
+            (recovery.task, recovery.acquisition_steps, recovery.recurrence_steps)
+            for recovery in seed.task_recovery
+        )
+        if actual_recoveries != tuple(expected_recoveries):
+            raise ValueError(
+                f"{variant.name} seed {seed.seed} task recovery must summarize phase evidence"
+            )
+
+        active_pairs = set(seed.active_pairs)
+        if len(active_pairs) != len(seed.active_pairs) or not active_pairs <= expected_pairs:
+            raise ValueError(
+                f"{variant.name} seed {seed.seed} active pairs must be unique members "
+                "of the protocol pair universe"
+            )
+
+
 def _validated_gate_result(value: object) -> RecurringFeatureGateResult:
     """Return a recursively validated snapshot before any evidence is consumed."""
     if type(value) is not RecurringFeatureGateResult:
@@ -735,13 +788,16 @@ def _validated_gate_result(value: object) -> RecurringFeatureGateResult:
     )
     if budget != expected_budget:
         raise ValueError("memory_budget capacities must match the protocol")
-    return RecurringFeatureGateResult(
+    checked = RecurringFeatureGateResult(
         protocol=protocol,
         memory_budget=budget,
         retained=_validated_variant_evidence(value.retained),
         no_retention=_validated_variant_evidence(value.no_retention),
         scope=value.scope,
     )
+    _validate_seed_cross_fields(checked.retained, protocol)
+    _validate_seed_cross_fields(checked.no_retention, protocol)
+    return checked
 
 
 def _validated_gate_criteria(value: object) -> RecurringFeatureGateCriteria:
