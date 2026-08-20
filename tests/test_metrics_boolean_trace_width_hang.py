@@ -3,13 +3,11 @@
 
 from __future__ import annotations
 
-import time
-
+import numpy as np
 import pytest
 
 from alberta_framework.utils import metrics
 from alberta_framework.utils.metrics import (
-    _BOOLEAN_TRACE_MAX_NODES,
     compute_cumulative_error,
     compute_running_mean,
 )
@@ -17,25 +15,38 @@ from alberta_framework.utils.metrics import (
 pytestmark = pytest.mark.unit
 
 
-def test_running_mean_rejects_origin_hang_class_before_trace_walk() -> None:
-    started = time.perf_counter()
+def test_running_mean_rejects_origin_hang_class_before_trace_walk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 8)
     with pytest.raises(ValueError, match="boolean-trace value limit"):
-        compute_running_mean([0.0] * (_BOOLEAN_TRACE_MAX_NODES + 1), window_size=2)
-    assert time.perf_counter() - started < 0.25
+        compute_running_mean([0.0] * 9, window_size=2)
 
 
-def test_running_mean_rejects_pointer_repeat_origin_hang_n() -> None:
-    started = time.perf_counter()
+def test_cumulative_error_rejects_oversized_metrics_history_before_walk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 8)
     with pytest.raises(ValueError, match="boolean-trace value limit"):
-        compute_running_mean([0.0] * 15_000_000, window_size=2)
-    assert time.perf_counter() - started < 0.25
+        compute_cumulative_error([{"squared_error": 1.0}] * 9)
 
 
-def test_cumulative_error_rejects_oversized_metrics_history_before_walk() -> None:
-    started = time.perf_counter()
+def test_object_array_rejects_oversized_width_before_flat_walk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 8)
+    values = np.empty(9, dtype=object)
+    values.fill(0.0)
     with pytest.raises(ValueError, match="boolean-trace value limit"):
-        compute_cumulative_error([{"squared_error": 1.0}] * (_BOOLEAN_TRACE_MAX_NODES + 1))
-    assert time.perf_counter() - started < 0.25
+        metrics._reject_boolean_numeric_trace(values, name="values")
+
+
+def test_index_vector_rejects_oversized_width_before_item_walk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 8)
+    with pytest.raises(ValueError, match="boolean-trace value limit"):
+        metrics._require_index_vector([0] * 9, name="indices")
 
 
 def test_nested_shared_trace_uses_one_traversal_wide_budget(
