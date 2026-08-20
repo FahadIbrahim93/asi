@@ -26,6 +26,7 @@ Calibration (measured on this machine, scripts in the session scratchpad):
   superset always and strictness on >= 50 draws.
 """
 
+import sys
 import warnings
 from typing import Any
 
@@ -131,6 +132,19 @@ class TestComputeStatistics:
             warnings.simplefilter("error")
             with pytest.raises(ValueError, match="confidence_level.*strictly between 0 and 1"):
                 compute_statistics([4.2], confidence_level=confidence_level)
+
+    def test_missing_scipy_raises_instead_of_silently_wrong_ci(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Without scipy, compute_statistics must fail loudly (matching
+        ttest_comparison/mann_whitney_comparison/wilcoxon_comparison's own
+        established convention in this file), not silently substitute the
+        99% z-quantile for every confidence_level != 0.95.
+        """
+        monkeypatch.setitem(sys.modules, "scipy", None)
+        monkeypatch.setitem(sys.modules, "scipy.stats", None)
+        with pytest.raises(ImportError, match="scipy is required for compute_statistics"):
+            compute_statistics([1.0, 2.0, 3.0, 4.0, 5.0], confidence_level=0.90)
 
 
 class TestSampleVectorContract:
@@ -411,6 +425,21 @@ class TestTimeseriesStatistics:
             warnings.simplefilter("error")
             with pytest.raises(ValueError, match="confidence_level.*strictly between 0 and 1"):
                 compute_timeseries_statistics(arr, confidence_level=confidence_level)
+
+    def test_missing_scipy_raises_instead_of_silently_wrong_ci(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Same contract as compute_statistics: without scipy this must fail
+        loudly rather than silently substitute the 99% z-quantile for every
+        confidence_level != 0.95.
+        """
+        monkeypatch.setitem(sys.modules, "scipy", None)
+        monkeypatch.setitem(sys.modules, "scipy.stats", None)
+        arr = np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float64)
+        with pytest.raises(
+            ImportError, match="scipy is required for compute_timeseries_statistics"
+        ):
+            compute_timeseries_statistics(arr, confidence_level=0.90)
 
 
 class TestBootstrapCI:
