@@ -206,6 +206,14 @@ def test_coom_receipt_validator_rejects_hostile_provider_payloads(
     with pytest.raises(FileExistsError, match="refusing to overwrite"):
         smoke.write_new_receipt(retained, receipt)
 
+    stalled = tmp_path / "stalled.json"
+    real_write = smoke.os.write
+    monkeypatch.setattr(smoke.os, "write", lambda *_args: 0)
+    with pytest.raises(OSError, match="made no progress"):
+        smoke.write_new_receipt(stalled, receipt)
+    assert not stalled.exists()
+    monkeypatch.setattr(smoke.os, "write", real_write)
+
     duplicate = tmp_path / "duplicate.json"
     encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
     duplicate.write_text(encoded[:-1] + ',"schema":"duplicate"}', encoding="utf-8")
@@ -262,6 +270,19 @@ def test_coom_retained_receipt_loader_is_bounded_and_fail_closed(tmp_path: Path)
 
     receipt.write_text("NaN", encoding="utf-8")
     with pytest.raises(ValueError, match="non-finite"):
+        smoke.load_receipt(receipt)
+
+    receipt.write_text('{"truncated":', encoding="utf-8")
+    with pytest.raises(ValueError, match="bounded valid JSON"):
+        smoke.load_receipt(receipt)
+
+    deeply_nested = '{"nested":' + "[" * 10_000 + "0" + "]" * 10_000 + "}"
+    receipt.write_text(deeply_nested, encoding="utf-8")
+    with pytest.raises(ValueError, match="bounded valid JSON"):
+        smoke.load_receipt(receipt)
+
+    receipt.write_bytes(b'{"invalid":"\xff"}')
+    with pytest.raises(ValueError, match="UTF-8"):
         smoke.load_receipt(receipt)
 
     target = tmp_path / "target.json"

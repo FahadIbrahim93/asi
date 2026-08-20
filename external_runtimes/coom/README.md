@@ -23,14 +23,14 @@ Build and execute from this directory:
 
 ```bash
 docker build --tag asi-coom-qualification:development .
-docker run --rm asi-coom-qualification:development > receipt.json
-docker run --rm asi-coom-qualification:development > receipt.second.json
-mkdir -p receipts
-docker run --rm -v "$PWD/receipts:/output" asi-coom-qualification:development \
+receipt_dir="$(mktemp -d /tmp/asi-coom-receipts.XXXXXX)"
+docker run --rm -v "$receipt_dir:/output" asi-coom-qualification:development \
   --output /output/receipt.json
-docker run --rm -v "$PWD/receipts:/input:ro" asi-coom-qualification:development \
+docker run --rm -v "$receipt_dir:/input:ro" asi-coom-qualification:development \
   --validate-receipt /input/receipt.json
 ```
+
+The host receipt directory above is explicitly outside the source checkout.
 
 Compare `trace_sha256`, not the telemetry-only elapsed time or platform string.
 The smoke consumes seed 1582000, all eight official CO8 tasks, and two action-0

@@ -311,11 +311,14 @@ def load_receipt(path: Path) -> dict[str, object]:
         text = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError("receipt input must be UTF-8") from exc
-    value = json.loads(
-        text,
-        object_pairs_hook=_json_pairs,
-        parse_constant=_reject_constant,
-    )
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=_json_pairs,
+            parse_constant=_reject_constant,
+        )
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError("receipt input must be bounded valid JSON") from exc
     if type(value) is not dict:
         raise ValueError("receipt input must be an exact JSON object")
     return value
@@ -407,7 +410,10 @@ def write_new_receipt(path: Path, receipt: dict[str, object]) -> Path:
         view = memoryview(encoded)
         written = 0
         while written < len(view):
-            written += os.write(file_fd, view[written:])
+            progress = os.write(file_fd, view[written:])
+            if progress <= 0:
+                raise OSError("receipt output write made no progress")
+            written += progress
         os.fsync(file_fd)
         os.fchmod(file_fd, 0o444)
         try:
