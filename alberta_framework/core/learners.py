@@ -32,6 +32,7 @@ import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float
 
+from alberta_framework._scan_resources import ScanBudget, require_scan_steps, require_step_units
 from alberta_framework.core._float32_scalars import (
     validated_float32_scalar,
     validated_float32_scalar_with_ratio,
@@ -89,6 +90,12 @@ _MAX_RESOURCE_BYTES = 256 * 1024 * 1024
 _LEARNING_LOOP_MAX_STEPS = 10_000
 _LEARNING_LOOP_MAX_SEEDS = 30
 _LEARNING_LOOP_MAX_SEED_STEPS = _LEARNING_LOOP_MAX_SEEDS * _LEARNING_LOOP_MAX_STEPS
+_LEARNING_LOOP_BUDGET = ScanBudget(
+    "learning-loop",
+    maximum_steps=_LEARNING_LOOP_MAX_STEPS,
+    maximum_parallel=_LEARNING_LOOP_MAX_SEEDS,
+    maximum_step_units=_LEARNING_LOOP_MAX_SEED_STEPS,
+)
 _FLOAT32_HALF_MIN_SUBNORMAL_DENOMINATOR = 1 << 150
 _MLP_CONFIG_FIELDS = frozenset(
     {
@@ -135,9 +142,7 @@ def _require_int32(name: str, value: object, *, minimum: int) -> int:
 
 
 def _require_learning_loop_steps(name: str, value: object) -> int:
-    if type(value) is not int or value < 1 or value > _LEARNING_LOOP_MAX_STEPS:
-        raise ValueError(f"{name} must be an integer in [1, {_LEARNING_LOOP_MAX_STEPS}]")
-    return value
+    return require_scan_steps(name, value, _LEARNING_LOOP_BUDGET)
 
 
 def _require_learning_loop_keys(keys: object) -> int:
@@ -154,11 +159,13 @@ def _require_learning_loop_keys(keys: object) -> int:
 
 
 def _require_learning_loop_seed_steps(num_steps: int, num_seeds: int) -> None:
-    if num_seeds * num_steps > _LEARNING_LOOP_MAX_SEED_STEPS:
+    try:
+        require_step_units(num_steps, num_seeds, _LEARNING_LOOP_BUDGET)
+    except ValueError:
         raise ValueError(
             "learning-loop seed-steps exceed the documented protocol budget "
             f"({_LEARNING_LOOP_MAX_SEED_STEPS})"
-        )
+        ) from None
 
 
 def _require_hidden_sizes(hidden_sizes: object) -> tuple[int, ...]:

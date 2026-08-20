@@ -49,6 +49,12 @@ import numpy as np
 from jax import Array
 from jaxtyping import Float
 
+from alberta_framework._scan_resources import (
+    ScanBudget,
+    require_jax_leading_length,
+    require_matching_jax_leading_length,
+    require_scan_steps,
+)
 from alberta_framework.core._float32_scalars import (
     validated_float32_scalar_with_ratio,
 )
@@ -71,6 +77,7 @@ _INT32_MAX = 2**31 - 1
 # Public last-fit in tests is 5_000 array steps / 50 stream steps. Origin handed
 # ``10**12`` to ``jnp.arange`` with no reject — hang/OOM, not an INT32 leftover.
 _UPGD_LOOP_MAX_STEPS = 10_000
+_UPGD_LOOP_BUDGET = ScanBudget("UPGD learning-loop", _UPGD_LOOP_MAX_STEPS)
 _ACTUAL_INT_TYPES: frozenset[type] = frozenset(
     {
         int,
@@ -107,24 +114,26 @@ def _require_int(name: str, value: object, *, minimum: int, maximum: int = _INT3
 
 def _require_upgd_loop_steps(name: str, value: object) -> int:
     """Reject scan lengths above the public last-fit before ``jnp.arange``."""
-    if type(value) is not int or value < 1 or value > _UPGD_LOOP_MAX_STEPS:
-        raise ValueError(f"{name} must be an integer in [1, {_UPGD_LOOP_MAX_STEPS}]")
-    return value
+    return require_scan_steps(name, value, _UPGD_LOOP_BUDGET)
 
 
 def _require_upgd_array_steps(observations: object, targets: object) -> int:
     """Reject pre-collected scan lengths above the public last-fit before scan."""
     if not isinstance(observations, jax.Array) or not isinstance(targets, jax.Array):
         raise TypeError("observations and targets must be JAX arrays")
-    if observations.ndim != 2 or targets.ndim != 2:
-        raise ValueError("observations and targets must be rank-2")
-    num_steps = observations.shape[0]
-    if type(num_steps) is not int or num_steps < 1 or num_steps > _UPGD_LOOP_MAX_STEPS:
-        raise ValueError(
-            f"observations num_steps must be an integer in [1, {_UPGD_LOOP_MAX_STEPS}]"
+    try:
+        num_steps = require_jax_leading_length(
+            "observations", observations, _UPGD_LOOP_BUDGET, ranks=(2,)
         )
-    if targets.shape[0] != num_steps:
-        raise ValueError("observations and targets must share num_steps")
+    except ValueError as error:
+        if observations.ndim == 2 and not 1 <= observations.shape[0] <= _UPGD_LOOP_MAX_STEPS:
+            raise ValueError(
+                "observations num_steps must be an integer in "
+                f"[1, {_UPGD_LOOP_MAX_STEPS}]"
+            ) from None
+        raise error
+    require_jax_leading_length("targets", targets, _UPGD_LOOP_BUDGET, ranks=(2,))
+    require_matching_jax_leading_length("targets", targets, expected=num_steps)
     return num_steps
 
 
