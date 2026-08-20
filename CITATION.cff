@@ -8,7 +8,7 @@ authors:
   - family-names: Lawson
     given-names: Keith
   - name: "elizaOS research contributors"
-repository-code: "https://github.com/elizaOS/asi"
+repository-code: "https://github.com/SlopDotCash/asi"
 license: Apache-2.0
 version: "0.29.0"
 date-released: "2026-08-14"

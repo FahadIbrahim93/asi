@@ -62,9 +62,9 @@ def test_release_repository_and_runtime_floors_are_explicit() -> None:
         "editables==0.6",
     ]
     assert project["urls"] == {
-        "Homepage": "https://github.com/elizaOS/asi",
-        "Repository": "https://github.com/elizaOS/asi",
-        "Issues": "https://github.com/elizaOS/asi/issues",
+        "Homepage": "https://github.com/SlopDotCash/asi",
+        "Repository": "https://github.com/SlopDotCash/asi",
+        "Issues": "https://github.com/SlopDotCash/asi/issues",
         "Upstream": "https://github.com/lalalune/alberta",
     }
     assert _citation_scalar("repository-code") == project["urls"]["Repository"]
@@ -100,7 +100,7 @@ def test_readme_does_not_claim_the_external_pypi_distribution() -> None:
     readme = (_ROOT / "README.md").read_text(encoding="utf-8")
 
     assert "pip install alberta-framework" not in readme
-    assert "git clone https://github.com/elizaOS/asi.git" in readme
+    assert "git clone https://github.com/SlopDotCash/asi.git" in readme
     assert "existing `alberta-framework` project on PyPI is a different distribution" in readme
 
 

@@ -70,9 +70,9 @@ gpu = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/elizaOS/asi"
-Repository = "https://github.com/elizaOS/asi"
-Issues = "https://github.com/elizaOS/asi/issues"
+Homepage = "https://github.com/SlopDotCash/asi"
+Repository = "https://github.com/SlopDotCash/asi"
+Issues = "https://github.com/SlopDotCash/asi/issues"
 Upstream = "https://github.com/lalalune/alberta"
 
 [project.scripts]

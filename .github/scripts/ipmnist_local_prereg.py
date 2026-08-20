@@ -32,7 +32,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Final, cast
 
-AUTHORIZED_REPOSITORY: Final = "elizaOS/asi"
+AUTHORIZED_REPOSITORY: Final = "SlopDotCash/asi"
 AUTHORIZED_LOGIN: Final = "lalalune"
 AUTHORIZED_USER_ID: Final = 18_633_264
 AUTHORIZED_ASSOCIATION: Final = "MEMBER"
