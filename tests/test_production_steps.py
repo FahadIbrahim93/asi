@@ -83,6 +83,64 @@ def test_step1_kernel_all_public_optimizers_smoke(optimizer: str) -> None:
     assert result.metrics_shape == (12, 4)
 
 
+@pytest.mark.parametrize(
+    "normalizer",
+    ["none", "ema", "welford", "streaming_batch"],
+)
+def test_step1_kernel_all_public_normalizers_smoke(normalizer: str) -> None:
+    """Every documented Step1NormalizerName must actually run end to end.
+
+    Before this test, ``run_step1_smoke``/``make_step1_normalizer`` were only
+    ever exercised with ``normalizer in {"none", "ema"}``; "welford" and
+    "streaming_batch" were touched by config-construction and JSON
+    round-trip tests but never actually driven through the smoke loop. Mirrors
+    ``test_step1_kernel_all_public_optimizers_smoke`` above.
+    """
+    config = Step1KernelConfig(
+        optimizer="autostep",
+        normalizer=normalizer,  # type: ignore[arg-type]
+        feature_dim=8,
+        num_relevant=3,
+        noise_std=0.1,
+    )
+    result = run_step1_smoke(config, steps=12, final_window=3)
+    assert result.finite
+    expected_columns = 3 if normalizer == "none" else 4
+    assert result.metrics_shape == (12, expected_columns)
+
+
+@pytest.mark.parametrize(
+    ("normalizer", "field", "value"),
+    [
+        ("ema", "ema_decay", 0.0),
+        ("ema", "ema_decay", 1.0),
+        ("streaming_batch", "streaming_batch_momentum", 0.0),
+        ("streaming_batch", "streaming_batch_momentum", 1.0),
+    ],
+)
+def test_step1_normalizer_boundary_hyperparameters_stay_finite_when_selected(
+    normalizer: str, field: str, value: float
+) -> None:
+    """Boundary decay/momentum values must stay finite for the normalizer they configure.
+
+    ``test_step1_fields_preserve_legal_endpoints`` already exercises these
+    same 0.0/1.0 endpoints for ``ema_decay``/``streaming_batch_momentum``, but
+    only while ``normalizer`` is left at its unrelated default ("ema" or
+    "none"), so the boundary value is never actually consumed by the
+    normalizer it configures. This runs the smoke loop with the matching
+    normalizer selected.
+    """
+    config = Step1KernelConfig(
+        optimizer="autostep",
+        normalizer=normalizer,  # type: ignore[arg-type]
+        feature_dim=6,
+        num_relevant=2,
+        **{field: value},
+    )
+    result = run_step1_smoke(config, steps=10, final_window=3)
+    assert result.finite
+
+
 def test_step1_kernel_rejects_unpublished_auto_alias() -> None:
     with pytest.raises(ValueError, match="optimizer"):
         Step1KernelConfig(optimizer="auto")  # type: ignore[arg-type]
