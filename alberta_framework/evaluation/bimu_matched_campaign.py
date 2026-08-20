@@ -1364,14 +1364,14 @@ def publish_json(
             written += count
         os.fsync(file_descriptor)
         os.fchmod(file_descriptor, 0o444)
+        source_stat = os.fstat(file_descriptor)
+        published_identity = (source_stat.st_dev, source_stat.st_ino)
         try:
             _link_unnamed_file(file_descriptor, parent_descriptor, destination.name)
         except FileExistsError as exc:
             raise FileExistsError(
                 f"refusing to replace existing campaign artifact: {destination}"
             ) from exc
-        source_stat = os.fstat(file_descriptor)
-        published_identity = (source_stat.st_dev, source_stat.st_ino)
         read_descriptor = os.open(
             destination.name,
             os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,

@@ -670,6 +670,25 @@ def test_publication_revalidation_failure_removes_published_inode(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_post_link_failure_removes_prearmed_published_inode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_campaign: Any
+) -> None:
+    plan_path = campaign.campaign_path(tmp_path, "plan")
+    document = campaign.build_plan_document()
+    original_link = campaign._link_unnamed_file
+
+    def link_then_fail(file_descriptor: int, parent_descriptor: int, name: str) -> None:
+        original_link(file_descriptor, parent_descriptor, name)
+        raise OSError("simulated post-link publication failure")
+
+    monkeypatch.setattr(campaign, "_link_unnamed_file", link_then_fail)
+    with pytest.raises(OSError, match="post-link publication failure"):
+        campaign.publish_json(plan_path, document, root=tmp_path)
+    assert not plan_path.exists()
+    assert not plan_path.with_name(".plan.json.reservation").exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
 def test_post_link_replacement_is_not_removed_on_validation_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_campaign: Any
 ) -> None:
