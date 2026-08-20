@@ -511,15 +511,37 @@ def test_cli_reserves_exact_shard_before_execution(
     )
 
 
-def test_cli_rejects_relocated_root_before_namespace_access(
+def test_cli_allows_disposable_plan_preview_but_rejects_relocated_shard(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     registered = tmp_path / "registered"
-    relocated = tmp_path / "relocated"
+    preview = tmp_path / "preview"
+    published: list[tuple[Path, Path]] = []
+
+    def capture_plan(path: Path, value: object, *, root: Path, **kwargs: object) -> None:
+        assert campaign.validate_plan_document(value) == value
+        published.append((path, root))
+
     monkeypatch.setattr(campaign, "REGISTERED_OUTPUT_ROOT", registered)
+    monkeypatch.setattr(campaign, "publish_json", capture_plan)
+
+    assert campaign.main(["plan", "--root", str(preview)]) == 0
+    assert published == [(campaign.campaign_path(preview, "plan"), preview)]
+
+    monkeypatch.setattr(campaign, "EXECUTION_AUTHORIZED", True)
     with pytest.raises(ValueError, match="registered repository root"):
-        campaign.main(["validate", "--root", str(relocated)])
-    assert not relocated.exists()
+        campaign.main(
+            [
+                "run-shard",
+                "--root",
+                str(preview),
+                "--arm",
+                "memory_off",
+                "--seed",
+                "157001",
+            ]
+        )
+    assert len(published) == 1
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
