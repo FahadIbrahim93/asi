@@ -13,6 +13,7 @@ import os
 import platform
 import stat
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Final, cast
 
@@ -31,6 +32,7 @@ from alberta_framework.benchmarks.upgd_ipmnist import (
     build_schedule,
     default_openml_data_home,
     init_mlp_params,
+    load_mnist_train,
 )
 from alberta_framework.evaluation.bounded_elastic_ipmnist_nonpromoting import (
     bounded_elastic_resource_expectations,
@@ -52,9 +54,9 @@ _POLICY: Final = {
     "scientific_promotion_allowed": False,
     "sota_claim_allowed": False,
     "completed_outcomes_retained_in_result": True,
-    "atomic_execution_and_publication": False,
-    "execution_failure_receipts_retained": False,
-    "post_start_retry_prevention": False,
+    "atomic_execution_and_publication": True,
+    "execution_failure_receipts_retained": True,
+    "post_start_retry_prevention": True,
 }
 _MAX_STEPS: Final = 2_000_000
 _MAX_PERSISTENT_BYTES: Final = 256 * 1024 * 1024
@@ -122,9 +124,9 @@ def frozen_plan() -> dict[str, object]:
         "development_only": True,
         "scientific_promotion_allowed": False,
         "completed_outcomes_retained_in_result": True,
-        "atomic_execution_and_publication": False,
-        "execution_failure_receipts_retained": False,
-        "post_start_retry_prevention": False,
+        "atomic_execution_and_publication": True,
+        "execution_failure_receipts_retained": True,
+        "post_start_retry_prevention": True,
         "output_path": "outputs/bounded_elastic_matched_development/report.v1.json",
     }
 
@@ -454,18 +456,17 @@ def _aggregate(rows: list[dict[str, object]]) -> dict[str, object]:
 def run_bounded_elastic_matched(
     data_x: object, data_y: object, *, config: IPMNISTConfig
 ) -> dict[str, object]:
-    """Fail closed pending a separately reviewed authorization transition."""
-    if (_REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True):
-        raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
-    return _run_bounded_elastic_matched_authorized(
-        data_x, data_y, config=config, seeds=CAMPAIGN_SEEDS,
-        _capability=_EXECUTION_CAPABILITY,
+    """Permanently reject execution outside the reservation-first transaction."""
+    del data_x, data_y, config
+    raise RuntimeError(
+        "standalone bounded-elastic execution is disabled; use the reserved transaction"
     )
 
 
 def _run_bounded_elastic_matched_authorized(
     data_x: object, data_y: object, *, config: IPMNISTConfig,
     seeds: tuple[int, ...], _capability: object,
+    _on_first_dispatch: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     """Capability-private full runner used by tests or an authorized campaign."""
     expected_seeds = (
@@ -493,6 +494,8 @@ def _run_bounded_elastic_matched_authorized(
         execution_identity = _execution_identity(seed, checked_config, x.shape[0])
         for arm in ARMS:
             spec = screening_spec(arm)
+            if not rows and _on_first_dispatch is not None:
+                _on_first_dispatch()
             arm_result = run_screening_config(x, y, spec, seed, checked_config)
             if _source_identity() != execution_source or _runtime_identity() != execution_runtime:
                 raise RuntimeError("source or runtime changed during matched execution")
@@ -532,12 +535,10 @@ def _run_bounded_elastic_matched_authorized(
 def validate_bounded_elastic_matched(
     value: object, data_x: object, data_y: object, *, config: IPMNISTConfig
 ) -> None:
-    """Fail closed because validation reexecutes the reserved campaign roster."""
-    if (_REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True):
-        raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
-    _validate_bounded_elastic_matched_authorized(
-        value, data_x, data_y, config=config, seeds=CAMPAIGN_SEEDS,
-        _capability=_EXECUTION_CAPABILITY,
+    """Permanently reject reexecution outside the reservation-first transaction."""
+    del value, data_x, data_y, config
+    raise RuntimeError(
+        "standalone bounded-elastic reexecution is disabled; use the reserved transaction"
     )
 
 
@@ -680,12 +681,10 @@ def write_bounded_elastic_matched(
     *,
     config: IPMNISTConfig,
 ) -> None:
-    """Fail closed until a reviewed authorization enables publication."""
-    if (_REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True):
-        raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
-    _write_bounded_elastic_matched_authorized(
-        destination, value, data_x, data_y, config=config, seeds=CAMPAIGN_SEEDS,
-        _capability=_EXECUTION_CAPABILITY,
+    """Permanently reject publication outside the reservation-first transaction."""
+    del destination, value, data_x, data_y, config
+    raise RuntimeError(
+        "standalone bounded-elastic publication is disabled; use the reserved transaction"
     )
 
 
@@ -818,6 +817,28 @@ def _release_output(reservation: OutputReservation) -> None:
         os.close(directory_fd)
 
 
+def _retain_consumed_output(reservation: OutputReservation) -> None:
+    """Retain the owned marker permanently after the first consumer dispatch."""
+    directory_fd, _name, _marker_name, marker_fd, _device, _inode = reservation
+    try:
+        _require_owned_reservation(reservation)
+        marker = b"asi-bounded-elastic-consumed-without-result-v1\n"
+        os.ftruncate(marker_fd, 0)
+        os.lseek(marker_fd, 0, os.SEEK_SET)
+        view = memoryview(marker)
+        while view:
+            written = os.write(marker_fd, view)
+            if written <= 0:
+                raise OSError("consumed reservation write made no progress")
+            view = view[written:]
+        os.fsync(marker_fd)
+        os.fsync(directory_fd)
+        _require_owned_reservation(reservation)
+    finally:
+        os.close(marker_fd)
+        os.close(directory_fd)
+
+
 def _link_unnamed_file(file_fd: int, directory_fd: int, name: str) -> None:
     linkat = ctypes.CDLL(None, use_errno=True).linkat
     linkat.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
@@ -833,18 +854,47 @@ def _write_bounded_elastic_matched_authorized(
     destination: Path, value: object, data_x: object, data_y: object, *,
     config: IPMNISTConfig, seeds: tuple[int, ...], _capability: object,
 ) -> None:
+    """Test-only convenience publisher; campaign publication is transactional."""
+    if _capability is not _TEST_EXECUTION_CAPABILITY:
+        raise RuntimeError(
+            "campaign publication requires the reservation-first transaction"
+        )
+    if type(seeds) is not tuple or seeds != TEST_ONLY_SEEDS:
+        raise RuntimeError("private bounded-elastic publication capability is invalid")
+    reservation = _reserve_output(destination)
+    try:
+        _publish_bounded_elastic_matched_reserved(
+            reservation,
+            destination,
+            value,
+            data_x,
+            data_y,
+            config=config,
+            seeds=seeds,
+        )
+    finally:
+        _release_output(reservation)
+
+
+def _publish_bounded_elastic_matched_reserved(
+    reservation: OutputReservation,
+    destination: Path,
+    value: object,
+    data_x: object,
+    data_y: object,
+    *,
+    config: IPMNISTConfig,
+    seeds: tuple[int, ...],
+) -> None:
+    if type(seeds) is not tuple:
+        raise RuntimeError("private bounded-elastic publication capability is invalid")
     expected_seeds = (
-        CAMPAIGN_SEEDS if _capability is _EXECUTION_CAPABILITY
-        else TEST_ONLY_SEEDS if _capability is _TEST_EXECUTION_CAPABILITY
+        CAMPAIGN_SEEDS if seeds == CAMPAIGN_SEEDS
+        else TEST_ONLY_SEEDS if seeds == TEST_ONLY_SEEDS
         else None
     )
-    if expected_seeds is None or seeds != expected_seeds:
+    if expected_seeds is None:
         raise RuntimeError("private bounded-elastic publication capability is invalid")
-    if _capability is _EXECUTION_CAPABILITY and (
-        _REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True
-    ):
-        raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
-    reservation = _reserve_output(destination)
     directory_fd, destination_name, _marker, _marker_fd, _device, _inode = reservation
     descriptor = -1
     published_identity: tuple[int, int] | None = None
@@ -931,7 +981,85 @@ def _write_bounded_elastic_matched_authorized(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
-        _release_output(reservation)
+
+
+def run_and_publish_bounded_elastic_matched(
+    data_home: Path,
+    destination: Path = OUTPUT_PATH,
+) -> dict[str, object]:
+    """Run only as one reviewed reservation-first campaign transaction."""
+    if _REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True:
+        raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
+    return _run_and_publish_bounded_elastic_matched_authorized(
+        data_home,
+        destination,
+        config=CAMPAIGN_CONFIG,
+        seeds=CAMPAIGN_SEEDS,
+        _capability=_EXECUTION_CAPABILITY,
+    )
+
+
+def _run_and_publish_bounded_elastic_matched_authorized(
+    data_home: Path,
+    destination: Path,
+    *,
+    config: IPMNISTConfig,
+    seeds: tuple[int, ...],
+    _capability: object,
+) -> dict[str, object]:
+    expected_seeds = (
+        CAMPAIGN_SEEDS if _capability is _EXECUTION_CAPABILITY
+        else TEST_ONLY_SEEDS if _capability is _TEST_EXECUTION_CAPABILITY
+        else None
+    )
+    if (
+        expected_seeds is None
+        or type(seeds) is not tuple
+        or seeds != expected_seeds
+        or type(data_home) is not type(Path())
+    ):
+        raise RuntimeError("private bounded-elastic transaction capability is invalid")
+    if _capability is _EXECUTION_CAPABILITY and (
+        _REVIEWED_EXECUTION_TRANSITION is not True or _EXECUTION_AUTHORIZED is not True
+    ):
+        raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
+    reservation = _reserve_output(destination)
+    consumer_started = False
+    published = False
+
+    def note_first_dispatch() -> None:
+        nonlocal consumer_started
+        consumer_started = True
+
+    try:
+        _require_live_output_parent(destination, reservation[0])
+        _require_owned_reservation(reservation)
+        data_x, data_y = load_mnist_train(data_home)
+        report = _run_bounded_elastic_matched_authorized(
+            data_x,
+            data_y,
+            config=config,
+            seeds=seeds,
+            _capability=_capability,
+            _on_first_dispatch=note_first_dispatch,
+        )
+        _require_owned_reservation(reservation)
+        _publish_bounded_elastic_matched_reserved(
+            reservation,
+            destination,
+            report,
+            data_x,
+            data_y,
+            config=config,
+            seeds=seeds,
+        )
+        published = True
+        return report
+    finally:
+        if published or not consumer_started:
+            _release_output(reservation)
+        else:
+            _retain_consumed_output(reservation)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -942,7 +1070,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.catalog:
         print(json.dumps(frozen_plan(), sort_keys=True))
         return 0
-    raise RuntimeError("bounded-elastic matched campaign execution is not authorized")
+    run_and_publish_bounded_elastic_matched(args.data_home)
+    return 0
 
 
 if __name__ == "__main__":  # pragma: no cover

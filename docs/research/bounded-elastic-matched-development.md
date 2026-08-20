@@ -22,17 +22,16 @@ and otherwise inconclusive. The campaign is supported when either candidate is s
 rejected when both are rejected, and otherwise inconclusive. This conservative sign rule is a
 development-selection outcome only; it is not a significance test or scientific evidence.
 
-Execution, strict reexecution, and publication are hard-disabled until both a separately reviewed
-source transition and runtime authorization become exact `true`. The future output path is NEW.
-The reviewed plan records both authorization fields as literal `false`; a later transition cannot
-retroactively change that plan identity. The current runner and publisher are separate primitives,
-not an atomic campaign transaction: an in-memory run can precede output reservation, execution
-failures produce no durable receipt, and a failed attempt does not prevent retry. A future
-authorization must either add a reserve-before-execution coordinator with explicit failure
-semantics or retain these limitations. The existing publisher reserves its NEW path before strict
-reexecution, then publishes create-only via a fsynced unique link with bounded reread, duplicate-key
-rejection, and strict revalidation. Completed results retain their outcome in the returned or
-published object. Every outcome remains development-only and permanently nonpromoting.
+Standalone execution, strict reexecution, and publication are permanently disabled. One public
+run-and-publish transaction remains hard-disabled until both a separately reviewed source transition
+and runtime authorization become exact `true`. The reviewed plan records both authorization fields
+as literal `false`; a later transition cannot retroactively change that plan identity. The future
+output path is NEW. Before any dataset load or runner dispatch, the transaction reserves the path
+through per-segment no-follow directory descriptors. A failure after the first runner dispatch
+permanently retains the inode-owned marker as a consumed-without-result tombstone, so the five-seed
+roster cannot be retried. Publication is create-only, fsynced, uniquely linked, bounded-reread,
+duplicate-key rejected, and strictly revalidated. Every result is development-only, permanently
+nonpromoting, and retains negative or inconclusive outcomes.
 
 The read-only catalog is available without loading MNIST:
 

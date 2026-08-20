@@ -38,9 +38,9 @@ def test_plan_is_prospective_and_public_execution_is_hard_disabled(
     assert plan["seeds"] == [51_562_001, 51_562_002, 51_562_003, 51_562_004, 51_562_005]
     assert plan["reviewed_execution_transition"] is False
     assert plan["execution_authorized"] is False
-    assert plan["atomic_execution_and_publication"] is False
-    assert plan["execution_failure_receipts_retained"] is False
-    assert plan["post_start_retry_prevention"] is False
+    assert plan["atomic_execution_and_publication"] is True
+    assert plan["execution_failure_receipts_retained"] is True
+    assert plan["post_start_retry_prevention"] is True
     monkeypatch.setattr(runner, "_REVIEWED_EXECUTION_TRANSITION", True)
     monkeypatch.setattr(runner, "_EXECUTION_AUTHORIZED", True)
     assert runner.frozen_plan() == plan
@@ -54,7 +54,7 @@ def test_plan_is_prospective_and_public_execution_is_hard_disabled(
         raise AssertionError("runner dispatched before authorization")
 
     monkeypatch.setattr(runner, "run_screening_config", forbidden)
-    with pytest.raises(RuntimeError, match="not authorized"):
+    with pytest.raises(RuntimeError, match="standalone.*disabled"):
         runner.run_bounded_elastic_matched(*_data(), config=SMALL)
     with pytest.raises(RuntimeError, match="not authorized"):
         runner._run_bounded_elastic_matched_authorized(
@@ -310,12 +310,11 @@ def test_writer_parent_swap_does_not_publish_through_replacement(
 
 def test_public_writer_is_closed_before_creating_output(tmp_path: Path) -> None:
     destination = tmp_path / "never" / "report.json"
-    with pytest.raises(RuntimeError, match="not authorized"):
+    with pytest.raises(RuntimeError, match="standalone.*disabled"):
         runner.write_bounded_elastic_matched(
             destination, {}, *_data(), config=SMALL
         )
-    assert not destination.parent.exists()
-    with pytest.raises(RuntimeError, match="not authorized"):
+    with pytest.raises(RuntimeError, match="reservation-first transaction"):
         runner._write_bounded_elastic_matched_authorized(
             destination,
             {},
@@ -325,6 +324,122 @@ def test_public_writer_is_closed_before_creating_output(tmp_path: Path) -> None:
             _capability=runner._EXECUTION_CAPABILITY,
         )
     assert not destination.parent.exists()
+
+
+def test_standalone_paths_remain_disabled_after_flag_transition(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    destination = tmp_path / "never" / "report.json"
+    calls = 0
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("standalone path dispatched a runner")
+
+    monkeypatch.setattr(runner, "_REVIEWED_EXECUTION_TRANSITION", True)
+    monkeypatch.setattr(runner, "_EXECUTION_AUTHORIZED", True)
+    monkeypatch.setattr(runner, "run_screening_config", forbidden)
+    with pytest.raises(RuntimeError, match="standalone.*disabled"):
+        runner.run_bounded_elastic_matched(*_data(), config=SMALL)
+    with pytest.raises(RuntimeError, match="standalone.*disabled"):
+        runner.validate_bounded_elastic_matched({}, *_data(), config=SMALL)
+    with pytest.raises(RuntimeError, match="standalone.*disabled"):
+        runner.write_bounded_elastic_matched(destination, {}, *_data(), config=SMALL)
+    assert calls == 0
+    assert not destination.parent.exists()
+
+
+def test_transaction_reserves_before_dataset_load_or_runner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    destination = tmp_path / "report.json"
+    marker = destination.with_name(f".{destination.name}.reservation")
+    marker.write_bytes(b"prior reservation")
+    calls = 0
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("consumer work preceded reservation")
+
+    monkeypatch.setattr(runner, "OUTPUT_PATH", destination)
+    monkeypatch.setattr(runner, "load_mnist_train", forbidden)
+    monkeypatch.setattr(runner, "run_screening_config", forbidden)
+    with pytest.raises(FileExistsError):
+        runner._run_and_publish_bounded_elastic_matched_authorized(
+            tmp_path,
+            destination,
+            config=SMALL,
+            seeds=runner.TEST_ONLY_SEEDS,
+            _capability=runner._TEST_EXECUTION_CAPABILITY,
+        )
+    assert calls == 0
+    assert marker.read_bytes() == b"prior reservation"
+
+
+def test_transaction_retains_owned_tombstone_after_first_dispatch_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    destination = tmp_path / "report.json"
+    x, y = _data()
+    calls = 0
+
+    def fail_after_dispatch(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("injected consumer failure")
+
+    monkeypatch.setattr(runner, "OUTPUT_PATH", destination)
+    monkeypatch.setattr(runner, "load_mnist_train", lambda _home: (x, y))
+    monkeypatch.setattr(runner, "run_screening_config", fail_after_dispatch)
+    with pytest.raises(RuntimeError, match="injected consumer failure"):
+        runner._run_and_publish_bounded_elastic_matched_authorized(
+            tmp_path,
+            destination,
+            config=SMALL,
+            seeds=runner.TEST_ONLY_SEEDS,
+            _capability=runner._TEST_EXECUTION_CAPABILITY,
+        )
+    marker = destination.with_name(f".{destination.name}.reservation")
+    assert marker.read_bytes() == b"asi-bounded-elastic-consumed-without-result-v1\n"
+    assert not destination.exists()
+    with pytest.raises(FileExistsError):
+        runner._run_and_publish_bounded_elastic_matched_authorized(
+            tmp_path,
+            destination,
+            config=SMALL,
+            seeds=runner.TEST_ONLY_SEEDS,
+            _capability=runner._TEST_EXECUTION_CAPABILITY,
+        )
+    assert calls == 1
+
+
+def test_transaction_publishes_only_after_strict_reexecution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    destination = tmp_path / "report.json"
+    x, y = _data()
+    calls = 0
+
+    def counted_run(*args: object, **kwargs: object) -> ScreeningRunResult:
+        nonlocal calls
+        calls += 1
+        return _fake_run(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "OUTPUT_PATH", destination)
+    monkeypatch.setattr(runner, "load_mnist_train", lambda _home: (x, y))
+    monkeypatch.setattr(runner, "run_screening_config", counted_run)
+    report = runner._run_and_publish_bounded_elastic_matched_authorized(
+        tmp_path,
+        destination,
+        config=SMALL,
+        seeds=runner.TEST_ONLY_SEEDS,
+        _capability=runner._TEST_EXECUTION_CAPABILITY,
+    )
+    assert json.loads(destination.read_bytes()) == report
+    assert calls == 2 * len(runner.TEST_ONLY_SEEDS) * len(runner.ARMS)
+    assert not destination.with_name(f".{destination.name}.reservation").exists()
 
 
 def test_preflight_rejects_unbounded_or_wrong_dataset_before_execution(
