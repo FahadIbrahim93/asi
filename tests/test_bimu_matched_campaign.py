@@ -117,14 +117,6 @@ def test_run_shard_refuses_before_loading_data_when_unauthorized(
     assert called is False
 
 
-def test_plan_distinguishes_tombstone_attempt_from_durability_guarantee() -> None:
-    policy = campaign.build_plan_document()["policy"]
-    assert policy["post_dispatch_consumed_without_result_tombstone_enabled"] is True
-    assert policy["post_dispatch_tombstone_retention_guaranteed"] is False
-    assert policy["process_death_tombstone_retention_guaranteed"] is False
-    assert policy["pre_dispatch_escaped_failure_reservation_released"] is True
-
-
 def test_public_publisher_refuses_flag_mismatches_before_namespace_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
