@@ -20,13 +20,14 @@ from pathlib import Path
 from typing import Any, Final, cast
 
 from alberta_framework.benchmarks.adamo_diagnostic import (
+    ADAMO_MATCHED_DEVELOPMENT_SEEDS,
     ARMS,
-    FROZEN_DEVELOPMENT_SEEDS,
     _load_dataset,
     run_adamo_diagnostic,
     validate_adamo_diagnostic,
 )
 from alberta_framework.benchmarks.ipmnist_screening import (
+    _screening_dataset_provenance,
     _screening_runtime_environment,
     _screening_source_provenance,
 )
@@ -34,18 +35,15 @@ from alberta_framework.benchmarks.ipmnist_screening import (
 SCHEMA: Final[str] = "asi.adamo-matched-development.report.v1"
 PLAN_ID: Final[str] = "issue-1560-adamo-bounded-development-v1"
 PROFILE: Final[str] = "bounded-development"
-SEEDS: Final[tuple[int, ...]] = FROZEN_DEVELOPMENT_SEEDS
+SEEDS: Final[tuple[int, ...]] = ADAMO_MATCHED_DEVELOPMENT_SEEDS
 CONSUMED_QUALIFICATION_SEEDS: Final[tuple[int, ...]] = (15600, 15601, 15602, 15603)
 CONTROL_ARM: Final[str] = "adamw_control"
 CANDIDATE_ARMS: Final[tuple[str, ...]] = ("adamo_l1e3", "adam_iso_joint_l1e3")
 T95_DF3: Final[float] = 3.1824463052837078
-DATASET_FILE_SHA256: Final[str] = (
-    "58320c334531afce90c4899ea0c05976c9b9d1c10b7b37e8eb4289cabd0a00ba"
-)
 DATASET_SEMANTIC_SHA256: Final[str] = (
-    "d25060db8f3f3f6ae7b0bb972e848733e15a1158f02021645e86a2923a5ee8a3"
+    "220e4a97a6d345a9f09bbee8e6ba65e8cc117604428392ae08fed2bd8ea0ab27"
 )
-DATASET_NUMERIC_BYTES: Final[int] = 219_800_000
+DATASET_NUMERIC_BYTES: Final[int] = 188_400_000
 _EXECUTION_AUTHORIZED: Final[bool] = False
 _HEX: Final[frozenset[str]] = frozenset("0123456789abcdef")
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
@@ -109,15 +107,28 @@ def frozen_plan() -> dict[str, object]:
         "allowed_task_information": ["current_example_label"],
         "diagnostic_information": ["post_task_boundary_index", "fixed_input_row_0"],
         "dataset": {
-            "file_sha256": DATASET_FILE_SHA256,
             "semantic_sha256": DATASET_SEMANTIC_SHA256,
             "numeric_bytes": DATASET_NUMERIC_BYTES,
             "keys": ["inputs", "labels"],
             "dtypes": ["float32", "int32"],
-            "shapes": [[70000, 784], [70000]],
+            "shapes": [[60000, 784], [60000]],
+            "source": {
+                "provider": "openml",
+                "name": "mnist_784",
+                "version": 1,
+                "row_start": 0,
+                "row_stop_exclusive": 60000,
+            },
+            "materialization_id": "alberta.ipmnist.float32-neg1-pos1-int32-labels.v1",
+            "array_sha256": {
+                "inputs": "b8078cd833f53d89828a5e28d728517be9add34076f13fe973399f1f16381313",
+                "labels": "4f1dd9551f104f8153409e0add59f0a71568f7bad5a5f8e2274480c186fe219a",
+            },
             "materialization": (
-                "caller-frozen MNIST cache x/y copied without numeric conversion into "
-                "compressed NPZ inputs/labels before plan review"
+                "fetch_openml('mnist_784', version=1, as_frame=False), rows 0:60000; "
+                "inputs=np.asarray(data,float32); inputs=(inputs/255-0.5)/0.5; "
+                "labels=np.asarray(target,int32); NPZ transport bytes are recorded but are "
+                "not the semantic dataset identity"
             ),
         },
         "mechanism_off_reduction": "adamo_inert == adamw_control bit-exact",
@@ -397,8 +408,6 @@ def build_report(
             "timing_is_telemetry_only": True,
         },
     }
-    if report["dataset_file_sha256"] != DATASET_FILE_SHA256:
-        raise ValueError("dataset file does not match the prospectively frozen input")
     comparisons = cast(dict[str, object], report["paired_comparisons"])
     primary_comparison = cast(dict[str, object], comparisons["adamo_l1e3"])
     report["development_disposition"] = primary_comparison["outcome"]
@@ -433,9 +442,9 @@ def validate_report(
     if type(report["schema"]) is not str or report["schema"] != SCHEMA:
         raise ValueError("report schema does not match the frozen protocol")
     _validate_plan(report["plan"])
-    file_digest = _digest(report["dataset_file_sha256"], context="dataset file sha256")
+    _digest(report["dataset_file_sha256"], context="dataset file sha256")
     semantic = _digest(report["dataset_semantic_sha256"], context="dataset semantic sha256")
-    if file_digest != DATASET_FILE_SHA256 or semantic != DATASET_SEMANTIC_SHA256:
+    if semantic != DATASET_SEMANTIC_SHA256:
         raise ValueError("report dataset does not match the prospectively frozen input")
     _digest(report["execution_source_commit"], context="execution source commit", length=40)
     source = _bounded_json(report["source_provenance"], context="source provenance")
@@ -682,11 +691,13 @@ def run_campaign(dataset_path: Path, output_path: Path = OUTPUT_PATH) -> dict[st
         raise ValueError(f"output path must be the reserved NEW path {OUTPUT_PATH}")
     reservation = _reserve_output(output_path)
     try:
-        if _sha256_file(dataset_path) != DATASET_FILE_SHA256:
-            raise ValueError("dataset file does not match the prospectively frozen input")
+        dataset_file_sha256 = _sha256_file(dataset_path)
         source_before = _current_source_provenance()
         runtime_before = _current_runtime_environment()
         inputs, labels = _load_dataset(dataset_path)
+        _screening_dataset_provenance(inputs, labels)
+        if _sha256_file(dataset_path) != dataset_file_sha256:
+            raise RuntimeError("dataset container changed while it was loaded")
         receipts = [
             run_adamo_diagnostic(inputs, labels, profile=PROFILE, seed=seed) for seed in SEEDS
         ]
@@ -696,7 +707,7 @@ def run_campaign(dataset_path: Path, output_path: Path = OUTPUT_PATH) -> dict[st
             raise RuntimeError("runtime identity changed during matched execution")
         report = build_report(
             receipts,
-            dataset_file_sha256=_sha256_file(dataset_path),
+            dataset_file_sha256=dataset_file_sha256,
             execution_source_commit=_execution_commit(),
         )
         _publish_reserved(reservation, report)

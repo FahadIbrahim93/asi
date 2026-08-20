@@ -40,7 +40,7 @@ Run only on a caller-materialized NPZ containing exactly float32 `inputs` and in
 ```bash
 .venv/bin/asi-adamo-diagnostic --catalog
 .venv/bin/asi-adamo-diagnostic --dataset /new/path/data.npz \
-  --profile contract-smoke --seed 25600
+  --profile contract-smoke --seed 15600
 ```
 
 Receipts bind exact dataset and current-source hashes, runtime identity, data steps, observations,
@@ -65,7 +65,9 @@ protocol and untouched seeds; and establish calibrated compute, memory, and timi
 original `15600`-`15603` schedule was consumed by executable qualification and is excluded from
 the retained matched screen. The prospectively frozen `25600`-`25603` schedule can execute only
 through `asi-adamo-matched-development` after a separate authorization review. Any exposed
-outcome consumes those seeds and can never promote a claim. The plan also freezes the exact
-caller-materialized MNIST NPZ (`58320c334531afce90c4899ea0c05976c9b9d1c10b7b37e8eb4289cabd0a00ba`)
-and its canonical numeric-array digest
-(`d25060db8f3f3f6ae7b0bb972e848733e15a1158f02021645e86a2923a5ee8a3`).
+outcome consumes those seeds and can never promote a claim. The plan freezes the independently
+reconstructable canonical IPMNIST materialization: OpenML `mnist_784` version 1 rows `0:60000`,
+float32 inputs scaled to `[-1,1]`, and int32 labels. Its input and label array hashes are
+`b8078cd833f53d89828a5e28d728517be9add34076f13fe973399f1f16381313` and
+`4f1dd9551f104f8153409e0add59f0a71568f7bad5a5f8e2274480c186fe219a`; the combined semantic
+digest is `220e4a97a6d345a9f09bbee8e6ba65e8cc117604428392ae08fed2bd8ea0ab27`.

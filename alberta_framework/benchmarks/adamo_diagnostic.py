@@ -40,9 +40,10 @@ PAPER_URL = "https://arxiv.org/abs/2606.09762v1"
 OFFICIAL_CODE = None
 OFFICIAL_CODE_SEARCH_DATE = "2026-08-17"
 ARMS = ("adamw_control", "adamo_inert", "adamo_l1e3", "adam_iso_joint_l1e3")
-# The original 15600-15603 schedule was consumed by executable qualification.
-# The matched campaign prospectively reserves a disjoint schedule.
-FROZEN_DEVELOPMENT_SEEDS = (25600, 25601, 25602, 25603)
+# Preserve the original executable-qualification schedule as a compatibility and
+# provenance interface. The matched campaign owns a distinct prospective schedule.
+FROZEN_DEVELOPMENT_SEEDS = (15600, 15601, 15602, 15603)
+ADAMO_MATCHED_DEVELOPMENT_SEEDS = (25600, 25601, 25602, 25603)
 _MAX_DATASET_BYTES = 256 * 1024 * 1024
 _HEX = frozenset("0123456789abcdef")
 _MAX_RECEIPT_NODES = 100_000
@@ -192,8 +193,14 @@ def run_adamo_diagnostic(
     if type(profile) is not str or profile not in PROFILES:
         raise ValueError("profile must name one registered AdamO diagnostic profile")
     resolved_seed = require_jax_seed(seed, name="seed")
-    if resolved_seed not in FROZEN_DEVELOPMENT_SEEDS:
-        raise ValueError("seed is not in the frozen, consumed development schedule")
+    allowed_seeds = FROZEN_DEVELOPMENT_SEEDS + ADAMO_MATCHED_DEVELOPMENT_SEEDS
+    if resolved_seed not in allowed_seeds:
+        raise ValueError("seed is not in a frozen AdamO development schedule")
+    receipt_seeds = (
+        ADAMO_MATCHED_DEVELOPMENT_SEEDS
+        if resolved_seed in ADAMO_MATCHED_DEVELOPMENT_SEEDS
+        else FROZEN_DEVELOPMENT_SEEDS
+    )
     if type(inputs) is not np.ndarray or type(labels) is not np.ndarray:
         raise TypeError("inputs and labels must be exact numpy arrays")
     config = PROFILES[profile].config
@@ -245,7 +252,7 @@ def run_adamo_diagnostic(
         "official_parity_status": "blocked_no_author_maintained_code_located",
         "profile": profile,
         "seed": resolved_seed,
-        "frozen_development_seeds": list(FROZEN_DEVELOPMENT_SEEDS),
+        "frozen_development_seeds": list(receipt_seeds),
         "config": asdict(config),
         "dataset": {
             "sha256": _sha256_arrays(inputs, labels),
@@ -395,14 +402,20 @@ def validate_adamo_diagnostic(payload: object) -> dict[str, object]:
     if type(profile) is not str or profile not in PROFILES:
         raise ValueError("unknown profile")
     seed = _exact_int(result["seed"], "seed")
-    if seed not in FROZEN_DEVELOPMENT_SEEDS:
+    allowed_seeds = FROZEN_DEVELOPMENT_SEEDS + ADAMO_MATCHED_DEVELOPMENT_SEEDS
+    if seed not in allowed_seeds:
         raise ValueError("seed is outside the frozen development schedule")
     frozen_seeds = result["frozen_development_seeds"]
+    expected_seeds = (
+        ADAMO_MATCHED_DEVELOPMENT_SEEDS
+        if seed in ADAMO_MATCHED_DEVELOPMENT_SEEDS
+        else FROZEN_DEVELOPMENT_SEEDS
+    )
     if (
         type(frozen_seeds) is not list
-        or len(frozen_seeds) != len(FROZEN_DEVELOPMENT_SEEDS)
+        or len(frozen_seeds) != len(expected_seeds)
         or any(type(value) is not int for value in frozen_seeds)
-        or tuple(frozen_seeds) != FROZEN_DEVELOPMENT_SEEDS
+        or tuple(frozen_seeds) != expected_seeds
     ):
         raise ValueError("frozen seed schedule drift")
     config = PROFILES[profile].config

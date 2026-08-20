@@ -9,6 +9,7 @@ from typing import Never
 import numpy as np
 import pytest
 
+from alberta_framework.benchmarks import adamo_diagnostic
 from alberta_framework.benchmarks import adamo_matched_development as matched
 from alberta_framework.benchmarks.adamo_diagnostic import run_adamo_diagnostic
 
@@ -30,7 +31,6 @@ def _patch_identities(
     )
     monkeypatch.setattr(matched, "validate_adamo_diagnostic", lambda value: value)
     semantic = receipts[0]["dataset"]["sha256"]
-    monkeypatch.setattr(matched, "DATASET_FILE_SHA256", "b" * 64)
     monkeypatch.setattr(matched, "DATASET_SEMANTIC_SHA256", semantic)
 
 
@@ -55,12 +55,22 @@ def receipts() -> list[dict[str, object]]:
 
 def test_plan_is_prospective_exact_and_permanently_nonpromoting() -> None:
     plan = matched.frozen_plan()
+    assert adamo_diagnostic.FROZEN_DEVELOPMENT_SEEDS == (15600, 15601, 15602, 15603)
+    assert adamo_diagnostic.ADAMO_MATCHED_DEVELOPMENT_SEEDS == matched.SEEDS
     assert plan["seeds"] == list(matched.SEEDS)
     assert plan["profile"] == "bounded-development"
     assert plan["execution_authorized"] is False
     assert plan["scientific_promotion_allowed"] is False
     assert plan["outcome_retention_required"] is True
     assert plan["consumed_qualification_seeds"] == [15600, 15601, 15602, 15603]
+    assert plan["dataset"]["source"] == {
+        "provider": "openml",
+        "name": "mnist_784",
+        "version": 1,
+        "row_start": 0,
+        "row_stop_exclusive": 60000,
+    }
+    assert plan["dataset"]["numeric_bytes"] == 188_400_000
 
 
 def test_report_recomputes_paired_statistics_and_retains_every_outcome(
