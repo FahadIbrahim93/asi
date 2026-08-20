@@ -35,7 +35,7 @@ def _resign(payload: dict[str, Any], field: str = "shard_sha256") -> None:
 
 
 @pytest.fixture
-def tiny_campaign(monkeypatch: pytest.MonkeyPatch) -> Any:
+def tiny_campaign(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
     plan = _test_plan(input_dim=4, n_classes=2, examples=4)
     monkeypatch.setattr(plan_module, "FROZEN_BIMU_MATCHED_PLAN", plan)
     monkeypatch.setattr(plan_module, "EXECUTION_AUTHORIZED", True)
@@ -46,6 +46,7 @@ def tiny_campaign(monkeypatch: pytest.MonkeyPatch) -> Any:
     )
     monkeypatch.setattr(campaign, "FROZEN_BIMU_MATCHED_PLAN", plan)
     monkeypatch.setattr(campaign, "EXECUTION_AUTHORIZED", True)
+    monkeypatch.setattr(campaign, "REGISTERED_OUTPUT_ROOT", tmp_path)
     monkeypatch.setattr(campaign, "load_frozen_bimu_dataset", lambda _home=None: _slice_data())
     process_index = 0
 
@@ -121,6 +122,7 @@ def test_linux_process_identity_is_current_and_self_consistent() -> None:
 def test_cli_run_shard_refuses_before_loading_data_when_unauthorized(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    monkeypatch.setattr(campaign, "REGISTERED_OUTPUT_ROOT", tmp_path)
     campaign.publish_json(
         campaign.campaign_path(tmp_path, "plan"),
         campaign.build_plan_document(),
@@ -353,6 +355,77 @@ def test_publication_race_retains_concurrent_destination(
         campaign.publish_json(path, campaign.build_plan_document(), root=tmp_path)
 
     assert path.read_bytes() == competitor
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_publication_revalidates_readback_without_unlinking_visible_inode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(campaign, "REGISTERED_OUTPUT_ROOT", tmp_path)
+    plan_path = campaign.campaign_path(tmp_path, "plan")
+    document = campaign.build_plan_document()
+    original = campaign.validate_plan_document
+    calls = 0
+
+    def fail_readback(value: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ValueError("simulated readback rejection")
+        return original(value)
+
+    monkeypatch.setattr(campaign, "validate_plan_document", fail_readback)
+    with pytest.raises(ValueError, match="readback rejection"):
+        campaign.publish_json(plan_path, document, root=tmp_path)
+    assert plan_path.is_file()
+    assert plan_path.stat().st_mode & 0o777 == 0o444
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_cli_reserves_exact_shard_before_execution(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_campaign: Any
+) -> None:
+    campaign.publish_json(
+        campaign.campaign_path(tmp_path, "plan"),
+        campaign.build_plan_document(),
+        root=tmp_path,
+    )
+    destination = campaign.campaign_path(
+        tmp_path, "shard", arm="memory_off", seed=157001
+    )
+
+    def fail_after_reservation(*args: object, **kwargs: object) -> dict[str, object]:
+        assert destination.is_file()
+        assert destination.stat().st_size == 0
+        raise RuntimeError("simulated execution failure")
+
+    monkeypatch.setattr(campaign, "run_bimu_shard", fail_after_reservation)
+    with pytest.raises(RuntimeError, match="execution failure"):
+        campaign.main(
+            [
+                "run-shard",
+                "--root",
+                str(tmp_path),
+                "--arm",
+                "memory_off",
+                "--seed",
+                "157001",
+            ]
+        )
+    assert destination.is_file()
+    assert destination.stat().st_size == 0
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_publication_rejects_zero_progress_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tiny_campaign: Any
+) -> None:
+    document = campaign.build_plan_document()
+    monkeypatch.setattr(campaign.os, "write", lambda *args: 0)
+    with pytest.raises(OSError, match="no progress"):
+        campaign.publish_json(
+            campaign.campaign_path(tmp_path, "plan"), document, root=tmp_path
+        )
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign file validation is Linux-only")

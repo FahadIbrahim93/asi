@@ -62,6 +62,7 @@ MAX_TEXT_BYTES: Final = 4096
 MAX_PLAN_BYTES: Final = 2 * 1024 * 1024
 MAX_SHARD_BYTES: Final = 4 * 1024 * 1024
 MAX_AGGREGATE_BYTES: Final = 32 * 1024 * 1024
+REGISTERED_OUTPUT_ROOT: Final = Path(__file__).resolve().parents[2]
 
 _ARMS: Final = ("memory_off", "bimu")
 _MATCHED_COUNTERS: Final = (
@@ -982,6 +983,11 @@ def _allowed_path(path: Path, root: Path) -> bool:
     return path in candidates
 
 
+def _require_registered_root(root: Path) -> None:
+    if Path(os.path.abspath(os.fspath(root))) != REGISTERED_OUTPUT_ROOT:
+        _fail("campaign output root is not the registered repository root")
+
+
 def _open_output_parent(path: Path, *, create: bool) -> tuple[Path, int]:
     """Open an absolute parent through no-follow directory descriptors."""
 
@@ -1027,19 +1033,50 @@ def _link_unnamed_file(file_descriptor: int, parent_descriptor: int, name: str) 
         raise OSError(error, os.strerror(error), name)
 
 
-def publish_json(path: Path, value: object, *, root: Path) -> None:
+def _reserve_shard_destination(path: Path, *, root: Path) -> tuple[Path, int, int]:
+    """Reserve one exact shard path before dataset load or execution."""
+
+    _require_registered_root(root)
+    if not _allowed_path(path, root) or path.parent.name != "shards":
+        _fail("only one canonical shard destination may be reserved")
+    destination, parent_descriptor = _open_output_parent(path, create=True)
+    try:
+        file_descriptor = os.open(
+            destination.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o000,
+            dir_fd=parent_descriptor,
+        )
+    except BaseException:
+        os.close(parent_descriptor)
+        raise
+    return destination, parent_descriptor, file_descriptor
+
+
+def publish_json(
+    path: Path,
+    value: object,
+    *,
+    root: Path,
+    _reservation: tuple[Path, int, int] | None = None,
+) -> None:
     """Atomically publish one canonical campaign file without replacement."""
 
     if type(path) is not type(Path()) or type(root) is not type(Path()):
         raise TypeError("path and root must be exact Paths")
+    _require_registered_root(root)
     if not _allowed_path(path, root):
         _fail("destination is outside the fixed campaign namespace")
-    if path == campaign_path(root, "plan"):
-        validate_plan_document(value)
-    elif path == campaign_path(root, "aggregate"):
-        validate_bimu_aggregate(value)
-    else:
-        validate_bimu_shard(value)
+
+    def validate(candidate: object) -> None:
+        if path == campaign_path(root, "plan"):
+            validate_plan_document(candidate)
+        elif path == campaign_path(root, "aggregate"):
+            validate_bimu_aggregate(candidate)
+        else:
+            validate_bimu_shard(candidate)
+
+    validate(value)
     raw = _canonical(value) + b"\n"
     shard_path = campaign_path(
         root,
@@ -1049,37 +1086,93 @@ def publish_json(path: Path, value: object, *, root: Path) -> None:
     )
     _, shard_parent_descriptor = _open_output_parent(shard_path, create=True)
     os.close(shard_parent_descriptor)
-    destination, parent_descriptor = _open_output_parent(path, create=True)
-    file_descriptor: int | None = None
+    if _reservation is None:
+        destination, parent_descriptor = _open_output_parent(path, create=True)
+        file_descriptor: int | None = None
+    else:
+        destination, parent_descriptor, file_descriptor = _reservation
+        if destination != Path(os.path.abspath(os.fspath(path))):
+            _fail("campaign reservation does not match its exact destination")
     try:
-        try:
-            os.stat(destination.name, dir_fd=parent_descriptor, follow_symlinks=False)
-        except FileNotFoundError:
-            pass
-        else:
-            raise FileExistsError(
-                f"refusing to replace existing campaign artifact: {destination}"
+        if _reservation is None:
+            try:
+                os.stat(destination.name, dir_fd=parent_descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileExistsError(
+                    f"refusing to replace existing campaign artifact: {destination}"
+                )
+            if not hasattr(os, "O_TMPFILE"):
+                raise OSError("immutable publication requires Linux O_TMPFILE support")
+            file_descriptor = os.open(
+                ".",
+                os.O_WRONLY | os.O_CLOEXEC | os.O_TMPFILE,
+                0o600,
+                dir_fd=parent_descriptor,
             )
-        if not hasattr(os, "O_TMPFILE"):
-            raise OSError("immutable publication requires Linux O_TMPFILE support")
-        file_descriptor = os.open(
-            ".",
-            os.O_WRONLY | os.O_CLOEXEC | os.O_TMPFILE,
-            0o600,
-            dir_fd=parent_descriptor,
-        )
+        assert file_descriptor is not None
         view = memoryview(raw)
         written = 0
         while written < len(view):
-            written += os.write(file_descriptor, view[written:])
+            count = os.write(file_descriptor, view[written:])
+            if count <= 0:
+                raise OSError("campaign publication write made no progress")
+            written += count
         os.fsync(file_descriptor)
         os.fchmod(file_descriptor, 0o444)
+        if _reservation is None:
+            try:
+                _link_unnamed_file(file_descriptor, parent_descriptor, destination.name)
+            except FileExistsError as exc:
+                raise FileExistsError(
+                    f"refusing to replace existing campaign artifact: {destination}"
+                ) from exc
+        read_descriptor = os.open(
+            destination.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_descriptor,
+        )
         try:
-            _link_unnamed_file(file_descriptor, parent_descriptor, destination.name)
-        except FileExistsError as exc:
-            raise FileExistsError(
-                f"refusing to replace existing campaign artifact: {destination}"
-            ) from exc
+            source_stat = os.fstat(file_descriptor)
+            before = os.fstat(read_descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or (before.st_dev, before.st_ino) != (source_stat.st_dev, source_stat.st_ino)
+                or before.st_size != len(raw)
+            ):
+                raise RuntimeError("published campaign artifact is not the prepared inode")
+            loaded = bytearray()
+            while len(loaded) <= len(raw):
+                chunk = os.read(read_descriptor, min(64 * 1024, len(raw) + 1 - len(loaded)))
+                if not chunk:
+                    break
+                loaded.extend(chunk)
+            after = os.fstat(read_descriptor)
+        finally:
+            os.close(read_descriptor)
+
+        def identity(item: os.stat_result) -> tuple[int, int, int, int, int]:
+            return (
+                item.st_dev,
+                item.st_ino,
+                item.st_size,
+                item.st_mtime_ns,
+                item.st_ctime_ns,
+            )
+
+        if bytes(loaded) != raw or identity(before) != identity(after):
+            raise RuntimeError("published campaign artifact changed during bounded readback")
+        try:
+            decoded = json.loads(
+                loaded,
+                object_pairs_hook=_json_object_pairs,
+                parse_constant=lambda token: _fail(f"invalid JSON constant: {token}"),
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+            raise RuntimeError("published campaign artifact is not strict JSON") from exc
+        validate(decoded)
         os.fsync(parent_descriptor)
         _, live_parent_descriptor = _open_output_parent(destination, create=False)
         try:
@@ -1202,16 +1295,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 2
         destination = campaign_path(root, "shard", arm=args.arm, seed=args.seed)
-        if os.path.lexists(destination):
-            raise FileExistsError(f"refusing to replace existing campaign shard: {destination}")
         plan = _load_plan(root)
-        shard = run_bimu_shard(
-            args.arm,
-            args.seed,
-            data_home=args.data_home,
-            plan_document=plan,
+        reservation: tuple[Path, int, int] | None = _reserve_shard_destination(
+            destination, root=root
         )
-        publish_json(destination, shard, root=root)
+        try:
+            shard = run_bimu_shard(
+                args.arm,
+                args.seed,
+                data_home=args.data_home,
+                plan_document=plan,
+            )
+            publish_json(destination, shard, root=root, _reservation=reservation)
+            reservation = None
+        finally:
+            if reservation is not None:
+                _, parent_descriptor, file_descriptor = reservation
+                os.close(file_descriptor)
+                os.close(parent_descriptor)
         _print_json({"status": "complete", "shard": str(destination)})
         return 0
     if args.command == "summarize":
@@ -1247,6 +1348,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "shards": [],
             "aggregate": None,
         }
+        shards: list[dict[str, object]] = []
         if any_shards:
             arrays = load_frozen_bimu_dataset(args.data_home)
             shards = _load_shards(root, arrays)
@@ -1255,6 +1357,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             aggregate = validate_bimu_aggregate(
                 load_json_strict(aggregate_path, byte_ceiling=MAX_AGGREGATE_BYTES)
             )
+            if any_shards and aggregate["shards"] != shards:
+                _fail("aggregate does not contain the exact retained shard roster")
             result["aggregate"] = aggregate["aggregate_sha256"]
         _print_json(result)
         return 0
