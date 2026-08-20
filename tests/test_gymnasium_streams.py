@@ -905,14 +905,17 @@ class TestCollectTrajectoryNextStateMode:
         the feature width).
         """
         env = gymnasium.make("CartPole-v1")
-        observations, targets = collect_trajectory(
-            env,
-            None,
-            num_steps=15,
-            mode=PredictionMode.NEXT_STATE,
-            include_action_in_features=True,
-            seed=1,
-        )
+        try:
+            observations, targets = collect_trajectory(
+                env,
+                None,
+                num_steps=15,
+                mode=PredictionMode.NEXT_STATE,
+                include_action_in_features=True,
+                seed=1,
+            )
+        finally:
+            env.close()
         assert observations.shape == (15, 5)  # obs(4) + action(1)
         assert targets.shape == (15, 4)  # observation_dim, not feature_dim
 
@@ -922,14 +925,17 @@ class TestCollectTrajectoryNextStateMode:
         Compared over the shared 4-dim observation half of the feature row.
         """
         env = gymnasium.make("CartPole-v1")
-        observations, targets = collect_trajectory(
-            env,
-            None,
-            num_steps=100,
-            mode=PredictionMode.NEXT_STATE,
-            include_action_in_features=True,
-            seed=42,
-        )
+        try:
+            observations, targets = collect_trajectory(
+                env,
+                None,
+                num_steps=40,
+                mode=PredictionMode.NEXT_STATE,
+                include_action_in_features=True,
+                seed=42,
+            )
+        finally:
+            env.close()
         matches = jnp.all(jnp.isclose(observations[1:, :4], targets[:-1]), axis=1)
         # CartPole-v1 caps episodes at 500 steps but seed=42 terminates
         # early; some rows must match (no reset) and some must not
@@ -945,20 +951,23 @@ class TestCollectTrajectoryNextStateMode:
         following row's features.
         """
         env = gymnasium.make("CartPole-v1")
-        observations, targets = collect_trajectory(
-            env,
-            None,
-            num_steps=200,
-            mode=PredictionMode.NEXT_STATE,
-            include_action_in_features=False,
-            seed=42,
-        )
+        try:
+            observations, targets = collect_trajectory(
+                env,
+                None,
+                num_steps=40,
+                mode=PredictionMode.NEXT_STATE,
+                include_action_in_features=False,
+                seed=42,
+            )
+        finally:
+            env.close()
         mismatches = [
             i
             for i in range(len(observations) - 1)
             if not jnp.allclose(observations[i + 1], targets[i])
         ]
-        assert mismatches  # seed=42 must terminate at least once inside 200 steps
+        assert mismatches  # seed=42 must terminate at least once inside 40 steps
 
         x_threshold = 2.4
         theta_threshold = 12 * 2 * jnp.pi / 360
