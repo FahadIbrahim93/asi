@@ -1,14 +1,6 @@
-"""Scale-robust pair sequences reject oversized host collections before hang.
-
-Origin ``ConditionSeedRecord`` rebuilt every integer pair with no count bound.
-A cheap ``((0, 1),) * 25_000_000`` pointer-repeat took 4.107s on origin/main.
-"""
+"""Scale-robust pair sequences reject oversized host collections before traversal."""
 
 from __future__ import annotations
-
-import time
-from collections.abc import Sequence
-from typing import cast
 
 import pytest
 
@@ -59,42 +51,38 @@ def test_last_fit_pair_count_is_accepted() -> None:
     assert len(record.end_segment_5_active_pairs) == _MAX_INTEGER_PAIRS
     assert count_relevant_context_pairs(pairs) == 1
     assert count_relevant_context_pairs_by_task(pairs) == (1, 0)
+    assert count_relevant_context_pairs(list(pairs)) == 1
+    assert count_relevant_context_pairs_by_task(list(pairs)) == (1, 0)
 
 
-@pytest.mark.parametrize("count", [4097, 25_000_000])
-def test_condition_record_rejects_oversized_pair_pointer_repeat(count: int) -> None:
-    started = time.perf_counter()
+def test_condition_record_rejects_oversized_pairs_before_inspecting_elements() -> None:
+    pairs = (object(),) * (_MAX_INTEGER_PAIRS + 1)
     with pytest.raises(ValueError, match="4096-pair limit"):
         ConditionSeedRecord(
             seed=0,
             condition=CONDITION_PRIMARY,
             phases=(),
-            end_segment_5_active_pairs=(_PAIR,) * count,
+            end_segment_5_active_pairs=pairs,  # type: ignore[arg-type]
             end_segment_7_active_pairs=(),
             final_active_pairs=(),
         )
-    assert time.perf_counter() - started < 0.5
 
 
-@pytest.mark.parametrize("count", [4097, 25_000_000])
-def test_pair_counters_reject_oversized_pointer_repeat(count: int) -> None:
-    pairs = (_PAIR,) * count
-    started = time.perf_counter()
+def test_pair_counters_reject_oversized_pairs_before_inspecting_elements() -> None:
+    pairs = [object()] * (_MAX_INTEGER_PAIRS + 1)
     with pytest.raises(ValueError, match="4096-pair limit"):
-        count_relevant_context_pairs(pairs)
+        count_relevant_context_pairs(pairs)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="4096-pair limit"):
-        count_relevant_context_pairs_by_task(pairs)
-    assert time.perf_counter() - started < 0.5
+        count_relevant_context_pairs_by_task(pairs)  # type: ignore[arg-type]
 
 
 def test_pair_admission_rejects_hostile_sequence_without_type_hooks() -> None:
     _HostileMeta.calls = 0
     hostile = _HostileSequence((_PAIR,))
-    hostile_pairs = cast(Sequence[tuple[int, int]], hostile)
     with pytest.raises(TypeError, match="exact tuple or list"):
-        count_relevant_context_pairs(hostile_pairs)
+        count_relevant_context_pairs(hostile)  # type: ignore[arg-type]
     with pytest.raises(TypeError, match="exact tuple or list"):
-        count_relevant_context_pairs_by_task(hostile_pairs)
+        count_relevant_context_pairs_by_task(hostile)  # type: ignore[arg-type]
     assert _HostileMeta.calls == 0
 
 

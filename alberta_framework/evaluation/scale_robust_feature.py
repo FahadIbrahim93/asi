@@ -95,8 +95,9 @@ CONDITION_NAMES = (
 EARLY_WINDOW_STEPS = 200
 TAIL_WINDOW_STEPS = 500
 ASYMPTOTIC_WINDOW_STEPS = 1_500
-# Origin ConditionSeedRecord rebuilt every pair before any count bound.
-# A cheap ``((0, 1),) * 25_000_000`` pointer-repeat took 4.107s on origin/main.
+# Host-provided pair collections share the repository's 4,096-item traversal
+# ceiling. This leaves more than 45x headroom over the frozen 91-pair candidate
+# archive and more than 170x over each 24-pair active bank.
 _MAX_INTEGER_PAIRS = 4096
 
 FROZEN_STREAM_CONFIGURATION: dict[str, int | float] = {
@@ -517,7 +518,7 @@ def make_condition_learner(condition: str) -> FixedBudgetInteractionLearner:
 
 
 def count_relevant_context_pairs(
-    pairs: Sequence[tuple[int, int]],
+    pairs: tuple[tuple[int, int], ...] | list[tuple[int, int]],
     *,
     relevant_dim: int = 8,
     input_dim: int = 12,
@@ -534,7 +535,7 @@ def count_relevant_context_pairs(
 
 
 def count_relevant_context_pairs_by_task(
-    pairs: Sequence[tuple[int, int]],
+    pairs: tuple[tuple[int, int], ...] | list[tuple[int, int]],
     *,
     relevant_dim: int = 8,
     input_dim: int = 12,
