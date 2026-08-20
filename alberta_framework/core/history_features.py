@@ -389,9 +389,17 @@ class HistoryFeatureExtractor:
         config.pop("type", None)
         raw_rates = config["decay_rates"]
         if type(raw_rates) is list:
+            if len(raw_rates) > _MAX_HISTORY_DECAY_RATES:
+                raise ValueError(
+                    f"decay_rates must contain at most {_MAX_HISTORY_DECAY_RATES} rates"
+                )
             raw_rates = tuple(raw_rates)
         raw_channels = config["channels"]
         if type(raw_channels) is list:
+            if len(raw_channels) > _MAX_HISTORY_CHANNELS:
+                raise ValueError(
+                    f"channels must contain at most {_MAX_HISTORY_CHANNELS} indices"
+                )
             raw_channels = tuple(raw_channels)
         return cls(
             raw_dim=config["raw_dim"],

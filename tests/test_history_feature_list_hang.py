@@ -61,3 +61,19 @@ def test_rejects_oversized_channels_before_per_index_walk(count: int) -> None:
             channels=(0,) * count,
         )
     assert time.perf_counter() - started < 0.5
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("decay_rates", [0.5] * 4097),
+        ("channels", [0] * 4097),
+    ],
+)
+def test_from_config_rejects_oversized_lists_before_tuple_copy(
+    field: str, value: list[object]
+) -> None:
+    config = HistoryFeatureExtractor(raw_dim=1).to_config()
+    config[field] = value
+    with pytest.raises(ValueError, match="at most 4096"):
+        HistoryFeatureExtractor.from_config(config)
