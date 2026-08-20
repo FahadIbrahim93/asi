@@ -1060,7 +1060,12 @@ def publish_json(
     root: Path,
     _reservation: tuple[Path, int, int] | None = None,
 ) -> None:
-    """Atomically publish one canonical campaign file without replacement."""
+    """Publish one canonical file without replacement and verify its held inode.
+
+    Plans and aggregates link a complete anonymous inode atomically. A shard's
+    exact final name is instead reserved before execution; an interrupted or
+    failed run intentionally leaves that non-result reservation occupied.
+    """
 
     if type(path) is not type(Path()) or type(root) is not type(Path()):
         raise TypeError("path and root must be exact Paths")
@@ -1274,6 +1279,7 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     root = cast(Path, args.root)
+    _require_registered_root(root)
     if args.command == "plan":
         document = build_plan_document()
         publish_json(campaign_path(root, "plan"), document, root=root)
@@ -1295,11 +1301,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 2
         destination = campaign_path(root, "shard", arm=args.arm, seed=args.seed)
-        plan = _load_plan(root)
         reservation: tuple[Path, int, int] | None = _reserve_shard_destination(
             destination, root=root
         )
         try:
+            plan = _load_plan(root)
             shard = run_bimu_shard(
                 args.arm,
                 args.seed,

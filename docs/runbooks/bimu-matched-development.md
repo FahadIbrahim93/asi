@@ -12,6 +12,11 @@ a disjoint development test, seeds 157001–157003, and arms `memory_off` and
 versus `128`). Every other configuration, schedule, initial state, counter,
 and numeric resource field must match within each pair.
 
+Seeds 157001–157003 are publicly exposed by this literal development plan and
+are therefore consumed for every promotion purpose. They have not produced a
+retained matched result. Any future scientific protocol needs a new path and
+untouched seeds; changing the execution gate cannot make this roster eligible.
+
 The preregistered primary outcome uses the final-model mean accuracy over the
 five task permutations. It is `supported` only when all three candidate-minus-
 control deltas are strictly positive, `rejected` when all three are
@@ -61,3 +66,10 @@ All files publish without replacement under
 inconclusive aggregates. Source, runtime, dependency, process, dataset,
 resource, and telemetry digests are consistency bindings, not authenticated
 execution attestation.
+
+Each shard's final path is reserved before plan admission, dataset load, or
+execution. A crash or execution failure intentionally leaves a zero-byte,
+mode-000 non-result reservation at that path: it consumes that attempt and is
+not a valid shard or permission to retry. Successful publication fills the
+same held inode, makes it read-only, rereads bounded bytes without following
+links, and strictly validates them before reporting completion.

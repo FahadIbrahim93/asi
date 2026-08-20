@@ -393,12 +393,19 @@ def test_cli_reserves_exact_shard_before_execution(
     destination = campaign.campaign_path(
         tmp_path, "shard", arm="memory_off", seed=157001
     )
+    original_load_plan = campaign._load_plan
+
+    def load_plan_after_reservation(root: Path) -> dict[str, object]:
+        assert destination.is_file()
+        assert destination.stat().st_size == 0
+        return original_load_plan(root)
 
     def fail_after_reservation(*args: object, **kwargs: object) -> dict[str, object]:
         assert destination.is_file()
         assert destination.stat().st_size == 0
         raise RuntimeError("simulated execution failure")
 
+    monkeypatch.setattr(campaign, "_load_plan", load_plan_after_reservation)
     monkeypatch.setattr(campaign, "run_bimu_shard", fail_after_reservation)
     with pytest.raises(RuntimeError, match="execution failure"):
         campaign.main(
@@ -414,6 +421,17 @@ def test_cli_reserves_exact_shard_before_execution(
         )
     assert destination.is_file()
     assert destination.stat().st_size == 0
+
+
+def test_cli_rejects_relocated_root_before_namespace_access(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    registered = tmp_path / "registered"
+    relocated = tmp_path / "relocated"
+    monkeypatch.setattr(campaign, "REGISTERED_OUTPUT_ROOT", registered)
+    with pytest.raises(ValueError, match="registered repository root"):
+        campaign.main(["validate", "--root", str(relocated)])
+    assert not relocated.exists()
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")

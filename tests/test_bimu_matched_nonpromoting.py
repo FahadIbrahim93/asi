@@ -21,7 +21,12 @@ def test_frozen_bimu_plan_is_matched_and_prospective() -> None:
     candidate = plan.candidate_config.to_protocol_payload()
     assert {key for key in control if control[key] != candidate[key]} == {"memory_window"}
     assert plan.dataset_sha256 == "85c681c2f5fc5c274870b30c9accb3d2a6e9eb90a4575a2bf1ccca64f58b6227"
-    assert FROZEN_PLAN_SHA256 == "11ddfacd0aca8108a39bd8a68225149de246efb7420d2fdb864f36ea75681f71"
+    assert FROZEN_PLAN_SHA256 == "633b8e6b6bc212798e3af6b8550e39b99d800c3aae332384cda352dde31c4c75"
+    assert bimu_plan.frozen_plan_payload()["seed_status"] == {
+        "consumed_for_promotion": True,
+        "retained_matched_result_exists": False,
+        "reason": "the literal development roster is publicly exposed",
+    }
     assert INVALID_PRIOR_ATTEMPT["pull_request"] == 1686
     assert INVALID_PRIOR_ATTEMPT["seed"] == 23
     payload = _plan_payload(plan)

@@ -23,7 +23,7 @@ PLAN_SCHEMA: Final = "asi.bimu.matched-development-plan.v3"
 OUTPUT_NAMESPACE: Final = Path("outputs/bimu_matched/development.v1")
 EXECUTION_AUTHORIZED: Final = False
 _DIGEST = "85c681c2f5fc5c274870b30c9accb3d2a6e9eb90a4575a2bf1ccca64f58b6227"
-FROZEN_PLAN_SHA256: Final = "11ddfacd0aca8108a39bd8a68225149de246efb7420d2fdb864f36ea75681f71"
+FROZEN_PLAN_SHA256: Final = "633b8e6b6bc212798e3af6b8550e39b99d800c3aae332384cda352dde31c4c75"
 
 INVALID_PRIOR_ATTEMPT: Final[Mapping[str, object]] = MappingProxyType({
     "pull_request": 1686,
@@ -229,6 +229,11 @@ def _plan_payload(plan: BiMUMatchedDevelopmentPlan) -> dict[str, object]:
             "secondary_metric_affects_outcome": False,
         },
         "output_namespace": str(OUTPUT_NAMESPACE),
+        "seed_status": {
+            "consumed_for_promotion": True,
+            "retained_matched_result_exists": False,
+            "reason": "the literal development roster is publicly exposed",
+        },
         "execution_authorized": EXECUTION_AUTHORIZED,
     }
 
