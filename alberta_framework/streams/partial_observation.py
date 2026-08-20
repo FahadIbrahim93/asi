@@ -56,9 +56,10 @@ class MaskMode(enum.Enum):
 # ``tests/test_partial_observation.py``. Origin stacked a pointer-repeat of
 # 5_000 identical masks with no reject — hang, not leftover INT32 math.
 _MAX_PERIODIC_SCHEDULE_LENGTH = 4_096
-# Each logical boolean is retained once in the per-row converted masks and
-# once again in the stacked schedule.  Cap the logical payload at 64 MiB so
-# those two runner-owned arrays stay below 128 MiB before allocator overhead.
+# Cap the final boolean schedule payload at 64 MiB. The schedule is converted
+# in one operation below: converting each row separately makes construction
+# time grow with thousands of JAX dispatches even when every row is a repeated
+# pointer to the same tiny host array.
 _MAX_PERIODIC_SCHEDULE_VALUES = 64 * 1024 * 1024
 
 

@@ -101,6 +101,24 @@ def test_periodic_schedule_rejects_large_rows_before_array_conversion(
         )
 
 
+def test_periodic_schedule_rejects_wrong_large_row_before_array_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A huge caller-owned row is checked by metadata before conversion."""
+    row = np.zeros((1_000_000,), dtype=bool)
+
+    def fail_asarray(*args: object, **kwargs: object) -> object:
+        raise AssertionError("array conversion ran before the row-shape gate")
+
+    monkeypatch.setattr(partial_observation.jnp, "asarray", fail_asarray)
+    with pytest.raises(ValueError, match="schedule masks"):
+        PartialObservationWrapper(
+            _inner(),
+            mode=MaskMode.PERIODIC,
+            schedule=(row,),
+        )
+
+
 def test_periodic_schedule_rejects_hostile_container_before_len() -> None:
     class HostileSchedule(tuple[object, ...]):
         calls = 0

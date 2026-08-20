@@ -139,11 +139,11 @@ def _reject_boolean_numeric_trace(
         return
     if actual_type is np.ndarray:
         array = cast(NDArray[np.generic], values)
-        if array.size > _remaining_nodes[0]:
-            raise ValueError(f"{name} exceeds the boolean-trace value limit")
         if array.dtype.kind == "b":
             raise ValueError(f"{name} must not be a boolean array")
         if array.dtype.kind == "O":
+            if array.size > _remaining_nodes[0]:
+                raise ValueError(f"{name} exceeds the boolean-trace value limit")
             for index, item in enumerate(array.flat):
                 _reject_boolean_numeric_trace(
                     item,
@@ -153,8 +153,6 @@ def _reject_boolean_numeric_trace(
                 )
         elif array.dtype.kind not in "iuf":
             raise ValueError(f"{name} must contain real numeric values")
-        else:
-            _remaining_nodes[0] -= int(array.size)
         return
     raise ValueError(f"{name} must contain exact real numeric values")
 
@@ -212,8 +210,6 @@ def _require_index_vector(values: object, *, name: str) -> NDArray[np.int64]:
         return np.asarray(values, dtype=np.int64)
     elif type(values) is np.ndarray:
         array = values
-        if array.size > _BOOLEAN_TRACE_MAX_NODES:
-            raise ValueError(f"{name} exceeds the boolean-trace value limit")
         if array.size == 0:
             return np.asarray(array, dtype=np.int64)
         if array.dtype.kind not in "iu":

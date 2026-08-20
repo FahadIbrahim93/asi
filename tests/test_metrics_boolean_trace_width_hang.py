@@ -37,6 +37,24 @@ def test_cumulative_error_rejects_oversized_metrics_history_before_walk(
     assert time.perf_counter() - started < 0.25
 
 
+def test_object_array_rejects_oversized_width_before_flat_walk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 8)
+    values = np.empty(9, dtype=object)
+    values.fill(0.0)
+    with pytest.raises(ValueError, match="boolean-trace value limit"):
+        metrics._reject_boolean_numeric_trace(values, name="values")
+
+
+def test_index_list_rejects_oversized_width_before_item_walk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 8)
+    with pytest.raises(ValueError, match="boolean-trace value limit"):
+        metrics._require_index_vector([0] * 9, name="indices")
+
+
 def test_nested_shared_trace_uses_one_traversal_wide_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -49,18 +67,34 @@ def test_nested_shared_trace_uses_one_traversal_wide_budget(
         metrics._reject_boolean_numeric_trace(root, name="values")
 
 
+def test_trace_budget_counts_root_and_rejects_first_non_fit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 4)
+    metrics._reject_boolean_numeric_trace([0.0, 1.0, 2.0], name="values")
+    with pytest.raises(ValueError, match="boolean-trace value limit"):
+        metrics._reject_boolean_numeric_trace([0.0, 1.0, 2.0, 3.0], name="values")
+    with pytest.raises(ValueError, match="boolean-trace value limit"):
+        metrics._reject_boolean_numeric_trace(
+            np.asarray([0.0, 1.0, 2.0, 3.0], dtype=object),
+            name="values",
+        )
+
+
 def test_running_mean_accepts_public_last_fit() -> None:
     result = compute_running_mean([0.0, 1.0, 2.0, 3.0, 4.0, 5.0], window_size=3)
     assert result.shape == (6,)
 
 
-def test_running_mean_rejects_oversized_broadcast_view_before_numeric_work(
+def test_dense_numeric_array_is_not_a_python_traversal_node_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Dense typed leaves keep their public numeric-array compatibility."""
     monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 8)
-    view = np.broadcast_to(np.asarray(0.0, dtype=np.float64), (9,))
-    with pytest.raises(ValueError, match="boolean-trace value limit"):
-        compute_running_mean(view, window_size=2)
+    view = np.broadcast_to(np.asarray(1.0, dtype=np.float64), (9,))
+    result = compute_running_mean(view, window_size=2)
+    assert np.isnan(result[0])
+    np.testing.assert_array_equal(result[1:], np.ones(8, dtype=np.float64))
 
 
 def test_numeric_trace_rejects_hostile_metaclass_without_hash_or_equality() -> None:
@@ -90,13 +124,13 @@ def test_metric_history_rejects_wide_record_before_key_iteration() -> None:
         compute_cumulative_error([record])
 
 
-def test_index_vector_rejects_oversized_broadcast_view_before_numeric_work(
+def test_dense_index_array_is_not_a_python_traversal_node_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 8)
-    view = np.broadcast_to(np.asarray(0, dtype=np.int64), (9,))
-    with pytest.raises(ValueError, match="boolean-trace value limit"):
-        metrics._require_index_vector(view, name="indices")
+    view = np.arange(9, dtype=np.int64)
+    result = metrics._require_index_vector(view, name="indices")
+    np.testing.assert_array_equal(result, view)
 
 
 def test_compare_learners_shares_one_history_item_budget(
