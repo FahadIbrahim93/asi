@@ -88,3 +88,13 @@ escapes without a published failed-attempt receipt releases the reservation.
 Source,
 runtime, dependency, process, dataset, resource, and telemetry digests are
 consistency bindings, not authenticated execution attestation.
+
+The frozen plan accounts for both learner passes rather than treating strict
+admission as free validation work. Each shard performs one initial execution
+and one strict reexecution over the same validated array tuple. Across the six
+fresh-process shards this is 12 learner dispatches, 15,360 observations, label
+queries, optimizer updates, optimizer-seen steps, and environment steps, plus
+122,880 model-forward queries. Each shard process loads its dataset once. The
+existing per-arm result counters describe one retained result; the separate
+transaction accounting binds the doubled work actually required for admission.
+Replay timing is not retained and timing remains unqualified telemetry only.

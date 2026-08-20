@@ -24,7 +24,7 @@ OUTPUT_NAMESPACE: Final = Path("outputs/bimu_matched/development.v1")
 EXECUTION_AUTHORIZED: Final = False
 AUTHORIZATION_TRANSITION_APPROVED: Final = False
 _DIGEST = "85c681c2f5fc5c274870b30c9accb3d2a6e9eb90a4575a2bf1ccca64f58b6227"
-FROZEN_PLAN_SHA256: Final = "182632b37c3a8598a30fb943742605374a846d965c5602f4db039f27f78754c1"
+FROZEN_PLAN_SHA256: Final = "ab2cb84f4e93e7e3fed2c21a2e450b67ec917dce496701646d3040489f9587bd"
 
 INVALID_PRIOR_ATTEMPT: Final[Mapping[str, object]] = MappingProxyType(
     {
@@ -190,6 +190,16 @@ def _plan_payload(plan: BiMUMatchedDevelopmentPlan) -> dict[str, object]:
         config.train_examples_per_task * (config.input_dim + 1) * 4
         + config.test_examples_per_task * (config.input_dim + 1) * 4
     )
+    expected_counters = {
+        "environment_steps": observations,
+        "observations": observations,
+        "label_queries": label_queries,
+        "optimizer_seen": observations,
+        "model_forward_queries": model_forward_queries,
+        "optimizer_updates": observations,
+    }
+    execution_passes_per_shard = 2
+    campaign_shards = len(checked.seeds) * len(checked.arm_names)
     return {
         "schema": PLAN_SCHEMA,
         "seeds": list(checked.seeds),
@@ -209,14 +219,7 @@ def _plan_payload(plan: BiMUMatchedDevelopmentPlan) -> dict[str, object]:
             "model_forward_queries",
             "initial_state",
         ],
-        "expected_counters_per_arm": {
-            "environment_steps": observations,
-            "observations": observations,
-            "label_queries": label_queries,
-            "optimizer_seen": observations,
-            "model_forward_queries": model_forward_queries,
-            "optimizer_updates": observations,
-        },
+        "expected_counters_per_arm": expected_counters,
         "expected_resources_per_arm": {
             "trainable_scalar_count": config.trainable_scalar_count,
             "parameter_numeric_bytes": config.trainable_scalar_count * 4,
@@ -227,6 +230,26 @@ def _plan_payload(plan: BiMUMatchedDevelopmentPlan) -> dict[str, object]:
             "timing_qualified": False,
             "aggregate_working_set_bytes_claimed": False,
             "numeric_resource_ceiling_bytes": 256 * 1024 * 1024,
+        },
+        "transaction_execution_accounting": {
+            "campaign_shards": campaign_shards,
+            "initial_execution_dispatches_per_shard": 1,
+            "strict_reexecution_dispatches_per_shard": 1,
+            "total_execution_dispatches_per_shard": execution_passes_per_shard,
+            "total_campaign_execution_dispatches": (
+                campaign_shards * execution_passes_per_shard
+            ),
+            "per_shard_counters_including_strict_reexecution": {
+                field: value * execution_passes_per_shard
+                for field, value in expected_counters.items()
+            },
+            "campaign_counters_including_strict_reexecution": {
+                field: value * execution_passes_per_shard * campaign_shards
+                for field, value in expected_counters.items()
+            },
+            "dataset_loads_per_shard_process": 1,
+            "validated_array_tuple_reused_for_strict_reexecution": True,
+            "strict_reexecution_timing_retained": False,
         },
         "comparison_scope": {
             "paper_comparable": False,

@@ -21,7 +21,7 @@ def test_frozen_bimu_plan_is_matched_and_prospective() -> None:
     candidate = plan.candidate_config.to_protocol_payload()
     assert {key for key in control if control[key] != candidate[key]} == {"memory_window"}
     assert plan.dataset_sha256 == "85c681c2f5fc5c274870b30c9accb3d2a6e9eb90a4575a2bf1ccca64f58b6227"
-    assert FROZEN_PLAN_SHA256 == "182632b37c3a8598a30fb943742605374a846d965c5602f4db039f27f78754c1"
+    assert FROZEN_PLAN_SHA256 == "ab2cb84f4e93e7e3fed2c21a2e450b67ec917dce496701646d3040489f9587bd"
     assert bimu_plan.frozen_plan_payload()["seed_status"] == {
         "consumed_for_promotion": True,
         "retained_matched_result_exists": False,
@@ -33,6 +33,32 @@ def test_frozen_bimu_plan_is_matched_and_prospective() -> None:
     assert payload["expected_counters_per_arm"]["observations"] == 1280
     assert payload["expected_counters_per_arm"]["model_forward_queries"] == 10240
     assert payload["expected_counters_per_arm"]["optimizer_updates"] == 1280
+    assert payload["transaction_execution_accounting"] == {
+        "campaign_shards": 6,
+        "initial_execution_dispatches_per_shard": 1,
+        "strict_reexecution_dispatches_per_shard": 1,
+        "total_execution_dispatches_per_shard": 2,
+        "total_campaign_execution_dispatches": 12,
+        "per_shard_counters_including_strict_reexecution": {
+            "environment_steps": 2560,
+            "observations": 2560,
+            "label_queries": 2560,
+            "optimizer_seen": 2560,
+            "model_forward_queries": 20480,
+            "optimizer_updates": 2560,
+        },
+        "campaign_counters_including_strict_reexecution": {
+            "environment_steps": 15360,
+            "observations": 15360,
+            "label_queries": 15360,
+            "optimizer_seen": 15360,
+            "model_forward_queries": 122880,
+            "optimizer_updates": 15360,
+        },
+        "dataset_loads_per_shard_process": 1,
+        "validated_array_tuple_reused_for_strict_reexecution": True,
+        "strict_reexecution_timing_retained": False,
+    }
     assert payload["expected_resources_per_arm"] == {
         "trainable_scalar_count": 25408,
         "parameter_numeric_bytes": 101632,
