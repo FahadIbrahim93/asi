@@ -1096,7 +1096,12 @@ def test_config_scalars_canonicalize_reals_and_preserve_infinity_clip_sentinel()
             gradient.trace_decay,
         )
     )
-    huge_finite = np.longdouble("1e400")
+    # The widest finite value the platform's longdouble can hold. A literal such
+    # as ``np.longdouble("1e400")`` is only finite where longdouble is wider than
+    # float64; on aarch64 (macOS arm64) longdouble *is* float64, so it overflows
+    # to inf at parse and would be accepted as the documented infinity sentinel
+    # instead of exercising the finite-value float32 overflow rejection.
+    huge_finite = np.finfo(np.longdouble).max
     with pytest.raises(ValueError, match="retrace_clip"):
         OffPolicyTDLinearLearner(retrace_clip=huge_finite)
     with pytest.raises(ValueError, match="ratio_clip"):
