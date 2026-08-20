@@ -631,10 +631,19 @@ def _metric_history_values(
     history = cast(list[object], metrics_history)
     if len(history) > _BOOLEAN_TRACE_MAX_NODES:
         raise ValueError(f"{name} exceeds the boolean-trace value limit")
-    values: list[float] = []
+    # Every dictionary key is inspected below. Bound that aggregate work in a
+    # metadata-only pass so repeating one wide dictionary by pointer cannot
+    # amplify a small outer history into an effectively unbounded key walk.
+    remaining_keys = _BOOLEAN_TRACE_MAX_NODES
     for index, record in enumerate(history):
         if type(record) is not dict:
             raise ValueError(f"{name}[{index}] must be an exact dictionary")
+        if len(record) > remaining_keys:
+            raise ValueError(f"{name} exceeds the boolean-trace value limit")
+        remaining_keys -= len(record)
+    values: list[float] = []
+    for index, record in enumerate(history):
+        assert type(record) is dict
         if any(type(record_key) is not str for record_key in record):
             raise ValueError(f"{name}[{index}] keys must be exact strings")
         if key not in record:

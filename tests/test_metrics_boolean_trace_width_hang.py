@@ -31,6 +31,22 @@ def test_cumulative_error_rejects_oversized_metrics_history_before_walk(
         compute_cumulative_error([{"squared_error": 1.0}] * 9)
 
 
+def test_cumulative_error_bounds_shared_dictionary_key_walk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pointer aliases cannot multiply an individually admitted dict width."""
+    monkeypatch.setattr(metrics, "_BOOLEAN_TRACE_MAX_NODES", 8)
+    record = {
+        "squared_error": 1.0,
+        "a": 0.0,
+        "b": 0.0,
+        "c": 0.0,
+        "d": 0.0,
+    }
+    with pytest.raises(ValueError, match="boolean-trace value limit"):
+        compute_cumulative_error([record, record])
+
+
 def test_object_array_rejects_oversized_width_before_flat_walk(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
