@@ -13,6 +13,11 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Self, SupportsIndex, cast
 import numpy as np
 from numpy.typing import NDArray
 
+from alberta_framework._scan_resources import (
+    ScanBudget,
+    require_parallel_count,
+    require_step_units,
+)
 from alberta_framework.core._float32_scalars import validated_float32_scalar
 
 if TYPE_CHECKING:
@@ -40,7 +45,13 @@ _ACTUAL_FLOAT_TYPES = frozenset(
 _ALLOWED_REAL_TYPES = _ACTUAL_INT_TYPES | _ACTUAL_FLOAT_TYPES
 # Public last-fit in tests is n_bootstrap=500; the documented default is 10_000.
 # Origin handed unbounded counts to range(n_bootstrap) — hang, not leftover INT32 math.
-_BOOTSTRAP_MAX_COUNT = 10_000
+_BOOTSTRAP_BUDGET = ScanBudget(
+    "bootstrap resampling",
+    maximum_steps=10_000,
+    maximum_parallel=10_000,
+    maximum_step_units=1_000_000,
+)
+_BOOTSTRAP_MAX_COUNT = _BOOTSTRAP_BUDGET.maximum_steps
 
 
 def _require_exact_str(name: str, value: object) -> str:
@@ -964,6 +975,8 @@ def bootstrap_ci(
         raise ValueError(
             f"n_bootstrap count must be an integer in [1, {_BOOTSTRAP_MAX_COUNT}]"
         )
+    sample_count = require_parallel_count("sample count", len(arr), _BOOTSTRAP_BUDGET)
+    require_step_units(n_bootstrap, sample_count, _BOOTSTRAP_BUDGET)
     rng = np.random.default_rng(seed)
 
     stat_func = np.mean if statistic == "mean" else np.median

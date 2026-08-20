@@ -19,3 +19,14 @@ def test_documented_protocol_ceiling() -> None:
 def test_rejects_oversized_bootstrap_counts(value: int) -> None:
     with pytest.raises(ValueError, match="n_bootstrap count must be"):
         bootstrap_ci([1.0, 2.0, 3.0], n_bootstrap=value)
+
+
+def test_rejects_oversized_resample_product_before_rng(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail(*args: object, **kwargs: object) -> None:
+        raise AssertionError(f"RNG constructed: {args} {kwargs}")
+
+    monkeypatch.setattr("alberta_framework.utils.statistics.np.random.default_rng", fail)
+    with pytest.raises(ValueError, match="step-units exceed"):
+        bootstrap_ci([1.0] * 101)
