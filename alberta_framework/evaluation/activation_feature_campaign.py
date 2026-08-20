@@ -139,6 +139,12 @@ _MAX_JSON_STRING_BYTES: Final[int] = 64 * 1024
 _MAX_SHARD_BYTES: Final[int] = 4 * 1024 * 1024
 _MAX_AGGREGATE_BYTES: Final[int] = 128 * 1024 * 1024
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
+_CANONICAL_X_SHAPE: Final[tuple[int, int]] = (60_000, 784)
+_CANONICAL_Y_SHAPE: Final[tuple[int]] = (60_000,)
+_DATASET_MATERIALIZATION: Final[str] = (
+    "OpenML mnist_784 v1 rows 0:60000; float32 pixels scaled by "
+    "(x / 255 - 0.5) / 0.5 and int32 labels"
+)
 
 _PLAN_FIELDS = frozenset(
     {
@@ -332,26 +338,31 @@ def _runtime_identity() -> dict[str, object]:
     }
 
 
+def _canonical_dataset_shapes() -> tuple[tuple[int, int], tuple[int]]:
+    """Return the frozen train-split shapes (overridden only by bounded unit tests)."""
+
+    return _CANONICAL_X_SHAPE, _CANONICAL_Y_SHAPE
+
+
 def _validated_arrays(data_x: object, data_y: object) -> tuple[np.ndarray, np.ndarray]:
     if type(data_x) is not np.ndarray or data_x.dtype != np.dtype(np.float32):
         raise ValueError("data_x must be an exact float32 NumPy array")
     if type(data_y) is not np.ndarray or data_y.dtype != np.dtype(np.int32):
         raise ValueError("data_y must be an exact int32 NumPy array")
-    if (
-        data_x.ndim != 2
-        or data_y.ndim != 1
-        or data_x.shape[0] != data_y.shape[0]
-        or data_x.shape[0] < 5_000
-        or data_x.shape[1] != 784
-    ):
-        raise ValueError("dataset does not match the frozen IPMNIST input contract")
+    expected_x_shape, expected_y_shape = _canonical_dataset_shapes()
+    if data_x.shape != expected_x_shape or data_y.shape != expected_y_shape:
+        raise ValueError("dataset does not match the frozen OpenML MNIST train split")
+    if not data_x.flags.c_contiguous or not data_y.flags.c_contiguous:
+        raise ValueError("dataset arrays must use canonical C-contiguous storage")
     if data_x.nbytes + data_y.nbytes > 256 * 1024 * 1024:
         raise ValueError("dataset exceeds the 256 MiB campaign bound")
     if not np.isfinite(data_x).all():
         raise ValueError("data_x must be finite")
+    if np.any(data_x < -1.0) or np.any(data_x > 1.0):
+        raise ValueError("data_x must use the frozen [-1, 1] scaling")
     if np.any(data_y < 0) or np.any(data_y >= 10):
         raise ValueError("data_y lies outside the frozen ten-class label range")
-    return np.array(data_x, copy=True, order="C"), np.array(data_y, copy=True, order="C")
+    return data_x, data_y
 
 
 def _dataset_identity(data_x: np.ndarray, data_y: np.ndarray) -> dict[str, object]:
@@ -360,7 +371,16 @@ def _dataset_identity(data_x: np.ndarray, data_y: np.ndarray) -> dict[str, objec
         "provider": "OpenML",
         "dataset": "mnist_784",
         "version": 1,
+        "row_start": 0,
+        "row_stop_exclusive": data_x.shape[0],
+        "materialization": _DATASET_MATERIALIZATION,
         "sha256": _array_bundle_sha256(data_x, data_y),
+        "x_sha256": screening_lane._array_bundle_sha256(
+            "alberta.ipmnist_screening.materialized_x.v1", {"x": data_x}
+        ),
+        "y_sha256": screening_lane._array_bundle_sha256(
+            "alberta.ipmnist_screening.materialized_y.v1", {"y": data_y}
+        ),
         "x_shape": list(data_x.shape),
         "y_shape": list(data_y.shape),
         "x_dtype": data_x.dtype.str,
@@ -597,7 +617,12 @@ def _validated_dataset_identity(value: object) -> dict[str, object]:
             "provider",
             "dataset",
             "version",
+            "row_start",
+            "row_stop_exclusive",
+            "materialization",
             "sha256",
+            "x_sha256",
+            "y_sha256",
             "x_shape",
             "y_shape",
             "x_dtype",
@@ -613,7 +638,11 @@ def _validated_dataset_identity(value: object) -> dict[str, object]:
         or dataset["provider"] != "OpenML"
         or dataset["dataset"] != "mnist_784"
         or dataset["version"] != 1
+        or dataset["row_start"] != 0
+        or dataset["materialization"] != _DATASET_MATERIALIZATION
         or not _is_sha256(dataset["sha256"])
+        or not _is_sha256(dataset["x_sha256"])
+        or not _is_sha256(dataset["y_sha256"])
         or type(x_shape) is not list
         or len(x_shape) != 2
         or any(type(item) is not int for item in x_shape)
@@ -626,8 +655,13 @@ def _validated_dataset_identity(value: object) -> dict[str, object]:
         raise ValueError("plan dataset identity differs from frozen MNIST")
     checked_x_shape = cast(list[int], x_shape)
     checked_y_shape = cast(list[int], y_shape)
-    rows = checked_x_shape[0]
-    if rows < 5_000 or checked_x_shape != [rows, 784] or checked_y_shape != [rows]:
+    expected_x_shape, expected_y_shape = _canonical_dataset_shapes()
+    rows = expected_x_shape[0]
+    if (
+        checked_x_shape != list(expected_x_shape)
+        or checked_y_shape != list(expected_y_shape)
+        or dataset["row_stop_exclusive"] != rows
+    ):
         raise ValueError("plan dataset row count is invalid")
     numeric_bytes = dataset["numeric_bytes"]
     if type(numeric_bytes) is not int or numeric_bytes != rows * (784 + 1) * 4:
@@ -805,6 +839,7 @@ def build_shard(
     if type(seed) is not int or seed not in seeds:
         raise ValueError("seed is outside the frozen matrix")
     x, y = _validated_arrays(data_x, data_y)
+    dataset_identity = _dataset_identity(x, y)
     execution_identity = _expected_execution_identity(stage, seed, x.shape[0])
     result = run_activation_feature_arm(
         x,
@@ -820,6 +855,8 @@ def build_shard(
             result, outcome="inconclusive", development_seeds=seeds
         )
     )
+    if result.dataset_sha256 != dataset_identity["sha256"]:
+        raise RuntimeError("dataset identity changed during shard execution")
     shard = _unsigned_shard(
         checked_plan,
         arm=arm,

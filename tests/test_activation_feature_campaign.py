@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
 
@@ -20,6 +21,14 @@ def data() -> tuple[np.ndarray, np.ndarray]:
     x = np.zeros((5_000, 784), dtype=np.float32)
     y = np.arange(5_000, dtype=np.int32) % 10
     return x, y
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _bounded_dataset_shapes() -> Iterator[None]:
+    patch = pytest.MonkeyPatch()
+    patch.setattr(campaign, "_canonical_dataset_shapes", lambda: ((5_000, 784), (5_000,)))
+    yield
+    patch.undo()
 
 
 @pytest.fixture(scope="module")
@@ -173,11 +182,26 @@ def test_both_plans_freeze_full_11_by_5_matrix_without_horizon_shrink(
     assert campaign.validate_plan(copy.deepcopy(cheap), data_x=data[0], data_y=data[1]) == cheap
 
 
+def test_production_dataset_contract_names_the_full_canonical_train_split() -> None:
+    assert campaign._CANONICAL_X_SHAPE == (60_000, 784)
+    assert campaign._CANONICAL_Y_SHAPE == (60_000,)
+    assert "rows 0:60000" in campaign._DATASET_MATERIALIZATION
+
+
 def test_plan_binds_exact_source_runtime_dataset_resources_and_paper_limits(
     cheap_plan: dict[str, object], data: tuple[np.ndarray, np.ndarray]
 ) -> None:
     identity = cast(dict[str, Any], cheap_plan["identity"])
-    assert identity["dataset"]["sha256"] == activation._array_bundle_sha256(*data)
+    dataset = identity["dataset"]
+    assert dataset["sha256"] == activation._array_bundle_sha256(*data)
+    assert dataset["row_start"] == 0
+    assert dataset["row_stop_exclusive"] == 5_000
+    assert dataset["x_sha256"] == campaign.screening_lane._array_bundle_sha256(
+        "alberta.ipmnist_screening.materialized_x.v1", {"x": data[0]}
+    )
+    assert dataset["y_sha256"] == campaign.screening_lane._array_bundle_sha256(
+        "alberta.ipmnist_screening.materialized_y.v1", {"y": data[1]}
+    )
     assert set(identity["source_sha256"]) == {
         "alberta_framework/benchmarks/activation_feature_ipmnist.py",
         "alberta_framework/benchmarks/ipmnist_screening.py",
@@ -192,6 +216,19 @@ def test_plan_binds_exact_source_runtime_dataset_resources_and_paper_limits(
     parity = cast(dict[str, Any], cheap_plan["paper_parity"])
     assert parity["paper_protocol_parity_claimed"] is False
     assert parity["paper_result_reproduction_claimed"] is False
+
+
+def test_plan_rejects_noncanonical_dataset_metadata_before_hashing(
+    data: tuple[np.ndarray, np.ndarray], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("dataset bytes were hashed before static metadata")
+
+    monkeypatch.setattr(campaign, "_array_bundle_sha256", forbidden)
+    with pytest.raises(ValueError, match="frozen OpenML MNIST train split"):
+        campaign.build_plan("cheap_screen", data[0][:-1], data[1][:-1])
+    with pytest.raises(ValueError, match="C-contiguous"):
+        campaign.build_plan("cheap_screen", data[0][:, ::-1], data[1])
 
 
 def test_plan_rejects_resigned_horizon_dataset_and_runtime_forgery(
