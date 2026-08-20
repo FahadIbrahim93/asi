@@ -23,4 +23,7 @@ docker run --rm asi-coom-qualification:development > receipt.second.json
 Compare `trace_sha256`, not the telemetry-only elapsed time or platform string.
 The smoke consumes seed 1582000, all eight official CO8 tasks, and two action-0
 steps per task. A matching trace is a deterministic runtime qualification check,
-not authenticated execution attestation or a COOM result.
+not authenticated execution attestation or a COOM result. Local audit receipts
+are not retained by this directory; callers that need a durable qualification
+record must publish the complete stdout receipt in a separately reviewed,
+append-only output namespace.

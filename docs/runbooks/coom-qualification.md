@@ -75,10 +75,13 @@ The separate `external_runtimes/coom/` directory now supplies a digest-pinned,
 hash-locked Linux qualification image. Its fixed-action smoke executes the real
 ViZDoom engine for two steps in each official CO8 task, verifies the pinned
 source/license/WAD/config identity, and reports an unattested, nonpromoting
-runtime receipt. Two clean executions at seed 1582000 produced the same trace
-SHA-256 `c74968494ccebaaeac4bc1e0c0f1db7546ac5091b831c05a4c0c727266da696f`;
-timing remains telemetry-only. This closes the bounded engine-load/reset/step
-determinism prerequisite, not the full benchmark or learner qualification.
+runtime receipt. A local audit ran the image twice at seed 1582000 and observed
+the same trace SHA-256
+`c74968494ccebaaeac4bc1e0c0f1db7546ac5091b831c05a4c0c727266da696f`.
+Those receipts were not retained, so the digest is a reproducibility target,
+not execution evidence; timing remains telemetry-only. The runtime closes the
+bounded engine-load/reset/step implementation prerequisite, not the full
+benchmark or learner qualification.
 
 ## Gates still open
 
