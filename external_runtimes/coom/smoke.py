@@ -19,7 +19,6 @@ import sys
 import time
 from collections.abc import Sequence
 from pathlib import Path
-from typing import cast
 
 import numpy as np
 
@@ -52,6 +51,8 @@ _MAX_RECEIPT_BYTES = 1024 * 1024
 
 
 def _array_sha256(value: np.ndarray) -> str:
+    if type(value) is not np.ndarray:
+        raise ValueError("observation must be an exact NumPy array before hashing")
     digest = hashlib.sha256()
     digest.update(value.dtype.str.encode("ascii"))
     digest.update(np.asarray(value.shape, dtype="<i8").tobytes())
@@ -123,9 +124,57 @@ def _source_tree_sha1(root: Path) -> str:
     return tree(root).hex()
 
 
-def _exact_keys(value: object, expected: set[str], *, name: str) -> dict[str, object]:
-    if type(value) is not dict or set(value) != expected:
+def _exact_keys(
+    value: object, expected: set[str] | frozenset[str], *, name: str
+) -> dict[str, object]:
+    if type(value) is not dict:
         raise ValueError(f"{name} fields differ from the qualification schema")
+    keys = tuple(value.keys())
+    if any(type(key) is not str for key in keys):
+        raise ValueError(f"{name} keys must be exact strings")
+    if frozenset(keys) != frozenset(expected):
+        raise ValueError(f"{name} fields differ from the qualification schema")
+    return value
+
+
+def _exact_str(value: object, *, name: str, maximum: int = 256) -> str:
+    if type(value) is not str or not 1 <= len(value.encode("utf-8")) <= maximum:
+        raise ValueError(f"{name} must be a bounded exact string")
+    return value
+
+
+def _exact_int(value: object, *, name: str, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{name} must be an exact integer >= {minimum}")
+    return value
+
+
+def _exact_bool(value: object, *, name: str) -> bool:
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be an exact bool")
+    return value
+
+
+def _exact_int_list(value: object, expected: list[int], *, name: str) -> list[int]:
+    if (
+        type(value) is not list
+        or len(value) != len(expected)
+        or any(type(item) is not int for item in value)
+        or value != expected
+    ):
+        raise ValueError(f"{name} differs from the exact integer list")
+    return value
+
+
+def _trusted_observation(value: object, *, name: str) -> np.ndarray:
+    if type(value) is not np.ndarray:
+        raise ValueError(f"{name} must be an exact NumPy array")
+    if value.dtype != np.dtype(np.float64) or value.shape != (84, 84, 3):
+        raise ValueError(f"{name} shape or dtype differs from the runtime contract")
+    if value.nbytes != 84 * 84 * 3 * np.dtype(np.float64).itemsize:
+        raise ValueError(f"{name} byte count differs from its shape and dtype")
+    if not np.isfinite(value).all():
+        raise ValueError(f"{name} must contain only finite values")
     return value
 
 
@@ -171,9 +220,11 @@ def _load_qualification_manifest() -> dict[str, object]:
         },
         name="qualification manifest",
     )
-    if manifest["schema"] != "asi.coom_external_runtime.inputs.v1":
+    if _exact_str(manifest["schema"], name="manifest schema") != (
+        "asi.coom_external_runtime.inputs.v1"
+    ):
         raise ValueError("qualification manifest schema differs")
-    if manifest["base_image_digest"] != (
+    if _exact_str(manifest["base_image_digest"], name="base image digest") != (
         "python:3.12.12-slim-bookworm@sha256:"
         "593bd06efe90efa80dc4eee3948be7c0fde4134606dd40d8dd8dbcade98e669c"
     ):
@@ -231,7 +282,7 @@ def _trace() -> tuple[list[dict[str, object]], int]:
 
     start = time.perf_counter_ns()
     records: list[dict[str, object]] = []
-    environments = make_sequence(
+    environments_value = make_sequence(
         Sequence.CO8,
         doom_kwargs={
             "seed": SEED,
@@ -255,34 +306,50 @@ def _trace() -> tuple[list[dict[str, object]], int]:
             "sparse_rewards": False,
         },
     )
+    if type(environments_value) is not list or len(environments_value) != len(TASK_NAMES):
+        raise ValueError("COOM provider must return exactly eight environments in a list")
+    environments = environments_value
     try:
-        for task_index, environment in enumerate(environments):
-            observation, reset_info = environment.reset()
-            if type(reset_info) is not dict or reset_info:
-                raise ValueError("COOM reset info must remain the exact empty safe subset")
-            reset = np.asarray(observation)
+        for task_index, (environment, expected_name) in enumerate(
+            zip(environments, TASK_NAMES, strict=True)
+        ):
+            observed_name = environment.unwrapped.name
+            if _exact_str(observed_name, name="environment name") != expected_name:
+                raise ValueError("COOM environment order or name differs")
+            reset_result = environment.reset()
+            if type(reset_result) is not tuple or len(reset_result) != 2:
+                raise ValueError("COOM reset must return an exact two-tuple")
+            observation, reset_info = reset_result
+            _exact_keys(reset_info, frozenset(), name="reset info")
+            reset = _trusted_observation(observation, name="reset observation")
             steps: list[dict[str, object]] = []
             for _ in range(STEPS_PER_TASK):
-                observation, reward, terminated, truncated, info = environment.step(0)
-                if type(info) is not dict or info:
-                    raise ValueError("COOM step info must remain the exact empty safe subset")
-                value = np.asarray(observation)
+                step_result = environment.step(0)
+                if type(step_result) is not tuple or len(step_result) != 5:
+                    raise ValueError("COOM step must return an exact five-tuple")
+                observation, reward, terminated, truncated, info = step_result
+                _exact_keys(info, frozenset(), name="step info")
+                value = _trusted_observation(observation, name="step observation")
+                if type(reward) is not float or not math.isfinite(reward):
+                    raise ValueError("COOM reward must be an exact finite float")
+                if type(terminated) is not bool or type(truncated) is not bool:
+                    raise ValueError("COOM termination flags must be exact bools")
                 steps.append(
                     {
                         "action": 0,
                         "observation_sha256": _array_sha256(value),
                         "observation_shape": list(value.shape),
                         "observation_dtype": value.dtype.str,
-                        "reward": float(reward),
-                        "terminated": bool(terminated),
-                        "truncated": bool(truncated),
+                        "reward": reward,
+                        "terminated": terminated,
+                        "truncated": truncated,
                         "info": {},
                     }
                 )
             records.append(
                 {
                     "task_index": task_index,
-                    "name": environment.unwrapped.name,
+                    "name": observed_name,
                     "reset_info": {},
                     "reset_observation_sha256": _array_sha256(reset),
                     "reset_observation_shape": list(reset.shape),
@@ -311,11 +378,17 @@ def _validate_receipt(receipt: object) -> None:
         },
         name="receipt",
     )
-    if root["schema"] != SCHEMA:
+    if _exact_str(root["schema"], name="receipt schema") != SCHEMA:
         raise ValueError("receipt schema differs")
     manifest = _load_qualification_manifest()
-    if root["qualification_inputs"] != manifest:
-        raise ValueError("receipt qualification inputs differ from verified local bytes")
+    supplied_manifest = _exact_keys(
+        root["qualification_inputs"],
+        frozenset(manifest),
+        name="receipt qualification inputs",
+    )
+    for field, expected in manifest.items():
+        if _exact_str(supplied_manifest[field], name=f"receipt {field}") != expected:
+            raise ValueError("receipt qualification inputs differ from verified local bytes")
     source = _exact_keys(
         root["source"],
         {
@@ -348,6 +421,24 @@ def _validate_receipt(receipt: object) -> None:
         "qualification_patch_scope": "gym RewardWrapper import only",
         "patched_reward_wrapper_sha256": PATCHED_REWARD_WRAPPER_SHA256,
     }
+    for name in (
+        "repository",
+        "commit",
+        "git_tree",
+        "license",
+        "qualification_patch_scope",
+    ):
+        _exact_str(source[name], name=f"source {name}", maximum=512)
+    for name in (
+        "archive_sha256",
+        "license_sha256",
+        "asset_manifest_sha256",
+        "qualification_patch_sha256",
+        "patched_reward_wrapper_sha256",
+    ):
+        _sha256(source[name], name=f"source {name}")
+    _exact_int(source["asset_count"], name="asset count", minimum=1)
+    _exact_int(source["asset_bytes"], name="asset bytes", minimum=1)
     if source != expected_source:
         raise ValueError("source identity differs from the exact qualification inputs")
     runtime = _exact_keys(
@@ -373,24 +464,26 @@ def _validate_receipt(receipt: object) -> None:
         "vizdoom": "1.3.0",
         "opencv_python_headless": "4.11.0.86",
     }
-    if any(runtime.get(name) != value for name, value in expected_versions.items()):
+    for name in runtime:
+        _exact_str(runtime[name], name=f"runtime {name}", maximum=256)
+    if any(runtime[name] != value for name, value in expected_versions.items()):
         raise ValueError("runtime versions differ from the hash-locked qualification")
-    if type(runtime["platform"]) is not str or not 1 <= len(runtime["platform"]) <= 256:
-        raise ValueError("platform telemetry must be a bounded exact string")
     trace = _exact_keys(
         root["trace"],
         {"seed", "sequence", "steps_per_task", "fixed_action", "frame_skip", "resize", "records"},
         name="trace",
     )
-    if {key: trace[key] for key in trace if key != "records"} != {
-        "seed": SEED,
-        "sequence": "CO8",
-        "steps_per_task": 2,
-        "fixed_action": 0,
-        "frame_skip": 4,
-        "resize": [84, 84],
-    }:
+    for name, expected in (
+        ("seed", SEED),
+        ("steps_per_task", 2),
+        ("fixed_action", 0),
+        ("frame_skip", 4),
+    ):
+        if _exact_int(trace[name], name=f"trace {name}") != expected:
+            raise ValueError("trace protocol differs from the frozen qualification smoke")
+    if _exact_str(trace["sequence"], name="trace sequence") != "CO8":
         raise ValueError("trace protocol differs from the frozen qualification smoke")
+    _exact_int_list(trace["resize"], [84, 84], name="trace resize")
     records = trace["records"]
     if type(records) is not list or len(records) != 8:
         raise ValueError("trace must contain exactly eight ordered task records")
@@ -408,15 +501,16 @@ def _validate_receipt(receipt: object) -> None:
             },
             name=f"task {task_index}",
         )
-        if (
-            record["task_index"] != task_index
-            or type(record["task_index"]) is not int
-            or record["name"] != task_name
-            or record["reset_info"] != {}
-            or record["reset_observation_shape"] != [84, 84, 3]
-            or record["reset_observation_dtype"] != "<f8"
-        ):
+        if _exact_int(record["task_index"], name="task index") != task_index:
             raise ValueError("task record identity or reset payload differs")
+        if _exact_str(record["name"], name="task name") != task_name:
+            raise ValueError("task record identity or reset payload differs")
+        _exact_keys(record["reset_info"], frozenset(), name="receipt reset info")
+        _exact_int_list(
+            record["reset_observation_shape"], [84, 84, 3], name="reset shape"
+        )
+        if _exact_str(record["reset_observation_dtype"], name="reset dtype") != "<f8":
+            raise ValueError("task reset dtype differs")
         _sha256(record["reset_observation_sha256"], name="reset observation hash")
         steps = record["steps"]
         if type(steps) is not list or len(steps) != 2:
@@ -436,23 +530,21 @@ def _validate_receipt(receipt: object) -> None:
                 },
                 name="step",
             )
-            if (
-                type(step["action"]) is not int
-                or step["action"] != 0
-                or step["info"] != {}
-                or step["observation_dtype"] != "<f8"
-                or step["observation_shape"] != [84, 84, 3]
-                or type(step["reward"]) not in (int, float)
-                or not math.isfinite(float(cast(int | float, step["reward"])))
-                or type(step["terminated"]) is not bool
-                or type(step["truncated"]) is not bool
-            ):
+            if _exact_int(step["action"], name="step action") != 0:
                 raise ValueError("step payload differs from the exact bounded contract")
+            _exact_keys(step["info"], frozenset(), name="receipt step info")
+            if _exact_str(step["observation_dtype"], name="step dtype") != "<f8":
+                raise ValueError("step dtype differs")
+            _exact_int_list(step["observation_shape"], [84, 84, 3], name="step shape")
+            if type(step["reward"]) is not float or not math.isfinite(step["reward"]):
+                raise ValueError("step reward must be an exact finite float")
+            _exact_bool(step["terminated"], name="step terminated")
+            _exact_bool(step["truncated"], name="step truncated")
             _sha256(step["observation_sha256"], name="step observation hash")
     trace_bytes = json.dumps(trace, sort_keys=True, separators=(",", ":")).encode("utf-8")
     observed_trace_sha256 = hashlib.sha256(trace_bytes).hexdigest()
     if (
-        root["trace_sha256"] != observed_trace_sha256
+        _sha256(root["trace_sha256"], name="trace hash") != observed_trace_sha256
         or observed_trace_sha256 != EXPECTED_TRACE_SHA256
     ):
         raise ValueError("trace differs from the independently repeated deterministic golden")
@@ -498,6 +590,8 @@ def _validate_receipt(receipt: object) -> None:
         },
         name="claims",
     )
+    for name in claims:
+        _exact_bool(claims[name], name=f"claim {name}")
     if claims != {
         "external_runtime_executed": True,
         "execution_attested": False,

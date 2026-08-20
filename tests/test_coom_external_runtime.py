@@ -5,12 +5,33 @@ import copy
 import hashlib
 import importlib.util
 import json
+import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
 ROOT = Path("external_runtimes/coom")
+
+
+class _HookStr(str):
+    calls = 0
+
+    def __hash__(self) -> int:
+        type(self).calls += 1
+        return super().__hash__()
+
+    def __eq__(self, other: object) -> bool:
+        type(self).calls += 1
+        return super().__eq__(other)
+
+
+class _ArrayHook:
+    calls = 0
+
+    def __array__(self, *_args: object, **_kwargs: object) -> object:
+        type(self).calls += 1
+        raise AssertionError("hostile array hook ran")
 
 
 def _smoke_module() -> ModuleType:
@@ -73,8 +94,8 @@ def test_coom_runtime_smoke_is_bounded_external_and_nonpromoting() -> None:
     assert "_source_tree_sha1(root) != SOURCE_TREE" in source
     assert "_validate_receipt(receipt)" in source
     assert "EXPECTED_TRACE_SHA256" in source
-    assert "type(reset_info) is not dict or reset_info" in source
-    assert "type(info) is not dict or info" in source
+    assert '_exact_keys(reset_info, frozenset(), name="reset info")' in source
+    assert '_exact_keys(info, frozenset(), name="step info")' in source
 
 
 def test_coom_receipt_validator_rejects_hostile_provider_payloads(
@@ -171,7 +192,7 @@ def test_coom_receipt_validator_rejects_hostile_provider_payloads(
 
     hostile = copy.deepcopy(receipt)
     hostile["trace"]["records"][0]["steps"][0]["info"] = {"object": object()}
-    with pytest.raises(ValueError, match="step payload"):
+    with pytest.raises(ValueError, match="receipt step info"):
         smoke._validate_receipt(hostile)
     hostile = copy.deepcopy(receipt)
     hostile["claims"]["execution_attested"] = True
@@ -181,6 +202,14 @@ def test_coom_receipt_validator_rejects_hostile_provider_payloads(
     hostile["resource_receipt"]["environment_steps"] = True
     with pytest.raises(ValueError, match="resource receipt"):
         smoke._validate_receipt(hostile)
+
+
+    hostile = copy.deepcopy(receipt)
+    hostile["trace"]["sequence"] = _HookStr("CO8")
+    _HookStr.calls = 0
+    with pytest.raises(ValueError, match="trace sequence"):
+        smoke._validate_receipt(hostile)
+    assert _HookStr.calls == 0
 
 
 def test_coom_retained_receipt_loader_is_bounded_and_fail_closed(tmp_path: Path) -> None:
@@ -200,3 +229,45 @@ def test_coom_retained_receipt_loader_is_bounded_and_fail_closed(tmp_path: Path)
     receipt.symlink_to(target)
     with pytest.raises(ValueError, match="regular file"):
         smoke._load_receipt(receipt)
+
+def test_exact_key_admission_rejects_hostile_key_without_dispatch() -> None:
+    smoke = _smoke_module()
+    hostile_key = _HookStr("schema")
+    value = {hostile_key: "x"}
+    _HookStr.calls = 0
+    with pytest.raises(ValueError, match="keys must be exact strings"):
+        smoke._exact_keys(value, {"schema"}, name="hostile")
+    assert _HookStr.calls == 0
+
+
+def test_provider_observation_is_rejected_before_array_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _smoke_module()
+
+    class Environment:
+        unwrapped = SimpleNamespace(name=smoke.TASK_NAMES[0])
+
+        def reset(self) -> tuple[object, dict[str, object]]:
+            return _ArrayHook(), {}
+
+        def close(self) -> None:
+            return None
+
+    builder = ModuleType("COOM.env.builder")
+    builder.build_multi_discrete_actions = object()
+    builder.make_sequence = lambda *_args, **_kwargs: [Environment()] * 8
+    config = ModuleType("COOM.utils.config")
+    config.Sequence = SimpleNamespace(CO8=object())
+    for name, module in (
+        ("COOM", ModuleType("COOM")),
+        ("COOM.env", ModuleType("COOM.env")),
+        ("COOM.env.builder", builder),
+        ("COOM.utils", ModuleType("COOM.utils")),
+        ("COOM.utils.config", config),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    _ArrayHook.calls = 0
+    with pytest.raises(ValueError, match="exact NumPy array"):
+        smoke._trace()
+    assert _ArrayHook.calls == 0
