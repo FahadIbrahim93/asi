@@ -20,8 +20,8 @@ def _patch_identities(
 ) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
     run_runtime = receipts[0]["runtime"]
     dataset = {
-        "x": {"shape": [60_000, 784], "sha256": receipts[0]["dataset"]["x_sha256"]},
-        "y": {"shape": [60_000], "sha256": receipts[0]["dataset"]["y_sha256"]},
+        "x": {"shape": [60_000, 784], "sha256": matched.CANONICAL_X_SHA256},
+        "y": {"shape": [60_000], "sha256": matched.CANONICAL_Y_SHA256},
     }
     source = {"git_commit": "c" * 40, "relevant_source_sha256": "a" * 64}
     runtime = {
@@ -68,6 +68,8 @@ def receipts() -> list[dict[str, object]]:
         receipt["seed"] = seed
         receipt["profile"] = matched.PROFILE
         receipt["frozen_development_seeds"] = list(matched.SEEDS)
+        receipt["dataset"]["x_sha256"] = matched.CANONICAL_X_SHA256
+        receipt["dataset"]["y_sha256"] = matched.CANONICAL_Y_SHA256
         receipt["dataset"]["rows"] = 60_000
         receipt["dataset"]["loaded_numeric_bytes"] = 60_000 * (4 * 4 + 4)
         result.append(receipt)
@@ -92,6 +94,52 @@ def test_plan_is_prospective_exact_and_permanently_nonpromoting() -> None:
         "row_start": 0,
         "row_stop_exclusive": 60_000,
     }
+    assert plan["dataset"]["arrays"] == {
+        "x": {
+            "dtype": "<f4",
+            "shape": [60_000, 784],
+            "sha256": matched.CANONICAL_X_SHA256,
+        },
+        "y": {
+            "dtype": "<i4",
+            "shape": [60_000],
+            "sha256": matched.CANONICAL_Y_SHA256,
+        },
+    }
+
+
+def test_canonical_dataset_hashes_are_required_before_dispatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = {
+        "x": {"shape": [60_000, 784], "sha256": "0" * 64},
+        "y": {"shape": [60_000], "sha256": "1" * 64},
+    }
+    monkeypatch.setattr(matched, "_validated_dataset_provenance", lambda value, **_: value)
+    destination = tmp_path / "report.json"
+    monkeypatch.setattr(matched, "OUTPUT_PATH", destination)
+    monkeypatch.setattr(matched, "_EXECUTION_AUTHORIZED", True)
+    monkeypatch.setattr(matched, "_current_source_provenance", lambda: {})
+    monkeypatch.setattr(matched, "_current_runtime_environment", lambda: {})
+    monkeypatch.setattr(
+        matched,
+        "load_mnist_train",
+        lambda _: (np.zeros((1, 1), dtype=np.float32), np.zeros(1, dtype=np.int32)),
+    )
+    monkeypatch.setattr(matched, "_screening_dataset_provenance", lambda *_: fake)
+    dispatched = 0
+
+    def unexpected_dispatch(*_: object, **__: object) -> Never:
+        nonlocal dispatched
+        dispatched += 1
+        raise AssertionError("reserved seeds must not dispatch")
+
+    monkeypatch.setattr(matched, "_run_matched_adamo_diagnostic", unexpected_dispatch)
+    with pytest.raises(ValueError, match="canonical OpenML materialization"):
+        matched.run_campaign(Path("unused"), destination)
+    assert dispatched == 0
+    assert not destination.exists()
 
 
 def test_report_recomputes_paired_statistics_and_retains_every_outcome(

@@ -212,7 +212,7 @@ def _run_matched_adamo_diagnostic(
     seed: int,
     capability: object,
 ) -> dict[str, object]:
-    """Private matched executor reachable only after the aggregate authorization gate."""
+    """Internal matched executor requiring the aggregate's exact capability token."""
     if capability is not _MATCHED_EXECUTION_CAPABILITY:
         raise RuntimeError("matched AdamO execution capability is unavailable")
     if type(profile) is not str or profile != "bounded-development":

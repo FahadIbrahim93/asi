@@ -74,7 +74,8 @@ matrix. The prospectively frozen, repository-audited `9156001`-`9156004` schedul
 through `asi-adamo-matched-development` after a separate authorization review. Any exposed
 outcome consumes those seeds and can never promote a claim. The plan also freezes the exact
 OpenML `mnist_784` version 1 rows 0--59999 materialization and records canonical per-array
-dtype, shape, and SHA-256 identities at execution. There is no opaque or unavailable NPZ input.
+dtype, shape, and SHA-256 identities before execution; dispatch fails closed unless the loaded
+arrays match those frozen hashes. There is no opaque or unavailable NPZ input.
 Use `--data-home` to select an OpenML cache; it does not change the frozen source selection or
 materialized-array validation. Reports validate structurally against their pinned runtime by
 default, so a GPU-produced report remains auditable on CPU; execution and publication separately

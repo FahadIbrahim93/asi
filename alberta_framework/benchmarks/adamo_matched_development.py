@@ -1,7 +1,7 @@
 """Prospectively frozen, permanently nonpromoting AdamO matched screen.
 
-The initial merge keeps execution closed. A separate reviewed authorization
-change must flip ``_EXECUTION_AUTHORIZED`` before the reserved matrix can run.
+Execution is closed until a separate reviewed authorization change flips
+``_EXECUTION_AUTHORIZED`` for the reserved matrix.
 """
 
 from __future__ import annotations
@@ -52,6 +52,12 @@ CONTROL_ARM: Final[str] = "adamw_control"
 CANDIDATE_ARMS: Final[tuple[str, ...]] = ("adamo_l1e3", "adam_iso_joint_l1e3")
 T95_DF3: Final[float] = 3.1824463052837078
 DATASET_NUMERIC_BYTES: Final[int] = 188_400_000
+CANONICAL_X_SHA256: Final[str] = (
+    "b8078cd833f53d89828a5e28d728517be9add34076f13fe973399f1f16381313"
+)
+CANONICAL_Y_SHA256: Final[str] = (
+    "4f1dd9551f104f8153409e0add59f0a71568f7bad5a5f8e2274480c186fe219a"
+)
 _EXECUTION_AUTHORIZED: Final[bool] = False
 _HEX: Final[frozenset[str]] = frozenset("0123456789abcdef")
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
@@ -131,8 +137,18 @@ def frozen_plan() -> dict[str, object]:
                 "row_stop_exclusive": 60000,
             },
             "numeric_bytes": DATASET_NUMERIC_BYTES,
-            "dtypes": ["<f4", "<i4"],
-            "shapes": [[60000, 784], [60000]],
+            "arrays": {
+                "x": {
+                    "dtype": "<f4",
+                    "shape": [60000, 784],
+                    "sha256": CANONICAL_X_SHA256,
+                },
+                "y": {
+                    "dtype": "<i4",
+                    "shape": [60000],
+                    "sha256": CANONICAL_Y_SHA256,
+                },
+            },
             "materialization": (
                 "OpenML mnist_784 v1 rows 0:60000; float32 pixels scaled by "
                 "(x / 255 - 0.5) / 0.5 and int32 labels"
@@ -252,6 +268,24 @@ def _current_source_provenance() -> dict[str, object]:
 
 def _current_runtime_environment() -> dict[str, object]:
     return _screening_runtime_environment()
+
+
+def _validated_canonical_dataset_provenance(
+    value: object, *, context: str
+) -> dict[str, Any]:
+    provenance = _validated_dataset_provenance(value, context=context)
+    x_binding = cast(dict[str, object], provenance["x"])
+    y_binding = cast(dict[str, object], provenance["y"])
+    if (
+        x_binding["sha256"] != CANONICAL_X_SHA256
+        or y_binding["sha256"] != CANONICAL_Y_SHA256
+    ):
+        raise ValueError(
+            f"{context} dataset does not match the frozen canonical OpenML materialization"
+        )
+    return provenance
+
+
 def _validate_plan(value: object) -> dict[str, object]:
     expected = frozen_plan()
     plan = _exact_object(value, frozenset(expected), context="plan")
@@ -380,7 +414,7 @@ def build_report(
             raise ValueError("receipt profile does not match the frozen plan")
         by_seed[seed] = receipt
         ordered.append(receipt)
-    normalized_dataset = _validated_dataset_provenance(
+    normalized_dataset = _validated_canonical_dataset_provenance(
         dataset_provenance, context="AdamO report"
     )
     normalized_source = _validated_source_provenance(
@@ -452,7 +486,7 @@ def validate_report(
     if type(report["schema"]) is not str or report["schema"] != SCHEMA:
         raise ValueError("report schema does not match the frozen protocol")
     _validate_plan(report["plan"])
-    dataset_provenance = _validated_dataset_provenance(
+    dataset_provenance = _validated_canonical_dataset_provenance(
         report["dataset_provenance"], context="AdamO report"
     )
     source = _validated_source_provenance(
@@ -728,6 +762,9 @@ def run_campaign(
         runtime_before = _current_runtime_environment()
         inputs, labels = load_mnist_train(data_home)
         dataset_before = _screening_dataset_provenance(inputs, labels)
+        _validated_canonical_dataset_provenance(
+            dataset_before, context="AdamO execution"
+        )
         receipts = [
             _run_matched_adamo_diagnostic(
                 inputs,
