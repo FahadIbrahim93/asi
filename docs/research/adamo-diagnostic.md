@@ -41,6 +41,8 @@ Run only on a caller-materialized NPZ containing exactly float32 `inputs` and in
 .venv/bin/asi-adamo-diagnostic --catalog
 .venv/bin/asi-adamo-diagnostic --dataset /new/path/data.npz \
   --profile contract-smoke --seed 15600
+.venv/bin/asi-adamo-matched-development --dataset /new/path/data.npz \
+  --profile bounded-development --output /new/path/adamo-matched.json
 ```
 
 Receipts bind exact dataset and current-source hashes, runtime identity, data steps, observations,
@@ -49,6 +51,19 @@ workspace, and a named logical-compute convention. Timing is telemetry only. Suc
 means only that an uninterpreted development measurement was produced. Every outcome is retained;
 the validator permanently rejects promotion fields, unmatched axes, malformed numerics, resource
 drift, source drift, and a non-exact inert reduction.
+
+The complete campaign crosses the four arms with consumed development seeds
+`15600` through `15604`. It binds the exact supplied dataset, every
+Threefry-derived initialization and task/example schedule, the installed
+execution-source closure, and the complete Python/JAX/dependency runtime. Its
+aggregate records per-arm whole-stream curves, final diagnostic means, and
+summed additive work counters plus maximum per-shard memory envelopes. Strict
+publication validation reruns all five seed shards under the current source and
+compares every deterministic field;
+wall-clock timing remains telemetry only. The campaign decision must remain
+`inconclusive` because there is no registered decision rule. Its atomic
+no-replace writer replays before publication. Consistency hashes are not
+authenticated execution attestation.
 
 ## Comparability and execution gates
 
@@ -61,5 +76,5 @@ Newton-Schulz, ReLU-revival, empirical NTK, effective-rank, CNN, RL, or transfor
 Before a scientific comparison: locate and pin official code or independently verify equations;
 implement the exact paper dataset/task construction, architecture, initialization and full
 diagnostic definitions; qualify the missing model families; freeze a separate preregistered
-protocol and untouched seeds; and establish calibrated compute, memory, and timing gates. The four
+protocol and untouched seeds; and establish calibrated compute, memory, and timing gates. The five
 listed seeds are consumed development seeds and can never promote a claim.

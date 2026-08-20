@@ -313,6 +313,15 @@ ACTIVATION_FEATURE_SPECS: Final[Mapping[str, ScreeningSpec]] = MappingProxyType(
 )
 
 _MAX_SCHEDULE_BYTES: Final[int] = 256 * 1024 * 1024
+_MAX_DATASET_NUMERIC_BYTES: Final[int] = 256 * 1024 * 1024
+_CONFIG_FIELDS: Final[tuple[str, ...]] = (
+    "n_tasks",
+    "task_length",
+    "input_dim",
+    "hidden1",
+    "hidden2",
+    "n_classes",
+)
 
 
 def activation_feature_spec(name: object) -> ScreeningSpec:
@@ -321,10 +330,21 @@ def activation_feature_spec(name: object) -> ScreeningSpec:
     return ACTIVATION_FEATURE_SPECS[name]
 
 
+def _require_activation_feature_config(value: object) -> IPMNISTConfig:
+    """Return a freshly validated exact config before any resource dispatch."""
+    if type(value) is not IPMNISTConfig:
+        raise ValueError("config must be an exact IPMNISTConfig")
+    try:
+        return IPMNISTConfig(**{name: getattr(value, name) for name in _CONFIG_FIELDS})
+    except (TypeError, ValueError) as error:
+        raise ValueError("activation/feature config is invalid") from error
+
+
 def _preflight_activation_feature_resources(
     config: IPMNISTConfig, *, n_train: int | None = None
 ) -> int:
     """Reject schedules that exceed the lane's bounded persistent envelope."""
+    config = _require_activation_feature_config(config)
     sampled_width = config.task_length if n_train is None else n_train
     if type(sampled_width) is not int or sampled_width < 1:
         raise ValueError("activation/feature training-row count must be positive")
@@ -336,6 +356,45 @@ def _preflight_activation_feature_resources(
             "activation/feature schedule exceeds its 268435456-byte bound"
         )
     return schedule_bytes
+
+
+def _preflight_activation_feature_data(
+    data_x: object, data_y: object, config: IPMNISTConfig
+) -> tuple[int, int]:
+    """Validate trusted array metadata and bound materialization before conversion."""
+    for value, name in ((data_x, "data_x"), (data_y, "data_y")):
+        actual_type = type(value)
+        if actual_type is not np.ndarray and not issubclass(actual_type, jax.Array):
+            raise TypeError(f"{name} must be an exact NumPy or JAX array")
+    trusted_x = cast(np.ndarray | Array, data_x)
+    trusted_y = cast(np.ndarray | Array, data_y)
+    x_shape = trusted_x.shape
+    y_shape = trusted_y.shape
+    if (
+        len(x_shape) != 2
+        or len(y_shape) != 1
+        or type(x_shape[0]) is not int
+        or type(x_shape[1]) is not int
+        or type(y_shape[0]) is not int
+        or x_shape[0] < config.task_length
+        or x_shape[1] != config.input_dim
+        or y_shape[0] != x_shape[0]
+    ):
+        raise ValueError("activation/feature data must match the bounded config shape")
+    materialized_bytes = _preflight_activation_feature_dataset_bytes(x_shape[0], config)
+    return x_shape[0], materialized_bytes
+
+
+def _preflight_activation_feature_dataset_bytes(n_train: int, config: IPMNISTConfig) -> int:
+    """Bound canonical float32-input/int32-label materialization from exact metadata."""
+    if type(n_train) is not int or n_train < config.task_length:
+        raise ValueError("activation/feature training-row count must cover one task")
+    materialized_bytes = n_train * (config.input_dim + 1) * np.dtype(np.float32).itemsize
+    if materialized_bytes > _MAX_DATASET_NUMERIC_BYTES:
+        raise ValueError(
+            "activation/feature dataset exceeds its 268435456-byte materialization bound"
+        )
+    return materialized_bytes
 
 
 def _array_bundle_sha256(data_x: np.ndarray, data_y: np.ndarray) -> str:
@@ -360,13 +419,18 @@ def _runtime_identity() -> tuple[str, str, str, str]:
     return (platform.python_version(), jax.__version__, np.__version__, jax.default_backend())
 
 
-def _current_source_identity() -> tuple[str, str, str]:
-    names = ("activation_feature_ipmnist.py", "ipmnist_screening.py", "upgd_ipmnist.py")
+def _current_source_identity() -> tuple[str, str, str, str]:
+    names = (
+        "activation_feature_ipmnist.py",
+        "plasticity_comparators.py",
+        "ipmnist_screening.py",
+        "upgd_ipmnist.py",
+    )
     digests = tuple(
         hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
         for name in names
     )
-    return digests[0], digests[1], digests[2]
+    return digests[0], digests[1], digests[2], digests[3]
 
 
 def _host_array(value: object, *, name: str, dtype: np.dtype[Any]) -> np.ndarray:
@@ -381,7 +445,7 @@ class ActivationFeatureRunResult:
     screening: ScreeningRunResult
     dataset_sha256: str
     schedule_sha256: str
-    source_identity: tuple[str, str, str]
+    source_identity: tuple[str, str, str, str]
     runtime_identity: tuple[str, str, str, str]
     n_train: int
     peak_schedule_working_bytes: int
@@ -432,6 +496,8 @@ def run_activation_feature_arm(
     config: IPMNISTConfig,
 ) -> ActivationFeatureRunResult:
     """Execute one arm using the current screening runner and its schedule."""
+    spec = activation_feature_spec(arm)
+    config = _require_activation_feature_config(config)
     _preflight_activation_feature_resources(config)
     observations = config.n_tasks * config.task_length
     if observations > _MAX_STEPS:
@@ -440,18 +506,17 @@ def run_activation_feature_arm(
         raise ValueError("seed must be an exact uint32 value")
     if arm.startswith("deep_fourier") and (config.hidden1 % 2 or config.hidden2 % 2):
         raise ValueError("Deep Fourier arms require even hidden widths")
+    n_train, _ = _preflight_activation_feature_data(data_x, data_y, config)
     host_x = _host_array(data_x, name="data_x", dtype=np.dtype(np.float32))
     host_y = _host_array(data_y, name="data_y", dtype=np.dtype(np.int32))
-    if host_x.ndim != 2 or host_y.ndim != 1 or host_x.shape[0] != host_y.shape[0]:
-        raise ValueError("activation/feature data must be matched rank-2/rank-1 arrays")
     peak_schedule_bytes = _preflight_activation_feature_resources(
-        config, n_train=int(host_x.shape[0])
+        config, n_train=n_train
     )
-    root = jr.key(np.uint32(seed))
+    root = jr.key(np.uint32(seed), impl="threefry2x32")
     _, key_schedule, _ = jr.split(root, 3)
     schedule = build_schedule(key_schedule, config, int(host_x.shape[0]))
     screening = run_screening_config(
-        host_x, host_y, activation_feature_spec(arm), seed, config
+        host_x, host_y, spec, seed, config
     )
     return ActivationFeatureRunResult(
         screening=screening,
@@ -461,7 +526,7 @@ def run_activation_feature_arm(
         ),
         source_identity=_current_source_identity(),
         runtime_identity=_runtime_identity(),
-        n_train=int(host_x.shape[0]),
+        n_train=n_train,
         peak_schedule_working_bytes=peak_schedule_bytes,
     )
 
@@ -686,7 +751,12 @@ def _exact_dict(value: object, fields: frozenset[str], context: str) -> dict[str
 def validate_activation_feature_result(payload: object) -> dict[str, object]:
     """Fail-closed bounded validator; accepts only JSON-builtin containers."""
     root = _exact_dict(payload, _TOP_FIELDS, "result")
-    if root["schema"] != RESULT_SCHEMA or root["comparison_id"] != COMPARISON_ID:
+    if (
+        type(root["schema"]) is not str
+        or root["schema"] != RESULT_SCHEMA
+        or type(root["comparison_id"]) is not str
+        or root["comparison_id"] != COMPARISON_ID
+    ):
         raise ValueError("unsupported result identity")
     arm = root["arm"]
     spec = activation_feature_spec(arm)
@@ -756,6 +826,7 @@ def validate_activation_feature_result(payload: object) -> dict[str, object]:
     peak_schedule_bytes = _preflight_activation_feature_resources(
         validated_config, n_train=n_train_value
     )
+    _preflight_activation_feature_dataset_bytes(n_train_value, validated_config)
     hp = _exact_dict(root["hyperparameters"], frozenset(spec.hyperparameters), "hyperparameters")
     for name, expected in spec.hyperparameters.items():
         value = hp[name]

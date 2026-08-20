@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added the v3 canonical-asset gate for the native Split/Rotated MNIST, Split CIFAR-100, and
+  IPMNIST qualification slice. It verifies caller-held official release SHA-256, MD5, size,
+  loader cardinality, shape, label histogram, and train/test identities; uses anchored no-follow
+  reads; feeds bounded deterministic slices into the v2 held-out runner; retains both ASI
+  peak-forgetting and Avalanche-style first-post-training forgetting/BWT/FWT definitions; and
+  replays every non-timing field. It downloads nothing, runs no campaign, and leaves external
+  transform/metric implementation parity, competitive baselines, full IPMNIST horizon, and
+  scientific promotion explicitly open.
+- Added an L0, permanently nonpromoting recurrent Dreamer-family sequence-control slice. It
+  retains bounded transition replay, samples only contiguous boundary-safe sequences, trains a
+  recurrent latent dynamics model, runs multistep categorical-policy imagination, computes
+  lambda returns, and updates learned actor/value heads. Its matched consumer charges exact
+  replay/state/trace resources and keeps model and replay bytes identical in the mechanism-off
+  arm; it is not DreamerV3, WMAR, or Continual-Dreamer parity or performance evidence.
+- Added a v2 held-out supplied-array qualification layer for the native Split MNIST, Rotated
+  MNIST, Split CIFAR-100, and IPMNIST development suite. It records the exact learner/evaluator
+  boundary contract, full pre-training/after-task accuracy matrix, final average accuracy,
+  forgetting, forward transfer, explicit Threefry schedule, bounded resources, caller-asserted
+  asset provenance, and a current-source/runtime full-replay validator. It downloads no assets,
+  produces no result artifact, and is neither Avalanche parity nor scientific evidence.
+- Added a code-qualified, permanently nonpromoting five-seed matched campaign
+  for the calibrated-partial-reset IPMNIST arm family. It binds explicit
+  Threefry roots, canonical dataset bytes, current source/runtime identity,
+  schedules, initial states, terminal hashes, exact resource arithmetic, and
+  create-only strict reports. No campaign was run and, without a preregistered
+  selection rule, every report remains explicitly inconclusive.
+- Added a permanently nonpromoting five-seed/four-arm noise-curvature
+  development campaign with explicit Threefry schedules, current
+  source/runtime/dataset/resource identities, strict whole-campaign replay,
+  paired development intervals, and create-only retention. No campaign result
+  or benchmark execution is included.
+- Added a code-qualified, permanently nonpromoting five-seed campaign for the
+  abrupt, output-interpolation, and task-sampling gradual-transition
+  micro-phase arms. It binds paired dataset bytes, explicit Threefry schedules,
+  initial states, current source/runtime identity, and exact resources; strict
+  validation reexecutes all five runs. No campaign was executed, and every
+  report remains inconclusive without a preregistered selection rule.
+- Added a code-qualified, permanently nonpromoting five-seed campaign for the
+  bounded native Dreamer-family arms. It binds explicit Threefry roots,
+  workload and replay schedules, execution-relevant initial state, current
+  source/runtime identity, and exact resource receipts; strict validation
+  reexecutes all five runs. No campaign was executed and every decision remains
+  inconclusive without a registered selection rule.
+- Added a permanently nonpromoting five-seed/eight-arm replay/frozen
+  development campaign with exact Threefry schedule and initial-state
+  identities, canonical dataset/source/runtime/resource bindings, strict
+  whole-campaign replay, inconclusive-only decisions, and create-only
+  retention. No campaign result or benchmark execution is included.
+- Added a strict, create-only, permanently nonpromoting five-seed campaign for
+  the bounded plasticity diagnostics. It binds supplied arrays and caller source
+  metadata, explicit Threefry schedules and initial states, current sources,
+  runtime, profiles, exact roster and resources, and requires full replay while
+  leaving paper-scale MNIST, official CBP, ImageNet, and RL comparisons open.
 - Added the unfrozen `preview1` reference-agent transaction ledger, primitive
   Prototype adapter, aggregate SwitchingTwoState/RiverSwim life runner, and
   development-only quiescent checkpoint codec. These L0 mechanisms enforce
@@ -65,6 +118,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Retained strictly valid failed reference-life scorecard shards through the
+  manual workflow's validation, upload, and 144-record aggregate instead of
+  aborting before publication. Workflow reruns now fail closed in favor of a
+  fresh run ID, and the append-only review handoff is documented.
 - Canonicalized discounted-SARSA lifecycle timers at the exact-dispatch
   reference-control boundary. The first compiled update can no longer grow
   persistent numeric state by promoting two host floats into JAX leaves, so

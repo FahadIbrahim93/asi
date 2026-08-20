@@ -16,8 +16,8 @@ pytestmark = pytest.mark.unit
 
 
 def test_registry_exactly_covers_research_wave_and_is_not_run_ready() -> None:
-    assert tuple(plan.issue for plan in EXTERNAL_QUALIFICATION_PLANS) == tuple(range(1574, 1584))
-    assert len({plan.lane_id for plan in EXTERNAL_QUALIFICATION_PLANS}) == 10
+    assert tuple(plan.issue for plan in EXTERNAL_QUALIFICATION_PLANS) == tuple(range(1573, 1584))
+    assert len({plan.lane_id for plan in EXTERNAL_QUALIFICATION_PLANS}) == 11
     for plan in EXTERNAL_QUALIFICATION_PLANS:
         assert plan.blockers == plan.required_gates
         with pytest.raises(RuntimeError, match=f"external lane {plan.lane_id} is not qualified"):
@@ -43,6 +43,17 @@ def test_clear_uses_official_curation_source_without_claiming_asset_readiness() 
     assert "assets_checksums_and_storage_approved" in plan.blockers
     assert "external_code_available_and_license_reviewed" in plan.blockers
     assert "provider_archive_revision_and_checksums_disclosed" in plan.blockers
+
+
+def test_feature_ceiling_lane_pins_all_three_official_sources() -> None:
+    plan = qualification_plan(1573)
+    assert tuple(revision.commit for revision in plan.code_revisions) == (
+        "14a51ee0c045bff642f6ffbfe481efa4d49a3033",
+        "cf4b301d18b0c27db030f4371b72b768005ae58a",
+        "bfff8418a4f603a24ae578f1e108bfac89af1e18",
+    )
+    assert "pretraining_dataset_and_cost_provenance_verified" in plan.blockers
+    assert "proxy_arms_not_misreported_as_ceilings" in plan.blockers
 
 
 def test_action_conditioned_lane_pins_official_dreamer_cdp_source() -> None:

@@ -18,6 +18,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -156,9 +157,26 @@ class LocalImageInspection:
             _require_digest(self.observed_image_id, "observed image ID")
         if type(self.detail) is not str or not self.detail or len(self.detail) > 1_024:
             raise ForagerScientificRerunPreflightError("invalid local inspection detail")
-        if (self.status == "exact_present") != (self.observed_image_id == REQUIRED_IMAGE_ID):
+        coherent = (
+            self.status == "runtime_unavailable"
+            and self.runtime_executable is None
+            and self.observed_image_id is None
+        ) or (
+            self.status == "image_absent"
+            and self.runtime_executable is not None
+            and self.observed_image_id is None
+        ) or (
+            self.status == "inspection_failed"
+            and self.runtime_executable is not None
+            and self.observed_image_id != REQUIRED_IMAGE_ID
+        ) or (
+            self.status == "exact_present"
+            and self.runtime_executable is not None
+            and self.observed_image_id == REQUIRED_IMAGE_ID
+        )
+        if not coherent:
             raise ForagerScientificRerunPreflightError(
-                "exact_present must bind the required Docker image ID"
+                "local image status receipt is internally inconsistent"
             )
 
 
@@ -292,15 +310,114 @@ def validate_run_plan(value: object) -> ForagerScientificRerunPlan:
     return value
 
 
-def _read_record(root: Path, relative: str) -> PinnedIdentityRecord:
-    path = root / relative
+def _stat_identity(value: os.stat_result) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _open_project_root(
+    project_root: Path,
+) -> tuple[int, int, os.stat_result, list[tuple[int, str, int, os.stat_result]]]:
+    """Open an absolute lexical root one no-follow component at a time."""
+    absolute = project_root if project_root.is_absolute() else Path.cwd() / project_root
+    parts = absolute.parts
+    if not parts or parts[0] != absolute.anchor or any(
+        part in {"", ".", ".."} or "/" in part or "\x00" in part for part in parts[1:]
+    ):
+        raise ForagerScientificRerunPreflightError("cannot safely open project root")
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    anchor_descriptor = -1
+    chain: list[tuple[int, str, int, os.stat_result]] = []
+    try:
+        anchor_descriptor = os.open(absolute.anchor, directory_flags)
+        anchor_opened = os.fstat(anchor_descriptor)
+        parent_descriptor = anchor_descriptor
+        for part in parts[1:]:
+            metadata = os.stat(part, dir_fd=parent_descriptor, follow_symlinks=False)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ForagerScientificRerunPreflightError(
+                    "cannot safely open project root"
+                )
+            opened_descriptor = os.open(part, directory_flags, dir_fd=parent_descriptor)
+            try:
+                opened = os.fstat(opened_descriptor)
+            except OSError:
+                os.close(opened_descriptor)
+                raise
+            if _stat_identity(metadata) != _stat_identity(opened):
+                os.close(opened_descriptor)
+                raise ForagerScientificRerunPreflightError(
+                    "cannot safely open project root"
+                )
+            chain.append((parent_descriptor, part, opened_descriptor, opened))
+            parent_descriptor = opened_descriptor
+        return parent_descriptor, anchor_descriptor, anchor_opened, chain
+    except Exception:
+        for _parent_fd, _name, child_fd, _opened in reversed(chain):
+            os.close(child_fd)
+        if anchor_descriptor >= 0:
+            os.close(anchor_descriptor)
+        raise
+
+
+def _read_record(root_descriptor: int, relative: str) -> PinnedIdentityRecord:
+    parts = Path(relative).parts
+    if (
+        not parts
+        or Path(relative).is_absolute()
+        or any(part in {"", ".", ".."} or "/" in part or "\x00" in part for part in parts)
+    ):
+        raise ForagerScientificRerunPreflightError("unsafe pinned identity record path")
+    directory_descriptors: list[tuple[int, str, int, os.stat_result]] = []
+    parent_descriptor = root_descriptor
     descriptor = -1
     try:
-        root_resolved = root.resolve(strict=True)
-        path.parent.resolve(strict=True).relative_to(root_resolved)
+        directory_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        for index, part in enumerate(parts[:-1]):
+            path_so_far = "/".join(parts[: index + 1])
+            metadata = os.stat(part, dir_fd=parent_descriptor, follow_symlinks=False)
+            if not stat.S_ISDIR(metadata.st_mode):
+                raise ForagerScientificRerunPreflightError(
+                    f"cannot safely open pinned identity record directory {path_so_far}"
+                )
+            opened_descriptor = os.open(part, directory_flags, dir_fd=parent_descriptor)
+            try:
+                opened = os.fstat(opened_descriptor)
+            except OSError:
+                os.close(opened_descriptor)
+                raise
+            if _stat_identity(metadata) != _stat_identity(opened):
+                os.close(opened_descriptor)
+                raise ForagerScientificRerunPreflightError(
+                    f"pinned identity record directory {path_so_far} changed while opening"
+                )
+            directory_descriptors.append(
+                (parent_descriptor, part, opened_descriptor, opened)
+            )
+            parent_descriptor = opened_descriptor
         descriptor = os.open(
-            path,
+            parts[-1],
             os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_descriptor,
         )
         before = os.fstat(descriptor)
         if (
@@ -326,22 +443,27 @@ def _read_record(root: Path, relative: str) -> PinnedIdentityRecord:
                 f"pinned identity record {relative} grew during its bounded read"
             )
         after = os.fstat(descriptor)
-        current = os.lstat(path)
-        def identity(value: os.stat_result) -> tuple[int, ...]:
-            return (
-                value.st_dev,
-                value.st_ino,
-                value.st_mode,
-                value.st_nlink,
-                value.st_size,
-                value.st_mtime_ns,
-                value.st_ctime_ns,
-            )
-        if identity(before) != identity(after) or identity(after) != identity(current):
+        current = os.stat(parts[-1], dir_fd=parent_descriptor, follow_symlinks=False)
+        if (
+            _stat_identity(before) != _stat_identity(after)
+            or _stat_identity(after) != _stat_identity(current)
+        ):
             raise ForagerScientificRerunPreflightError(
                 f"pinned identity record {relative} changed during its bounded read"
             )
+        for parent_fd, name, child_fd, opened in reversed(directory_descriptors):
+            after_directory = os.fstat(child_fd)
+            current_directory = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                _stat_identity(opened) != _stat_identity(after_directory)
+                or _stat_identity(after_directory) != _stat_identity(current_directory)
+            ):
+                raise ForagerScientificRerunPreflightError(
+                    f"pinned identity record directory changed while reading {relative}"
+                )
         raw = b"".join(chunks)
+    except ForagerScientificRerunPreflightError:
+        raise
     except (OSError, ValueError) as exc:
         raise ForagerScientificRerunPreflightError(
             f"cannot read pinned identity record {relative}"
@@ -349,6 +471,8 @@ def _read_record(root: Path, relative: str) -> PinnedIdentityRecord:
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+        for _parent_fd, _name, child_fd, _opened in reversed(directory_descriptors):
+            os.close(child_fd)
     occurrences = raw.count(REQUIRED_IMAGE_ID.encode("ascii"))
     if occurrences == 0:
         raise ForagerScientificRerunPreflightError(
@@ -384,7 +508,43 @@ def audit_pinned_identity_records(project_root: Path) -> tuple[PinnedIdentityRec
     """Audit the declared immutable records without scanning reward payloads."""
     if not isinstance(project_root, Path):
         raise TypeError("project_root must be a Path")
-    records = tuple(_read_record(project_root, relative) for relative in PINNED_IDENTITY_RECORDS)
+    root_descriptor = -1
+    anchor_descriptor = -1
+    root_chain: list[tuple[int, str, int, os.stat_result]] = []
+    try:
+        root_descriptor, anchor_descriptor, anchor_opened, root_chain = _open_project_root(
+            project_root
+        )
+    except (OSError, ValueError) as exc:
+        raise ForagerScientificRerunPreflightError(
+            "cannot safely open project root"
+        ) from exc
+    try:
+        records = tuple(
+            _read_record(root_descriptor, relative) for relative in PINNED_IDENTITY_RECORDS
+        )
+        if _stat_identity(anchor_opened) != _stat_identity(os.fstat(anchor_descriptor)):
+            raise ForagerScientificRerunPreflightError(
+                "project root changed during pinned identity audit"
+            )
+        for parent_fd, name, child_fd, opened in reversed(root_chain):
+            after = os.fstat(child_fd)
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if (
+                _stat_identity(opened) != _stat_identity(after)
+                or _stat_identity(after) != _stat_identity(current)
+            ):
+                raise ForagerScientificRerunPreflightError(
+                    "project root changed during pinned identity audit"
+                )
+    except OSError as exc:
+        raise ForagerScientificRerunPreflightError(
+            "cannot verify project root after pinned identity audit"
+        ) from exc
+    finally:
+        for _parent_fd, _name, child_fd, _opened in reversed(root_chain):
+            os.close(child_fd)
+        os.close(anchor_descriptor)
     references = {reference for record in records for reference in record.registry_references}
     if references:
         raise ForagerScientificRerunPreflightError(
@@ -394,16 +554,49 @@ def audit_pinned_identity_records(project_root: Path) -> tuple[PinnedIdentityRec
 
 
 def _default_runner(command: Sequence[str]) -> ProcessResult:
+    process: subprocess.Popen[bytes] | None = None
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             tuple(command),
-            check=False,
-            capture_output=True,
-            timeout=_INSPECT_TIMEOUT_SECONDS,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
+        if process.stdout is None or process.stderr is None:  # pragma: no cover - Popen contract
+            raise ForagerScientificRerunPreflightError("local OCI pipes are unavailable")
+        captured: list[list[bytes]] = [[], []]
+
+        def drain(stream: Any, output: list[bytes]) -> None:
+            retained = 0
+            while chunk := stream.read(64 * 1024):
+                if retained <= _MAX_INSPECT_BYTES:
+                    keep = chunk[: _MAX_INSPECT_BYTES + 1 - retained]
+                    output.append(keep)
+                    retained += len(keep)
+
+        threads = (
+            threading.Thread(target=drain, args=(process.stdout, captured[0]), daemon=True),
+            threading.Thread(target=drain, args=(process.stderr, captured[1]), daemon=True),
+        )
+        for thread in threads:
+            thread.start()
+        try:
+            returncode = process.wait(timeout=_INSPECT_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            process.wait()
+            raise ForagerScientificRerunPreflightError("local OCI inspection timed out") from exc
+        finally:
+            for thread in threads:
+                thread.join()
+        return ProcessResult(returncode, b"".join(captured[0]), b"".join(captured[1]))
+    except ForagerScientificRerunPreflightError:
+        raise
     except (OSError, subprocess.SubprocessError) as exc:
         raise ForagerScientificRerunPreflightError("local OCI inspection failed") from exc
-    return ProcessResult(completed.returncode, completed.stdout, completed.stderr)
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
 
 
 def inspect_local_image(

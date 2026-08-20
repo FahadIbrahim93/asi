@@ -1,30 +1,43 @@
 """Hostile validation for rule discovery search-resource gates.
 
 Protocol-bound per-name caps plus combined work-unit products must reject
-before JAX allocation, stream construction, or range loops. The exact-type
+before JAX allocation, stream construction, or range loops. Trusted array
+identity is exact-gated before shape or conversion hooks. The exact-type
 hostile gate stays; 2**31-1 is not a legal search int.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import pathlib
 
 import numpy as np
 import pytest
 
-from alberta_framework.benchmarks.micro_continual import MICRO_SUITE, MicroTaskConfig
+from alberta_framework.benchmarks.micro_continual import MICRO_SUITE
 from alberta_framework.benchmarks.rule_discovery import (
+    _DEFAULT_BASELINE_EVALS,
+    _DEFAULT_DIGITS_HOLDOUT_STEPS,
+    _DEFAULT_DIGITS_SEARCH_STEPS,
+    _DEFAULT_EVAL_SEEDS,
+    _DEFAULT_GAUSS_STEPS,
+    _DEFAULT_HOLDOUT_EVALS,
+    _DEFAULT_HOLDOUT_SEEDS,
+    _DEFAULT_SEARCH_EVALS,
+    _SEARCH_CANDIDATE_EVALS_MAX,
     _SEARCH_INT_MAX_BY_NAME,
-    _SEARCH_LOGICAL_STEPS_MAX,
-    _SEARCH_STREAM_NAMED_BYTES_MAX,
+    _SEARCH_LOGICAL_WORK_MAX,
     _SEARCH_STREAM_STEPS_MAX,
+    _SEEDED_GENOME_COUNT,
     GENOME_SIZE,
-    _require_logical_steps,
     _require_search_int,
+    _require_search_protocol_work,
     _require_search_work_unit,
+    _require_suite_streams,
     _resolved_suite,
     evaluate_population,
     run_search,
+    seed_genomes,
 )
 
 
@@ -48,22 +61,27 @@ class _EvilStr(str):
         raise AssertionError("str hook")
 
 
-class _HostileArray:
+class _HostileGenomes:
     calls = 0
 
     @property
-    def __class__(self) -> type[object]:  # pragma: no cover
+    def __class__(self) -> type[np.ndarray]:  # pragma: no cover
         type(self).calls += 1
         raise AssertionError("class hook")
 
     @property
-    def shape(self) -> tuple[int, int]:  # pragma: no cover
+    def shape(self) -> tuple[int, ...]:  # pragma: no cover
         type(self).calls += 1
         raise AssertionError("shape hook")
 
-    def __array__(self) -> np.ndarray:  # pragma: no cover
+    def __array__(self, *args: object, **kwargs: object) -> np.ndarray:  # pragma: no cover
+        del args, kwargs
         type(self).calls += 1
-        raise AssertionError("array hook")
+        raise AssertionError("array conversion hook")
+
+    def __jax_array__(self) -> np.ndarray:  # pragma: no cover
+        type(self).calls += 1
+        raise AssertionError("jax conversion hook")
 
 
 def test_require_search_int_rejects_hostile_without_hooks() -> None:
@@ -140,25 +158,33 @@ def test_require_search_work_unit_adjacent_children_generations() -> None:
         _require_search_work_unit(n_random=4_097, children=256, generations=48)
 
 
-def test_require_logical_steps_adjacent_candidate_stream_product() -> None:
-    _require_logical_steps(
-        candidate_evals=1,
-        stream_steps=_SEARCH_LOGICAL_STEPS_MAX,
-        seed_count=1,
-    )
-    with pytest.raises(ValueError, match="candidate-example steps"):
-        _require_logical_steps(
-            candidate_evals=1,
-            stream_steps=_SEARCH_LOGICAL_STEPS_MAX + 1,
-            seed_count=1,
-        )
-
-
 def test_resolved_suite_rejects_single_override_stream_product() -> None:
     last_fit_length = _SEARCH_STREAM_STEPS_MAX // 12
     _resolved_suite(None, last_fit_length)
     with pytest.raises(ValueError, match="stream steps"):
         _resolved_suite(None, last_fit_length + 1)
+
+
+def test_evaluate_population_rejects_hostile_genomes_without_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_materialization(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("hostile genomes reached stream materialization")
+
+    monkeypatch.setattr(
+        "alberta_framework.benchmarks.rule_discovery._materialize_eval",
+        unexpected_materialization,
+    )
+    _HostileGenomes.calls = 0
+    with pytest.raises(TypeError, match="trusted array"):
+        evaluate_population(
+            _HostileGenomes(),  # type: ignore[arg-type]
+            MICRO_SUITE["M1"],
+            seeds=(0,),
+            batch_size=1,
+        )
+    assert _HostileGenomes.calls == 0
 
 
 def test_evaluate_population_rejects_oversize_block_before_materialize(
@@ -172,67 +198,156 @@ def test_evaluate_population_rejects_oversize_block_before_materialize(
         "alberta_framework.benchmarks.rule_discovery._materialize_eval",
         unexpected_materialization,
     )
-
+    genomes = np.zeros((_SEARCH_INT_MAX_BY_NAME["n_random"] + 1, GENOME_SIZE), np.float32)
     with pytest.raises(ValueError, match="must be an integer"):
         evaluate_population(
-            np.empty((_SEARCH_INT_MAX_BY_NAME["n_random"] + 1, GENOME_SIZE), np.float32),
+            genomes,
             MICRO_SUITE["M1"],
             seeds=(0,),
             batch_size=1,
         )
 
 
-def test_evaluate_population_rejects_stream_named_bytes_before_materialize(
+def test_evaluate_population_rejects_empty_block_before_materialize(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def unexpected_materialization(*args: object, **kwargs: object) -> None:
         del args, kwargs
-        raise AssertionError("oversize stream reached materialization")
+        raise AssertionError("empty genome block reached stream materialization")
 
     monkeypatch.setattr(
         "alberta_framework.benchmarks.rule_discovery._materialize_eval",
         unexpected_materialization,
     )
-    steps = _SEARCH_STREAM_NAMED_BYTES_MAX // (4 * 64 + 8) + 1
-    config = MicroTaskConfig(
-        name="hostile",
-        kind="input_permutation",
-        role="search",
-        input_dim=64,
-        n_classes=10,
-        n_tasks=1,
-        task_length=steps,
-        hidden1=32,
-        hidden2=16,
-        crop=False,
-    )
-    with pytest.raises(ValueError, match="named arrays"):
+    genomes = np.zeros((0, GENOME_SIZE), np.float32)
+    with pytest.raises(ValueError, match="n_random"):
         evaluate_population(
-            np.zeros((1, GENOME_SIZE), dtype=np.float32),
-            config,
-            seeds=(0,),
-            batch_size=1,
-        )
-
-
-def test_run_search_rejects_invalid_population_relationships() -> None:
-    with pytest.raises(ValueError, match="initial candidate pool"):
-        run_search(n_random=19, population=20, generations=0, elite=1)
-    with pytest.raises(ValueError, match="at least one child"):
-        run_search(n_random=19, population=19, generations=1, elite=19)
-
-
-def test_evaluate_population_rejects_hostile_array_without_dispatch() -> None:
-    value = _HostileArray()
-    _HostileArray.calls = 0
-    with pytest.raises(ValueError, match="exact trusted"):
-        evaluate_population(
-            value,  # type: ignore[arg-type]
+            genomes,
             MICRO_SUITE["M1"],
             seeds=(0,),
             batch_size=1,
         )
-    assert _HostileArray.calls == 0
+
+
+def test_require_search_work_unit_cartesian_last_fit_and_first_overflow() -> None:
+    evals = _SEARCH_CANDIDATE_EVALS_MAX
+    last_fit_steps = _SEARCH_LOGICAL_WORK_MAX // evals
+    assert last_fit_steps <= _SEARCH_STREAM_STEPS_MAX
+    _require_search_work_unit(
+        n_random=0,
+        population=1_024,
+        generations=15,
+        n_tasks=1,
+        task_length=last_fit_steps,
+        n_seeds=1,
+    )
+    with pytest.raises(ValueError, match="logical work"):
+        _require_search_work_unit(
+            n_random=0,
+            population=1_024,
+            generations=15,
+            n_tasks=1,
+            task_length=last_fit_steps + 1,
+            n_seeds=1,
+        )
+
+
+def test_require_search_work_unit_rejects_int32_envelope_product() -> None:
+    with pytest.raises(ValueError, match="logical work"):
+        _require_search_work_unit(
+            n_random=0,
+            population=1_024,
+            generations=15,
+            n_tasks=1,
+            task_length=_SEARCH_STREAM_STEPS_MAX,
+            n_seeds=1,
+        )
+
+
+def test_require_search_protocol_work_default_digits_and_gauss_fit() -> None:
+    _require_search_protocol_work(
+        search_evals=_DEFAULT_SEARCH_EVALS,
+        search_steps=_DEFAULT_DIGITS_SEARCH_STEPS,
+        n_eval_seeds=_DEFAULT_EVAL_SEEDS,
+        baseline_evals=_DEFAULT_BASELINE_EVALS,
+        holdout_evals=_DEFAULT_HOLDOUT_EVALS,
+        holdout_steps=_DEFAULT_DIGITS_HOLDOUT_STEPS,
+        n_holdout_seeds=_DEFAULT_HOLDOUT_SEEDS,
+    )
+    _require_search_protocol_work(
+        search_evals=_DEFAULT_SEARCH_EVALS,
+        search_steps=_DEFAULT_GAUSS_STEPS,
+        n_eval_seeds=_DEFAULT_EVAL_SEEDS,
+        baseline_evals=_DEFAULT_BASELINE_EVALS,
+        holdout_evals=_DEFAULT_HOLDOUT_EVALS,
+        holdout_steps=_DEFAULT_GAUSS_STEPS,
+        n_holdout_seeds=_DEFAULT_HOLDOUT_SEEDS,
+    )
+
+
+def test_protocol_accounting_binds_seeded_initial_rows_and_baseline_anchor() -> None:
+    assert int(seed_genomes().shape[0]) == _SEEDED_GENOME_COUNT
+    assert _DEFAULT_BASELINE_EVALS == 1 + 256 + 64 * 4
+
+
+def test_run_search_rejects_zero_child_generation_before_genome_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_generation(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("zero-child generation reached genome generation")
+
+    monkeypatch.setattr(
+        "alberta_framework.benchmarks.rule_discovery.seed_genomes",
+        unexpected_generation,
+    )
+    with pytest.raises(ValueError, match="less than population"):
+        run_search(
+            n_random=2,
+            population=2,
+            generations=1,
+            elite=2,
+            eval_seeds=(0,),
+            holdout_seeds=(101,),
+            top_k=1,
+            batch_size=2,
+        )
+
+
+def test_run_search_rejects_derived_children_above_protocol_cap_before_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_generation(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("oversize child block reached genome generation")
+
+    monkeypatch.setattr(
+        "alberta_framework.benchmarks.rule_discovery.seed_genomes",
+        unexpected_generation,
+    )
+    with pytest.raises(ValueError, match="children"):
+        run_search(
+            n_random=300,
+            population=300,
+            generations=1,
+            elite=1,
+            eval_seeds=(0,),
+            holdout_seeds=(101,),
+            top_k=1,
+            batch_size=2,
+        )
+def test_require_suite_streams_bounds_selected_product_not_each_factor() -> None:
+    left = dataclasses.replace(MICRO_SUITE["M1"], n_tasks=1, task_length=5_000_000)
+    right = dataclasses.replace(MICRO_SUITE["M2"], n_tasks=1, task_length=5_000_000)
+    with pytest.raises(ValueError, match="logical work"):
+        _require_suite_streams(
+            {"M1": left, "M2": right},
+            selected=("M1", "M2"),
+            n_seeds=1,
+            n_random=0,
+            population=1_024,
+            generations=15,
+        )
 
 
 def test_evaluate_population_rejects_cartesian_work_before_materialize(
@@ -240,17 +355,17 @@ def test_evaluate_population_rejects_cartesian_work_before_materialize(
 ) -> None:
     def unexpected_materialization(*args: object, **kwargs: object) -> None:
         del args, kwargs
-        raise AssertionError("oversize Cartesian work reached stream materialization")
+        raise AssertionError("cartesian overflow reached stream materialization")
 
     monkeypatch.setattr(
         "alberta_framework.benchmarks.rule_discovery._materialize_eval",
         unexpected_materialization,
     )
-    genomes = np.zeros((1_008, GENOME_SIZE), dtype=np.float32)
-    with pytest.raises(ValueError, match="candidate-example steps"):
-        evaluate_population(
-            genomes,
-            MICRO_SUITE["M1"],
-            seeds=tuple(range(1_024)),
-            batch_size=1,
-        )
+    n_genomes = 2_048
+    last_fit = _SEARCH_LOGICAL_WORK_MAX // n_genomes
+    genomes = np.zeros((n_genomes, GENOME_SIZE), np.float32)
+    overflow = dataclasses.replace(
+        MICRO_SUITE["M1"], n_tasks=1, task_length=last_fit + 1
+    )
+    with pytest.raises(ValueError, match="logical work"):
+        evaluate_population(genomes, overflow, seeds=(0,), batch_size=1)

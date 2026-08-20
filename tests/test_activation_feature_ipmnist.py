@@ -11,6 +11,7 @@ from alberta_framework.benchmarks.activation_feature_ipmnist import (
     ACTIVATION_FEATURE_SOURCES,
     ACTIVATION_FEATURE_SPECS,
     DEVELOPMENT_SEEDS,
+    _preflight_activation_feature_dataset_bytes,
     _preflight_activation_feature_resources,
     activation_feature_result_payload,
     activation_feature_spec,
@@ -126,6 +127,50 @@ def test_schedule_memory_is_bounded_before_runner_allocation(
     assert calls == 0
 
 
+def test_arm_and_config_are_exact_gated_before_resource_or_array_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("invalid identity must fail before dispatch")
+
+    monkeypatch.setattr(
+        "alberta_framework.benchmarks.activation_feature_ipmnist._preflight_activation_feature_resources",
+        forbidden,
+    )
+    x, y = _data()
+    with pytest.raises(ValueError, match="unknown activation/feature arm"):
+        run_activation_feature_arm(x, y, arm="not-an-arm", seed=0, config=SMALL)
+    with pytest.raises(ValueError, match="exact IPMNISTConfig"):
+        run_activation_feature_arm(x, y, arm="aid", seed=0, config=object())  # type: ignore[arg-type]
+    assert calls == 0
+
+
+def test_mutated_config_is_revalidated_before_resource_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = copy.deepcopy(SMALL)
+    object.__setattr__(config, "n_tasks", True)
+    calls = 0
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("invalid config must fail before resource dispatch")
+
+    monkeypatch.setattr(
+        "alberta_framework.benchmarks.activation_feature_ipmnist._preflight_activation_feature_resources",
+        forbidden,
+    )
+    x, y = _data()
+    with pytest.raises(ValueError, match="config is invalid"):
+        run_activation_feature_arm(x, y, arm="aid", seed=0, config=config)
+    assert calls == 0
+
+
 def test_schedule_memory_bound_has_exact_adjacent_boundary() -> None:
     last_fit = IPMNISTConfig(
         n_tasks=33_554_432,
@@ -146,6 +191,49 @@ def test_schedule_memory_bound_has_exact_adjacent_boundary() -> None:
     _preflight_activation_feature_resources(last_fit)
     with pytest.raises(ValueError, match="268435456-byte bound"):
         _preflight_activation_feature_resources(first_overflow)
+
+
+def test_dataset_materialization_is_bounded_before_array_conversion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = IPMNISTConfig(
+        n_tasks=1,
+        task_length=1,
+        input_dim=8_192,
+        hidden1=1,
+        hidden2=1,
+        n_classes=2,
+    )
+    # Zero-stride views expose huge logical shapes without allocating the payload.
+    x = np.broadcast_to(np.zeros((1, 1), dtype=np.float32), (8_193, 8_192))
+    y = np.broadcast_to(np.zeros(1, dtype=np.int32), (8_193,))
+    calls = 0
+
+    def forbidden(*args: object, **kwargs: object) -> object:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("bounded metadata must reject before conversion")
+
+    monkeypatch.setattr(
+        "alberta_framework.benchmarks.activation_feature_ipmnist._host_array", forbidden
+    )
+    with pytest.raises(ValueError, match="dataset exceeds"):
+        run_activation_feature_arm(x, y, arm="aid", seed=0, config=config)
+    assert calls == 0
+
+
+def test_dataset_materialization_bound_has_exact_adjacent_boundary() -> None:
+    config = IPMNISTConfig(
+        n_tasks=1,
+        task_length=1,
+        input_dim=8_191,
+        hidden1=1,
+        hidden2=1,
+        n_classes=2,
+    )
+    assert _preflight_activation_feature_dataset_bytes(8_192, config) == 268_435_456
+    with pytest.raises(ValueError, match="268435456-byte materialization bound"):
+        _preflight_activation_feature_dataset_bytes(8_193, config)
 
 
 def test_factories_are_jittable_and_aid_is_deterministic_per_seed() -> None:

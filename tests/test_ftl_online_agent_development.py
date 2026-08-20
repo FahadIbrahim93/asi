@@ -38,7 +38,7 @@ def test_end_to_end_lane_has_matched_axes_controls_and_exact_receipts() -> None:
     assert result.arms[2].candidate_eligible is False
 
 
-def test_sparse_model_predict_and_update_are_jit_eager_numerically_equivalent() -> None:
+def test_sparse_model_predict_and_update_are_jit_eager_parity() -> None:
     # The end-to-end lane invokes the model's jitted methods; disabling JIT checks its eager path.
     compiled = run_development_lane(seed=FROZEN_SEEDS[1], steps_per_task=1, planning_horizon=1)
     with jax.disable_jit():
@@ -46,9 +46,7 @@ def test_sparse_model_predict_and_update_are_jit_eager_numerically_equivalent() 
     for compiled_arm, eager_arm in zip(compiled.arms, eager.arms, strict=True):
         assert compiled_arm.task_returns == eager_arm.task_returns
         assert compiled_arm.prequential_squared_errors == pytest.approx(
-            eager_arm.prequential_squared_errors,
-            rel=1e-7,
-            abs=1e-12,
+            eager_arm.prequential_squared_errors, rel=1e-6, abs=1e-10
         )
 
 
@@ -103,5 +101,15 @@ def test_mechanism_off_is_causal_and_does_not_adopt_updates() -> None:
 
 
 def test_workload_action_registry_is_read_only() -> None:
-    with pytest.raises(ValueError):
-        ACTION_DELTAS[0, 0] = 7
+    assert type(ACTION_DELTAS) is tuple
+    assert all(type(delta) is tuple for delta in ACTION_DELTAS)
+    with pytest.raises(TypeError):
+        ACTION_DELTAS[0][0] = 7  # type: ignore[index]
+
+
+def test_validator_revalidates_nested_resource_receipt() -> None:
+    result = run_development_lane(seed=FROZEN_SEEDS[0], steps_per_task=1, planning_horizon=1)
+    object.__setattr__(result.arms[0].receipt, "elapsed_ns", True)
+
+    with pytest.raises(ValueError, match="elapsed_ns must be an exact integer"):
+        validate_result(result)

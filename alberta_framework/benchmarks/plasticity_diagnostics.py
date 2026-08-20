@@ -29,7 +29,8 @@ from jax import Array
 SCHEMA = "asi.loss_of_plasticity_mnist_development.v1"
 PAPER_REVISION = "arXiv:2306.13812v3"
 OFFICIAL_CODE_COMMIT = "a6b79580d85f3025bdb601566d3627c5f489f13b"
-FROZEN_SEEDS = (15830, 15831, 15832, 15833)
+FROZEN_SEEDS = (15830, 15831, 15832, 15833, 15834)
+PRNG_IMPLEMENTATION = "threefry2x32"
 ARM_IDS = ("sgd_control", "cbp_mechanism_off", "cbp_bounded")
 MAX_DATASET_EXAMPLES = 60_000
 INPUT_DIM = 784
@@ -384,7 +385,7 @@ def _dataset_sha(images: np.ndarray, labels: np.ndarray) -> str:
 def _schedule(
     images: np.ndarray, labels: np.ndarray, profile: DiagnosticProfile, seed: int
 ) -> tuple[tuple[np.ndarray, np.ndarray], ...]:
-    key = jr.key(seed)
+    key = jr.key(seed, impl=PRNG_IMPLEMENTATION)
     permutation = np.arange(INPUT_DIM, dtype=np.int32)
     tasks: list[tuple[np.ndarray, np.ndarray]] = []
     for _ in range(profile.n_tasks):
@@ -426,7 +427,7 @@ def _run_arm(
     profile: DiagnosticProfile,
     seed: int,
 ) -> ArmResult:
-    key = jr.key(seed)
+    key = jr.key(seed, impl=PRNG_IMPLEMENTATION)
     key, init_key = jr.split(key)
     state = _init_state(init_key, profile.hidden_width)
     rate = 0.0 if arm_id in ("sgd_control", "cbp_mechanism_off") else profile.replacement_rate
@@ -541,7 +542,10 @@ def validate_result(value: object) -> DiagnosticResult:
         ResourceReceipt.__post_init__(arm.receipt)
         receipt = arm.receipt
         expected_persistent = sum(
-            array.nbytes for array in jax.tree.leaves(_init_state(jr.key(0), profile.hidden_width))
+            array.nbytes
+            for array in jax.tree.leaves(
+                _init_state(jr.key(0, impl=PRNG_IMPLEMENTATION), profile.hidden_width)
+            )
         )
         training_queries = expected_steps * 2
         diagnostic_queries = expected_steps

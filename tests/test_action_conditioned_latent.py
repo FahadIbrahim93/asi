@@ -15,6 +15,8 @@ from alberta_framework.benchmarks.action_conditioned_latent import (
     FROZEN_ARM_IDS,
     PINNED_RESEARCH,
     ActionLatentProtocol,
+    _run_one_step_ftl_control,
+    _run_reconstruction_control,
     run_action_conditioned_latent_lane,
     select_latent_action,
     validate_action_latent_payload,
@@ -42,7 +44,7 @@ def test_lane_is_deterministic_matched_nonpromoting_and_round_trips(lane_result)
     assert first.development_only is True
     assert first.scientific_promotion_allowed is False
     assert validate_action_latent_payload(first.to_payload()) == first
-    assert tuple(arm.arm_id for arm in first.arms[:6]) == FROZEN_ARM_IDS
+    assert tuple(arm.arm_id for arm in first.arms[: len(FROZEN_ARM_IDS)]) == FROZEN_ARM_IDS
     assert all(arm.environment_steps == 8 for arm in first.arms)
     assert all(arm.negative_outcome_retained for arm in first.arms)
 
@@ -51,12 +53,58 @@ def test_mechanism_off_has_exact_decision_off_transcript_parity(lane_result) -> 
     result = lane_result
     for offset in range(0, len(result.arms), len(FROZEN_ARM_IDS)):
         decision_off = result.arms[offset + 3]
-        mechanism_off = result.arms[offset + 4]
+        mechanism_off = result.arms[offset + 6]
         assert decision_off.action_sha256 == mechanism_off.action_sha256
         assert decision_off.reward_sha256 == mechanism_off.reward_sha256
         assert decision_off.return_sum == mechanism_off.return_sum
         assert decision_off.model_updates == 8
         assert mechanism_off.model_updates == 0
+
+
+def test_requested_reconstruction_and_one_step_ftl_controls_are_end_to_end() -> None:
+    protocol = _tiny_protocol()
+    reconstruction = _run_reconstruction_control(protocol, seed=protocol.seeds[0])
+    one_step_ftl = _run_one_step_ftl_control(protocol, seed=protocol.seeds[0])
+
+    assert reconstruction.arm_id == "reconstruction_control"
+    assert one_step_ftl.arm_id == "one_step_ftl_control"
+    for receipt in (reconstruction, one_step_ftl):
+        assert receipt.environment_steps == protocol.steps
+        assert receipt.model_updates == protocol.steps
+        assert receipt.training_queries == protocol.steps
+        assert receipt.decision_queries == 2 * 3
+        assert receipt.persistent_mechanism_bytes > 0
+        assert receipt.mean_prequential_loss is not None
+        assert receipt.action_sha256 != "0" * 64
+
+
+def test_sarsa_control_receipts_its_real_training_work(lane_result) -> None:
+    for offset in range(0, len(lane_result.arms), len(FROZEN_ARM_IDS)):
+        sarsa = lane_result.arms[offset + 7]
+        assert sarsa.arm_id == "sarsa_control"
+        assert sarsa.model_updates == 0
+        assert sarsa.agent_updates == 8
+        assert sarsa.training_queries == 8
+
+
+def test_validator_rejects_forged_sarsa_update_accounting(lane_result) -> None:
+    forged = copy.deepcopy(lane_result.to_payload())
+    forged["arms"][7]["agent_updates"] = 0  # type: ignore[index]
+    with pytest.raises(ValueError, match="training query|agent-update"):
+        validate_action_latent_payload(forged)
+
+
+def test_frozen_roster_contains_the_requested_matched_controls() -> None:
+    assert FROZEN_ARM_IDS == (
+        "latent_action_interactions",
+        "latent_no_interactions",
+        "latent_action_masked",
+        "latent_decision_off",
+        "reconstruction_control",
+        "one_step_ftl_control",
+        "mechanism_off",
+        "sarsa_control",
+    )
 
 
 def test_live_model_action_selector_is_jittable_and_action_conditioned() -> None:
@@ -117,6 +165,10 @@ def test_validator_rejects_hostile_expanded_or_inconsistent_payloads(lane_result
     forged_bytes["arms"][0]["persistent_mechanism_bytes"] += 1  # type: ignore[index,operator]
     with pytest.raises(ValueError, match="mechanism bytes differ"):
         validate_action_latent_payload(forged_bytes)
+    missing_loss = copy.deepcopy(result.to_payload())
+    missing_loss["arms"][4]["mean_prequential_loss"] = None  # type: ignore[index]
+    with pytest.raises(ValueError, match="prequential loss"):
+        validate_action_latent_payload(missing_loss)
     forged_identity = copy.deepcopy(result.to_payload())
     forged_identity["identity"]["dependency_versions"][0][1] = "forged"  # type: ignore[index]
     with pytest.raises(ValueError, match="current source/runtime/registries"):

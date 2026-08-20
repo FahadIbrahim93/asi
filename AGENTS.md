@@ -172,9 +172,15 @@ Key documents:
   `tests/test_reference_life_scorecard.py`
 - Status & evidence: `docs/status.md` (levels L0–L3, completion gates) ·
   `docs/evidence/methodology.md` (property-by-property map)
-- Active campaign: `docs/research/ipmnist-theory.md` ·
+- Contribution and experiment protocol: `CONTRIBUTING.md`
+- Active campaign: `docs/research/ipmnist-campaign-index.md` ·
+  `docs/research/ipmnist-theory.md` ·
   `outputs/ipmnist_screening/{RUNBOOK,FINAL_REPORT,AUDIT,CEILING_ANALYSIS,SOTA_LANDSCAPE_2026}.md`
-- Current external comparison map: `docs/research/sota-landscape.md`
+- Current external paper/project library and comparison queue:
+  `docs/research/sota-landscape.md`
+- Machine-readable implementation backlog and benchmark setup:
+  `docs/research/implementation-backlog.json` ·
+  `docs/runbooks/continual-benchmark-suite.md` · `asi-benchmark-catalog`
 - Durable records: `docs/archive/forager-comparator-audit.md` ·
   `docs/design/rtu-taylor-correction.md` ·
   `docs/evidence/negative-results.md`

@@ -19,6 +19,7 @@ Search executions happen through the CLI, never inside pytest.
 
 import dataclasses
 import re
+from typing import Any
 
 import jax.numpy as jnp
 import jax.random as jr
@@ -66,6 +67,55 @@ _TINY = IPMNISTConfig(
 def _tiny_setup(seed: int = 0) -> tuple[dict[str, jnp.ndarray], RuleState]:
     params = init_mlp_params(jr.key(seed), _TINY)
     return params, init_rule_state(params)
+
+
+def test_rule_search_rng_roots_request_threefry_explicitly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[object] = []
+    real_key = jr.key
+
+    def recording_key(seed: object, *, impl: object = None):
+        calls.append(impl)
+        return real_key(seed, impl=impl)
+
+    class RecordingRandom:
+        key = staticmethod(recording_key)
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(jr, name)
+
+    monkeypatch.setattr(rule_discovery, "jr", RecordingRandom())
+    digits = dataclasses.replace(MICRO_SUITE["M1"], n_tasks=1, task_length=1)
+    gauss = dataclasses.replace(
+        rule_discovery.gauss_suite(2)["G1"], regime_length=1
+    )
+    rule_discovery._materialize_eval(digits, 3)
+    rule_discovery._materialize_eval(gauss, 3)
+
+    def stop_after_root() -> None:
+        raise RuntimeError("search root observed")
+
+    monkeypatch.setattr(rule_discovery, "seed_genomes", stop_after_root)
+    suite = {
+        "M1": digits,
+        "M1p": dataclasses.replace(MICRO_SUITE["M1p"], n_tasks=1, task_length=1),
+    }
+    with pytest.raises(RuntimeError, match="search root observed"):
+        run_search(
+            n_random=19,
+            population=1,
+            generations=0,
+            elite=1,
+            eval_seeds=(0,),
+            holdout_seeds=(101,),
+            top_k=1,
+            batch_size=1,
+            task_names=("M1",),
+            holdout_names=("M1p",),
+            suite=suite,
+        )
+    assert calls == ["threefry2x32", "threefry2x32", "threefry2x32"]
 
 
 def test_genome_layout() -> None:
@@ -453,6 +503,62 @@ def test_run_search_rejects_invalid_search_identities_before_genome_generation(
         run_search(**payload)  # type: ignore[arg-type]
 
 
+def test_run_search_rejects_population_larger_than_seeded_initial_pool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_generation(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise AssertionError("invalid population reached genome generation")
+
+    monkeypatch.setattr(rule_discovery, "seed_genomes", unexpected_generation)
+    monkeypatch.setattr(rule_discovery, "random_genomes", unexpected_generation)
+    with pytest.raises(ValueError, match="initial candidate pool"):
+        run_search(
+            n_random=0,
+            population=20,
+            generations=1,
+            elite=1,
+            eval_seeds=(0,),
+            holdout_seeds=(101,),
+            top_k=1,
+            batch_size=2,
+        )
+
+
+def test_run_search_nonzero_generation_reaches_child_evaluation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ChildEvaluationReachedError(Exception):
+        pass
+
+    calls = 0
+
+    def fake_evaluate_suite(
+        genomes: object, *args: object, **kwargs: object
+    ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        nonlocal calls
+        del args, kwargs
+        calls += 1
+        if calls == 2:
+            raise ChildEvaluationReachedError
+        shape = getattr(genomes, "shape")
+        return np.ones((int(shape[0]),), dtype=np.float64), {}
+
+    monkeypatch.setattr(rule_discovery, "evaluate_suite", fake_evaluate_suite)
+    with pytest.raises(ChildEvaluationReachedError):
+        run_search(
+            n_random=19,
+            population=2,
+            generations=1,
+            elite=1,
+            eval_seeds=(0,),
+            holdout_seeds=(101,),
+            top_k=1,
+            batch_size=2,
+        )
+    assert calls == 2
+
+
 @pytest.mark.parametrize("n_tasks", [True, 0, -1, 1.5])
 def test_resolved_suite_rejects_invalid_n_tasks_identities(n_tasks: object) -> None:
     with pytest.raises(ValueError, match="n_tasks"):
@@ -683,6 +789,7 @@ def test_cli_search_smoke(tmp_path) -> None:
     payload = json.loads(out.read_text())
     assert payload["schema"] == RESULT_SCHEMA
     assert payload["evidence_policy"]["scientific_promotion_allowed"] is False
+    assert payload["environment"]["agent_rng_impl"] == "threefry2x32"
     assert payload["n_evaluated"] >= 8
     assert len(payload["candidates"]) == 4
     assert "holdout_accuracy" in payload["baseline"]

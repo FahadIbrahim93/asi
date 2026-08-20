@@ -13,6 +13,12 @@ Before starting, read the [research roadmap](docs/research/asi-roadmap.md),
 [evidence methodology](docs/evidence/methodology.md), and
 [negative-results ledger](docs/evidence/negative-results.md). For Forager work, also read
 [FORAGER_BENCHMARK.md](FORAGER_BENCHMARK.md).
+The [implementation backlog](docs/research/implementation-backlog.json) and
+[benchmark-suite runbook](docs/runbooks/continual-benchmark-suite.md) are the machine-readable
+queue snapshot and setup map. Every backlog row carries its stable GitHub issue number, issue
+state, implementation status as of the manifest date, and primary references; follow the
+numbered GitHub issue for newer discussion. An entry there is not evidence that its
+implementation or run is complete.
 
 ## Choose an uphill contribution
 

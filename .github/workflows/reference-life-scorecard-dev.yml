@@ -43,6 +43,7 @@ jobs:
           test "$GITHUB_REF" = "refs/heads/main"
           test "$GITHUB_SHA" = "$LAUNCH_SHA"
           test "$WORKFLOW_SHA" = "$LAUNCH_SHA"
+          test "$GITHUB_RUN_ATTEMPT" = "1"
           test "$(git rev-parse HEAD)" = "$LAUNCH_SHA"
           test -z "$(git status --short)"
 
@@ -66,6 +67,15 @@ jobs:
           test "$uv_version" = "0.9.24"
           printf 'PYTHON_PATH=%s\nUV_PATH=%s\n' "$python_path" "$uv_path" >> "$GITHUB_ENV"
 
+      - name: Reverify exact authorized source after setup
+        shell: bash
+        env:
+          LAUNCH_SHA: ${{ inputs.launch_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$LAUNCH_SHA"
+          test -z "$(git status --short)"
+
       - name: Run and validate one fresh-process shard
         shell: bash
         env:
@@ -76,9 +86,16 @@ jobs:
           set -euo pipefail
           mkdir -p scorecard/shards
           output="scorecard/shards/${ENVIRONMENT}__${ARM}__${SEED}.json"
+          set +e
           "$PYTHON_PATH" -m alberta_framework.benchmarks.reference_life_scorecard \
             run-shard --environment "$ENVIRONMENT" --arm "$ARM" --seed "$SEED" \
             --output "$output"
+          shard_status=$?
+          set -e
+          if (( shard_status != 0 && shard_status != 1 )); then
+            echo "run-shard returned unexpected status $shard_status" >&2
+            exit "$shard_status"
+          fi
           "$PYTHON_PATH" -m alberta_framework.benchmarks.reference_life_scorecard \
             validate "$output"
           test "$(find scorecard/shards -maxdepth 1 -type f -name '*.json' | wc -l | tr -d ' ')" = 1
@@ -114,6 +131,7 @@ jobs:
           test "$GITHUB_REF" = "refs/heads/main"
           test "$GITHUB_SHA" = "$LAUNCH_SHA"
           test "$WORKFLOW_SHA" = "$LAUNCH_SHA"
+          test "$GITHUB_RUN_ATTEMPT" = "1"
           test "$(git rev-parse HEAD)" = "$LAUNCH_SHA"
           test -z "$(git status --short)"
 
@@ -136,6 +154,15 @@ jobs:
           uv_version="$("$uv_path" --version | sed -E 's/^uv ([0-9]+\.[0-9]+\.[0-9]+).*/\1/')"
           test "$uv_version" = "0.9.24"
           printf 'PYTHON_PATH=%s\nUV_PATH=%s\n' "$python_path" "$uv_path" >> "$GITHUB_ENV"
+
+      - name: Reverify exact authorized source after setup
+        shell: bash
+        env:
+          LAUNCH_SHA: ${{ inputs.launch_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$LAUNCH_SHA"
+          test -z "$(git status --short)"
 
       - name: Download all source-bound shard records
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4

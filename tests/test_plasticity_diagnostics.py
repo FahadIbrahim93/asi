@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 
 import jax
+import jax.random as jr
 import numpy as np
 import pytest
 
@@ -17,6 +18,7 @@ from alberta_framework.benchmarks.plasticity_diagnostics import (
     INPUT_DIM,
     OFFICIAL_CODE_COMMIT,
     PAPER_REVISION,
+    PRNG_IMPLEMENTATION,
     PROFILES,
     costly_lane_gates,
     main,
@@ -54,6 +56,25 @@ def test_hidden_network_lane_runs_end_to_end_and_mechanism_off_is_exact() -> Non
     assert result.negative_results_must_be_retained
     assert not result.task_boundary_available_to_learner
     assert not result.task_id_available_to_learner
+
+
+def test_rng_roots_are_explicit_threefry_and_ambient_prng_invariant() -> None:
+    assert PRNG_IMPLEMENTATION == "threefry2x32"
+    images, labels = _fixture()
+    with jax.default_prng_impl("threefry2x32"):
+        first = run_diagnostic(images, labels, seed=FROZEN_SEEDS[0])
+    with jax.default_prng_impl("rbg"):
+        second = run_diagnostic(images, labels, seed=FROZEN_SEEDS[0])
+    for left, right in zip(first.arms, second.arms, strict=True):
+        assert dataclasses.replace(left.receipt, elapsed_ns=0) == dataclasses.replace(
+            right.receipt, elapsed_ns=0
+        )
+        assert dataclasses.replace(left, receipt=dataclasses.replace(left.receipt, elapsed_ns=0)) \
+            == dataclasses.replace(right, receipt=dataclasses.replace(right.receipt, elapsed_ns=0))
+    assert (
+        str(jr.key_impl(jr.key(FROZEN_SEEDS[0], impl=PRNG_IMPLEMENTATION)))
+        == PRNG_IMPLEMENTATION
+    )
 
 
 def test_jit_and_eager_paths_match_except_timing() -> None:

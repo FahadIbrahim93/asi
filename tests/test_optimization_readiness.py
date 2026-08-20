@@ -5,6 +5,7 @@ from copy import deepcopy
 import numpy as np
 import pytest
 
+import alberta_framework.evaluation.optimization_readiness as optimization_readiness_module
 from alberta_framework.evaluation.optimization_readiness import (
     OPTIMIZATION_READINESS_PROTOCOL,
     energy_rank,
@@ -155,8 +156,84 @@ def test_energy_rank_is_scale_stable() -> None:
     assert energy_rank(np.diag([9e307, 1e307]), threshold=0.99) == 2
 
 
+def test_energy_rank_preflights_logical_work_before_numeric_scan_or_svd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    matrix = np.broadcast_to(np.zeros(1, dtype=np.float64), (10, 1_000_001))
+
+    def forbidden_finite_array(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("numeric scanning must happen after the SVD preflight")
+
+    monkeypatch.setattr(optimization_readiness_module, "_finite_array", forbidden_finite_array)
+    with pytest.raises(ValueError, match="logical work"):
+        energy_rank(matrix)
+
+
+def test_energy_rank_preflights_workspace_before_numeric_scan_or_svd(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    matrix = np.broadcast_to(np.zeros(1, dtype=np.float64), (1, 16_000_000))
+
+    def forbidden_finite_array(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("numeric scanning must happen after the SVD preflight")
+
+    monkeypatch.setattr(optimization_readiness_module, "_finite_array", forbidden_finite_array)
+    with pytest.raises(ValueError, match="working set"):
+        energy_rank(matrix)
+
+
+def test_energy_rank_peak_includes_caller_owned_logical_input_before_scan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The previous incremental-workspace estimate accepted this shape even
+    # though its 102 MiB int64 input remained live beside conversion/LAPACK
+    # storage.  A broadcast view also proves the charge follows safe logical
+    # metadata rather than assuming the tiny backing allocation is contiguous.
+    matrix = np.broadcast_to(np.zeros(1, dtype=np.int64), (2, 6_391_300))
+
+    def forbidden_finite_array(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise AssertionError("numeric scanning must happen after the total-peak preflight")
+
+    monkeypatch.setattr(optimization_readiness_module, "_finite_array", forbidden_finite_array)
+    with pytest.raises(ValueError, match="working set"):
+        energy_rank(matrix)
+
+
+def test_energy_rank_preflight_accepts_documented_validation_scale() -> None:
+    estimate = optimization_readiness_module._preflight_energy_rank_resources(
+        np.broadcast_to(np.zeros(1, dtype=np.float64), (10_000, 16))
+    )
+    assert estimate.logical_work == 2_560_000
+    assert estimate.peak_working_set_bytes <= 256 * 1024 * 1024
+
+    exact_logical_limit = optimization_readiness_module._preflight_energy_rank_resources(
+        np.broadcast_to(np.zeros(1, dtype=np.float64), (10, 1_000_000))
+    )
+    assert exact_logical_limit.logical_work == 100_000_000
+
+
+def test_energy_rank_workspace_preflight_has_an_exact_adjacent_boundary() -> None:
+    scalar = np.zeros(1, dtype=np.float64)
+    accepted = optimization_readiness_module._preflight_energy_rank_resources(
+        np.broadcast_to(scalar, (1, 8_134_404))
+    )
+    assert accepted.input_bytes == 8 * 8_134_404
+    assert accepted.peak_working_set_bytes == 268_435_452
+    with pytest.raises(ValueError, match="working set"):
+        optimization_readiness_module._preflight_energy_rank_resources(
+            np.broadcast_to(scalar, (1, 8_134_405))
+        )
+
+
 def test_protocol_is_prospective_and_nonpromoting() -> None:
     assert OPTIMIZATION_READINESS_PROTOCOL["paper_revision"] == "arXiv:2605.09044v1"
+    assert (
+        OPTIMIZATION_READINESS_PROTOCOL["energy_rank_working_set_scope"]
+        == "total_live_bytes_including_logical_input"
+    )
     assert OPTIMIZATION_READINESS_PROTOCOL["population_gradient_estimator"] == (
         "full_validation_set_gradient"
     )

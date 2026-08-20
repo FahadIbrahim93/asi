@@ -12,6 +12,8 @@ import hashlib
 import json
 import math
 import operator
+import os
+import stat
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, SupportsIndex, cast
@@ -20,6 +22,7 @@ V5_RAW_SCHEMA = "alberta.new_directions.v5_model_side.v1"
 V6_RAW_SCHEMA = "alberta.new_directions.v6_recurrence_headroom.v1"
 V5_AUDIT_SCHEMA = "asi.new_directions.v5_model_side.amendment.v1"
 V6_AUDIT_SCHEMA = "asi.new_directions.v6_recurrence_headroom.amendment.v1"
+_MAX_AUDIT_FILE_BYTES = 16_000_000
 
 V5_SEEDS = (0, 1, 2)
 V5_BOUNDARIES = (0, 1, 2)
@@ -168,11 +171,79 @@ def _reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]
     return result
 
 
+def _read_stable_regular_file(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    expected_size: int | None = None,
+) -> bytes:
+    """Read one regular non-symlink file through a stable bounded descriptor."""
+    if not isinstance(path, Path):
+        raise TypeError("path must be a Path")
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise ValueError("audit file metadata is unavailable") from exc
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ValueError("audit file must be a regular non-symlink file")
+    if before.st_size > maximum_bytes:
+        raise ValueError("audit file exceeds its byte bound")
+    if expected_size is not None and before.st_size != expected_size:
+        raise ValueError("audit file size differs from its binding")
+
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+        )
+        opened = os.fstat(descriptor)
+
+        def identity(value: os.stat_result) -> tuple[int, ...]:
+            return (
+                value.st_dev,
+                value.st_ino,
+                value.st_mode,
+                value.st_nlink,
+                value.st_size,
+                value.st_mtime_ns,
+                value.st_ctime_ns,
+            )
+
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or identity(opened) != identity(before)
+            or opened.st_size > maximum_bytes
+            or (expected_size is not None and opened.st_size != expected_size)
+        ):
+            raise ValueError("audit file changed before its bounded read")
+        chunks: list[bytes] = []
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1 << 20))
+            if not chunk:
+                raise ValueError("audit file ended during its bounded read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise ValueError("audit file grew during its bounded read")
+        after = os.fstat(descriptor)
+        current = path.lstat()
+        if identity(after) != identity(opened) or identity(current) != identity(opened):
+            raise ValueError("audit file changed during its bounded read")
+        return b"".join(chunks)
+    except ValueError:
+        raise
+    except OSError as exc:
+        raise ValueError("audit file could not be read safely") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def load_strict_json(path: Path) -> dict[str, Any]:
     """Load one bounded finite primitive JSON object with duplicate rejection."""
-    data = path.read_bytes()
-    if len(data) > 16_000_000:
-        raise ValueError("JSON artifact exceeds the 16 MB audit bound")
+    data = _read_stable_regular_file(path, maximum_bytes=_MAX_AUDIT_FILE_BYTES)
     try:
         value = json.loads(data, object_pairs_hook=_reject_duplicate_keys)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -184,11 +255,9 @@ def load_strict_json(path: Path) -> dict[str, Any]:
 
 
 def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1 << 20):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return hashlib.sha256(
+        _read_stable_regular_file(path, maximum_bytes=_MAX_AUDIT_FILE_BYTES)
+    ).hexdigest()
 
 
 def reconstruct_v6_family_control(seed: object) -> dict[str, object]:
@@ -537,7 +606,12 @@ def _validate_bound_file(
         raise ValueError(f"{name} must remain contained in the repository root") from exc
     if resolved_path != path or not path.is_file():
         raise ValueError(f"{name} must be a canonical contained regular file")
-    if path.stat().st_size != expected_size or file_sha256(path) != expected_sha256:
+    raw = _read_stable_regular_file(
+        path,
+        maximum_bytes=_MAX_AUDIT_FILE_BYTES,
+        expected_size=expected_size,
+    )
+    if hashlib.sha256(raw).hexdigest() != expected_sha256:
         raise ValueError(f"{name} file binding mismatch")
 
 
@@ -718,7 +792,6 @@ def _validate_v6_identity(value: object) -> None:
 
 
 def validate_v5_amendment(root: Path, raw: object, amendment: object) -> dict[str, Any]:
-    raw_summary = validate_v5_raw(raw)
     record = _exact_dict(
         amendment,
         {"schema", "subject", "identity", "protocol", "policy", "audit", "outcome"},
@@ -741,6 +814,10 @@ def validate_v5_amendment(root: Path, raw: object, amendment: object) -> dict[st
             expected_sha256=binding[1],
             expected_size=binding[2],
         )
+    bound_raw = load_strict_json(root / _V5_SUBJECT_BINDINGS["raw_json"][0])
+    if raw != bound_raw:
+        raise ValueError("V5 supplied raw payload differs from its bound repository file")
+    raw_summary = validate_v5_raw(bound_raw)
     _validate_policy(record["policy"])
     protocol = _exact_dict(
         record["protocol"],
@@ -826,7 +903,6 @@ def validate_v5_amendment(root: Path, raw: object, amendment: object) -> dict[st
 
 
 def validate_v6_amendment(root: Path, raw: object, amendment: object) -> dict[str, Any]:
-    raw_summary = validate_v6_raw(raw)
     record = _exact_dict(
         amendment,
         {"schema", "subject", "identity", "protocol", "policy", "controls", "audit", "outcome"},
@@ -850,6 +926,10 @@ def validate_v6_amendment(root: Path, raw: object, amendment: object) -> dict[st
             expected_sha256=binding[1],
             expected_size=binding[2],
         )
+    bound_raw = load_strict_json(root / _V6_SUBJECT_BINDINGS["raw_json"][0])
+    if raw != bound_raw:
+        raise ValueError("V6 supplied raw payload differs from its bound repository file")
+    raw_summary = validate_v6_raw(bound_raw)
     _validate_policy(record["policy"])
     protocol = _exact_dict(
         record["protocol"],

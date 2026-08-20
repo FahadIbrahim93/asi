@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 WORKFLOW = Path(".github/workflows/reference-life-scorecard-dev.yml")
+RUNBOOK = Path("docs/runbooks/reference-life-scorecard-development-run.md")
 
 
 def test_reference_life_scorecard_is_manual_only() -> None:
@@ -40,7 +41,10 @@ def test_reference_life_scorecard_fails_closed_on_source_and_runtime() -> None:
     assert text.count('test "$GITHUB_REF" = "refs/heads/main"') == 2
     assert text.count('test "$GITHUB_SHA" = "$LAUNCH_SHA"') == 2
     assert text.count('test "$WORKFLOW_SHA" = "$LAUNCH_SHA"') == 2
-    assert text.count('test "$(git rev-parse HEAD)" = "$LAUNCH_SHA"') == 2
+    assert text.count('test "$GITHUB_RUN_ATTEMPT" = "1"') == 2
+    assert text.count("Reverify exact authorized source after setup") == 2
+    assert text.count('test "$(git rev-parse HEAD)" = "$LAUNCH_SHA"') == 4
+    assert text.count('test -z "$(git status --short)"') == 4
     assert text.count('python-version: "3.12.12"') == 2
     assert text.count('test "$uv_version" = "0.9.24"') == 2
     assert text.count('python_path="$GITHUB_WORKSPACE/.venv/bin/python"') == 2
@@ -49,6 +53,25 @@ def test_reference_life_scorecard_fails_closed_on_source_and_runtime() -> None:
     assert "import alberta_framework, jax" in text
     assert "retention-days: 90" in text
     assert "retention-days: 30" not in text
+
+
+def test_reference_life_scorecard_retains_valid_failed_shards() -> None:
+    text = WORKFLOW.read_text(encoding="utf-8")
+
+    run_step = text.split(
+        "- name: Run and validate one fresh-process shard", maxsplit=1
+    )[1].split("- name: Upload immutable shard record", maxsplit=1)[0]
+    assert "set +e" in run_step
+    assert "shard_status=$?" in run_step
+    assert "set -e" in run_step
+    assert 'if (( shard_status != 0 && shard_status != 1 )); then' in run_step
+    assert 'exit "$shard_status"' in run_step
+    assert run_step.index("shard_status=$?") < run_step.index(
+        'if (( shard_status != 0 && shard_status != 1 )); then'
+    )
+    assert run_step.index(
+        'if (( shard_status != 0 && shard_status != 1 )); then'
+    ) < run_step.index('validate "$output"')
 
 
 def test_reference_life_scorecard_artifacts_and_receipt_bind_the_run() -> None:
@@ -75,3 +98,14 @@ def test_reference_life_scorecard_artifacts_and_receipt_bind_the_run() -> None:
         assert field in text
     assert "path: scorecard\n" not in text
     assert "scorecard/run-receipt.v1.json" in text
+
+
+def test_reference_life_scorecard_runbook_requires_durable_fresh_dispatch() -> None:
+    text = RUNBOOK.read_text(encoding="utf-8")
+
+    assert "permanently nonpromoting" in text
+    assert "github.run_attempt == 1" in text
+    assert "start a fresh dispatch with a new run ID" in text
+    assert "GitHub Actions retention is only a 90-day transfer window" in text
+    assert "outputs/reference_life_scorecard/development/" in text
+    assert "Publish all 147 files together" in text

@@ -55,6 +55,9 @@ def test_protocol_pins_official_sequence_sources_and_nonpromotion(runtime) -> No
     assert len(CW20_TASKS) == 20
     assert CW20_TASKS[:10] == CW20_TASKS[10:]
     assert payload["paper_revision"] == "arXiv:2105.10919v3"
+    assert payload["qualification_issue"] == 1580
+    assert payload["qualification_lane_id"] == "continual-world-cw20"
+    assert payload["official_repository"] == "https://github.com/awarelab/continual_world.git"
     assert payload["official_commit"] == "73f63bb4fa0b5d00bda973e20dfb783bfcf1b8aa"
     assert payload["metaworld_commit"] == "0875192baaa91c43523708f55866d98eaf3facaf"
     assert payload["learner_boundary_information"] == []
@@ -66,9 +69,19 @@ def test_fixed_action_receipt_is_exact_mechanism_off_and_round_trips(receipt) ->
     assert checked == receipt
     assert checked.environment_steps == 40
     assert checked.persistent_mechanism_bytes == 16
+    assert checked.action_bytes == 40 * 4 * np.dtype(np.float32).itemsize
+    assert checked.observation_bytes == 40 * 32 * np.dtype(np.float32).itemsize
+    assert checked.reward_bytes == 40 * np.dtype(np.float32).itemsize
+    assert checked.success_bytes == 40 * np.dtype(np.bool_).itemsize
+    assert checked.task_index_bytes == 40 * np.dtype(np.int32).itemsize
     assert checked.data_steps == checked.learner_updates == checked.model_queries == 0
     assert checked.mechanism_off is True
     assert checked.negative_outcome_retained is True
+    assert len(checked.identity.lane_source_sha256) == 64
+    assert dict(checked.identity.dependency_source_sha256).keys() >= {
+        "alberta_framework.benchmarks.external_qualification",
+        "alberta_framework.benchmarks.qualification_provenance",
+    }
 
 
 def test_trace_builder_snapshots_and_rejects_wrong_boundary_schedule(runtime) -> None:
@@ -132,8 +145,20 @@ def test_validator_rejects_hostile_expansion_resources_and_promotion(receipt) ->
     promoted["scientific_promotion_allowed"] = True
     with pytest.raises(ValueError, match="nonpromoting"):
         validate_smoke_payload(promoted)
+    forged_bytes = copy.deepcopy(receipt.payload())
+    forged_bytes["observation_bytes"] -= 1
+    with pytest.raises(ValueError, match="trace byte receipt"):
+        validate_smoke_payload(forged_bytes)
+    forged_identity = copy.deepcopy(receipt.payload())
+    forged_identity["identity"]["lane_source_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="current tree/runtime"):
+        validate_smoke_payload(forged_identity)
     with pytest.raises(ValueError, match="plan_sha256"):
         dataclasses.replace(receipt, plan_sha256="0" * 64)
+    with pytest.raises(ValueError, match="outcome scope"):
+        dataclasses.replace(receipt, outcome_scope="paper_comparison")
+    with pytest.raises(ValueError, match="environment byte scope"):
+        dataclasses.replace(receipt, persistent_environment_byte_scope="whole_process_rss")
 
 
 def test_runtime_and_plan_fail_closed(runtime) -> None:
@@ -142,3 +167,45 @@ def test_runtime_and_plan_fail_closed(runtime) -> None:
     with pytest.raises(ValueError, match="development seed"):
         ContinualWorldSmokePlan(runtime=runtime, seed=0)
     assert len(protocol_gap_record()) >= 8
+
+
+def test_direct_receipt_revalidates_mutated_nested_plan_and_runtime(receipt) -> None:
+    hostile_runtime = dataclasses.replace(receipt.plan.runtime)
+    hostile_plan = dataclasses.replace(receipt.plan, runtime=hostile_runtime)
+    object.__setattr__(hostile_runtime, "python_version", "")
+    with pytest.raises(ValueError, match="python_version"):
+        dataclasses.replace(
+            receipt,
+            plan=hostile_plan,
+            plan_sha256=hostile_plan.sha256,
+        )
+
+    hostile_plan = dataclasses.replace(receipt.plan)
+    object.__setattr__(hostile_plan, "steps_per_task", 3)
+    with pytest.raises(ValueError, match="smoke steps_per_task is frozen"):
+        dataclasses.replace(
+            receipt,
+            plan=hostile_plan,
+            plan_sha256=hostile_plan.sha256,
+            environment_steps=60,
+            action_bytes=60 * 4 * np.dtype(np.float32).itemsize,
+            observation_bytes=60 * 32 * np.dtype(np.float32).itemsize,
+            reward_bytes=60 * np.dtype(np.float32).itemsize,
+            success_bytes=60 * np.dtype(np.bool_).itemsize,
+            task_index_bytes=60 * np.dtype(np.int32).itemsize,
+        )
+
+
+def test_payload_validator_enforces_receipt_ceiling_before_identity_reconstruction(receipt) -> None:
+    oversized = receipt.payload()
+    oversized["identity"]["runtime_identity"].append(["zz", "x" * (1 << 20)])
+
+    with pytest.raises(ValueError, match="limit|ceiling"):
+        validate_smoke_payload(oversized)
+
+
+def test_payload_method_rejects_post_construction_mutation(receipt) -> None:
+    object.__setattr__(receipt, "development_only", False)
+
+    with pytest.raises(ValueError, match="permanently nonpromoting"):
+        receipt.payload()

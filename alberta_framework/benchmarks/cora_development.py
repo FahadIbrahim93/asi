@@ -31,8 +31,6 @@ TASK_TARGETS = (0, 1, 0)
 N_CYCLES = 2
 ARM_IDS = ("replay_q", "replay_off_q", "task_id_q_control", "uniform_random")
 MAX_STEPS_PER_TASK = 32
-# One pre-training snapshot plus one checkpoint after every task in every cycle.
-_EVALUATION_MATRIX_ROWS = len(TASK_TARGETS) * N_CYCLES + 1
 
 
 def _runner_source_sha256() -> str:
@@ -129,11 +127,6 @@ class ArmResult:
             raise ValueError("unknown arm_id")
         if type(self.evaluation_matrix) is not tuple or not self.evaluation_matrix:
             raise ValueError("evaluation_matrix must be a non-empty exact tuple")
-        if len(self.evaluation_matrix) != _EVALUATION_MATRIX_ROWS:
-            raise ValueError(
-                "evaluation_matrix must contain exactly "
-                f"{_EVALUATION_MATRIX_ROWS} checkpoint rows"
-            )
         malformed_rows = (
             type(row) is not tuple or len(row) != len(TASK_TARGETS)
             for row in self.evaluation_matrix
@@ -238,11 +231,6 @@ def _evaluate(
 
 
 def _metrics(matrix: tuple[tuple[float, ...], ...]) -> tuple[float, float, float]:
-    if type(matrix) is not tuple or len(matrix) != _EVALUATION_MATRIX_ROWS:
-        raise ValueError(
-            "evaluation_matrix must contain exactly "
-            f"{_EVALUATION_MATRIX_ROWS} checkpoint rows"
-        )
     array = np.asarray(matrix, dtype=np.float64)
     continual = float(np.mean(array))
     seen: set[int] = set()
@@ -381,7 +369,7 @@ def validate_result(value: object) -> CORADevelopmentResult:
         raise ValueError("result must be an exact CORADevelopmentResult")
     CORADevelopmentResult.__post_init__(value)
     train_steps = value.steps_per_task * len(TASK_TARGETS) * N_CYCLES
-    rows = _EVALUATION_MATRIX_ROWS
+    rows = len(TASK_TARGETS) * N_CYCLES + 1
     eval_steps = rows * len(TASK_TARGETS)
     for arm in value.arms:
         ArmResult.__post_init__(arm)

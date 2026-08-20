@@ -24,6 +24,7 @@ from alberta_framework.benchmarks.replay_frozen_ipmnist import (
 
 RESULT_SCHEMA: Final = "asi.replay-frozen-ipmnist.development-result.v1"
 COMPARISON_ID: Final = "asi.replay-frozen-ipmnist.current-runner.v1"
+DEVELOPMENT_SEEDS: Final[tuple[int, ...]] = (0, 1, 2, 3, 4)
 
 PROTOCOL_GAPS: Final = (
     "all arms use ASI's online IPMNIST stream and pre-update metric",
@@ -81,6 +82,12 @@ _ARMS: Final = MappingProxyType(
 _INT32_MAX = (1 << 31) - 1
 _MAX_BYTES = 256 * 1024 * 1024
 _PARAMETER_LEAVES = 6
+
+
+def registered_arms() -> tuple[str, ...]:
+    """Return the exact replay/frozen campaign roster in execution order."""
+
+    return tuple(_ARMS)
 
 
 def _object(value: object, keys: frozenset[str], context: str) -> Mapping[str, Any]:

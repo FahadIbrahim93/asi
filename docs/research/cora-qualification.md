@@ -29,8 +29,34 @@ replay inserts/samples/peak bytes, persistent numeric bytes, logical calls and t
 nanoseconds. Validators recompute all counters and all three metric summaries. Results are permanently
 nonpromoting, task-information use is explicit, and negative outcomes must be retained.
 
-Protocol gaps before external comparison include environment/ROM/assets checksums and licenses;
-the exact historical PyTorch/CUDA/runtime lock; observation preprocessing, frame stacking, action
+The separate `asi.cora.procgen.fixed_action_smoke.v1` contract is the first genuine external
+qualification surface. It pins the official repository and commit through issue #1581's external
+qualification authority and freezes the six-game Procgen sequence (Climber, Dodgeball, Ninja,
+Starpilot, Bigfish, Fruitbot), 64x64 RGB observations, 15 actions, 200 training levels,
+full-distribution evaluation, five cycles, 5 million training steps per task, and the paper's
+250,000-step/20-window/20-seed metric parameters. These are catalog values, not a launch request.
+
+An isolated provider must declare an immutable image, exact Python/PyTorch/torchvision/Gym/Procgen/
+NumPy versions, a lock hash, a clean official checkout at the pinned commit, its Git tree, source
+archive and install-tree hashes, hashes for required experiment/metrics entry points, and exact
+Procgen distribution, compiled-data, install-tree, and license identities. The provider interface
+emits one bounded training/evaluation reset-step pair for every game, using frozen training level
+seeds 0-5 and disjoint evaluation level seeds 10000-10005. The host copies and hashes
+exact int32 task/level/action arrays, uint8 observations, float32 rewards, and boolean termination
+signals; enforces the task/split/fixed-action schedule; and records exact trace-array bytes.
+External-runtime persistent numeric bytes are provider-reported, consistency-bound, and explicitly
+unattested until a reviewed runtime-state inventory can derive them. The fixed action has no model
+queries or learner updates, and task and boundary
+identity are evaluator-only. The receipt is current-source/runtime bound and nonpromoting.
+
+`asi-cora-external-qualification --blockers` only emits fail-closed metadata. It does not inspect
+the network, download source, build an image, accept assets, launch Procgen, or write a result.
+Content hashes are consistency bindings, not authenticated execution attestation. Until a supplied
+official checkout, runtime, asset manifest, raw trace, and authorization are independently reviewed,
+every external gate stays blocked and the native bandit remains explicitly not CORA.
+
+Protocol gaps before external comparison include acquisition and independent verification of the
+pinned source/runtime/Procgen identities; observation preprocessing, frame stacking, action
 unification, episode truncation and stochastic seeding; actor/learner concurrency; continual-test
 rollout counts and whether they affect learner state; task-ID and boundary exposure per baseline;
 CLEAR replay bytes and replay ratio; EWC Fisher computation; P&C capacity; task-specific return

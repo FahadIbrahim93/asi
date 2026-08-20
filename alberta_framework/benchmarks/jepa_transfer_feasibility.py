@@ -42,7 +42,13 @@ from alberta_framework.core.sarsa import SARSAAgent, SARSAConfig
 from alberta_framework.streams.closed_loop import SwitchingTwoStateConfig, SwitchingTwoStateMDP
 
 JEPA_TRANSFER_SCHEMA = "asi.jepa_transfer_feasibility.development.v1"
-FROZEN_DEVELOPMENT_SEEDS = (1_577_000, 1_577_001, 1_577_002, 1_577_003)
+FROZEN_DEVELOPMENT_SEEDS = (
+    1_577_000,
+    1_577_001,
+    1_577_002,
+    1_577_003,
+    1_577_004,
+)
 FROZEN_ARM_IDS = (
     "asi_encoder_transfer",
     "no_pretraining",
@@ -328,7 +334,7 @@ class JEPATransferResult:
             env = SwitchingTwoStateMDP(
                 SwitchingTwoStateConfig(phase_length=self.protocol.phase_length)
             )
-            env_key, agent_key = jr.split(jr.key(arm.seed))
+            env_key, agent_key = jr.split(jr.key(arm.seed, impl="threefry2x32"))
             expected_environment_bytes = _tree_nbytes(env.init(env_key))
             if resources.persistent_environment_bytes != expected_environment_bytes:
                 raise ValueError("environment bytes differ from the derived state")
@@ -339,7 +345,7 @@ class JEPATransferResult:
                 # update. The full-warm-start arm arrives in that structural
                 # state; other arms retain a larger fresh state at their peak.
                 structural_state = _model(encoder_learning=False).init(
-                    jr.fold_in(jr.key(arm.seed), 2)
+                    jr.fold_in(jr.key(arm.seed, impl="threefry2x32"), 2)
                 )
                 if index == 3:
                     learner_state = cast(Any, structural_state).learner_state
@@ -467,7 +473,13 @@ def _model_action(model: LatentWorldModel, state: object, observation: jax.Array
 
 
 def _base_actions(seed: int, steps: int) -> tuple[int, ...]:
-    actions = jr.randint(jr.fold_in(jr.key(seed), 1577), (steps,), 0, 2, dtype=jnp.int32)
+    actions = jr.randint(
+        jr.fold_in(jr.key(seed, impl="threefry2x32"), 1577),
+        (steps,),
+        0,
+        2,
+        dtype=jnp.int32,
+    )
     return tuple(int(value) for value in np.asarray(actions))
 
 
@@ -475,7 +487,9 @@ def _pretrain(protocol: JEPATransferProtocol, seed: int) -> tuple[object, int, i
     """Train on one stored ASI-only trace and return state, bytes, elapsed ns."""
     started = time.perf_counter_ns()
     env = SwitchingTwoStateMDP(SwitchingTwoStateConfig(phase_length=protocol.phase_length))
-    env_key, model_key = jr.split(jr.fold_in(jr.key(seed), 1))
+    env_key, model_key = jr.split(
+        jr.fold_in(jr.key(seed, impl="threefry2x32"), 1)
+    )
     env_state = env.init(env_key)
     observation = env.observe(env_state)
     replay: list[tuple[jax.Array, int, jax.Array, jax.Array]] = []
@@ -508,7 +522,7 @@ def _deployment_state(
     arm_id: str, seed: int, pretrained: object | None
 ) -> tuple[LatentWorldModel, object]:
     model = _model(encoder_learning=False)
-    fresh = model.init(jr.fold_in(jr.key(seed), 2))
+    fresh = model.init(jr.fold_in(jr.key(seed, impl="threefry2x32"), 2))
     if pretrained is None:
         return model, fresh
     learned = cast(Any, pretrained)
@@ -531,7 +545,7 @@ def _run_model_arm(protocol: JEPATransferProtocol, seed: int, arm_id: str) -> Tr
     model, state = _deployment_state(arm_id, seed, pretrained)
     initial_bytes = _tree_nbytes(state)
     env = SwitchingTwoStateMDP(SwitchingTwoStateConfig(phase_length=protocol.phase_length))
-    env_key, _ = jr.split(jr.key(seed))
+    env_key, _ = jr.split(jr.key(seed, impl="threefry2x32"))
     env_state = env.init(env_key)
     observation = env.observe(env_state)
     base = _base_actions(seed, protocol.steps)
@@ -604,7 +618,7 @@ def _run_model_arm(protocol: JEPATransferProtocol, seed: int, arm_id: str) -> Tr
 
 def _run_control(protocol: JEPATransferProtocol, seed: int, *, sarsa: bool) -> TransferArmReceipt:
     env = SwitchingTwoStateMDP(SwitchingTwoStateConfig(phase_length=protocol.phase_length))
-    env_key, agent_key = jr.split(jr.key(seed))
+    env_key, agent_key = jr.split(jr.key(seed, impl="threefry2x32"))
     env_state = env.init(env_key)
     observation = env.observe(env_state)
     base = _base_actions(seed, protocol.steps)

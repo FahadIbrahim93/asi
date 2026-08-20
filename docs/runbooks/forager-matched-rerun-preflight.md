@@ -1,7 +1,7 @@
 # Matched Forager rerun preflight
 
 `asi-forager-rerun-preflight` is a read-only, non-executing readiness check for
-[issue #1584](https://github.com/SlopDotCash/asi/issues/1584).
+[issue #1584](https://github.com/elizaOS/asi/issues/1584).
 It does not pull, build, load, or run an OCI image; prepare an output directory; read reward arrays;
 or authorize a campaign. A blocked report exits 2 and is not an execution receipt.
 
@@ -22,6 +22,11 @@ The frozen value is a Docker image **config digest** because the executors requi
 the official CPU qualification receipt and qualification record, and the RNG-parity receipt. They
 contain the required config digest but no registry repository/manifest reference. The issue's
 18 August 2026 UTC audit also found only receipts in GitHub code search and no published blob.
+
+The audit holds one no-follow descriptor for the project root, walks every path component relative
+to retained directory descriptors, rejects linked leaves, and rechecks root, directory, and file
+identities after reading. A symlinked root or intermediate directory is therefore not an acceptable
+substitute for the declared immutable records.
 
 The issue records a non-substitutable reconstruction failure. Recovered source, lock, uv 0.9.24,
 and Debian packages reproduced 120 symlinks, 6,564,533,833 regular-file bytes, and a

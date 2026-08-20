@@ -38,9 +38,10 @@ PAPERS = (
     "Hafner et al., Nature 2025, doi:10.1038/s41586-025-08744-2; arXiv:2301.04104",
     "Kessler et al., CoLLAs 2023, PMLR 232:184-204; arXiv:2211.15944",
 )
-FROZEN_SEEDS = (1760, 1761, 1762, 1763)
+FROZEN_SEEDS = (1760, 1761, 1762, 1763, 1764)
 FROZEN_TASK_TARGETS = (0, 1, 0)
 ARM_IDS = ("guarded_imagination", "imagination_off", "privileged_task_control")
+PRNG_IMPLEMENTATION = "threefry2x32"
 MAX_STEPS_PER_TASK = 16
 MAX_IMAGINATIONS_PER_STEP = 8
 WORKLOAD_REGISTRY = (
@@ -49,6 +50,7 @@ WORKLOAD_REGISTRY = (
     ("frozen_task_targets", FROZEN_TASK_TARGETS),
     ("max_imaginations_per_step", MAX_IMAGINATIONS_PER_STEP),
     ("max_steps_per_task", MAX_STEPS_PER_TASK),
+    ("prng_implementation", PRNG_IMPLEMENTATION),
 )
 PAPER_REGISTRY = (("dreamerv3_code", DREAMERV3_CODE), ("papers", PAPERS))
 
@@ -193,7 +195,7 @@ def _run_arm(
             error_decay=0.0,
         )
     )
-    state = model.init(jr.key(seed))
+    state = model.init(jr.key(seed, impl=PRNG_IMPLEMENTATION))
     initial_model_bytes = _tree_nbytes(state)
     dreamer = GuardedDreamer(
         DreamingConfig(warmup_steps=1, max_model_error_ema=1.0e6, max_uncertainty=0.0)
@@ -362,7 +364,11 @@ def validate_result(value: object) -> DevelopmentResult:
         expected_persistent = (
             int(np.asarray(FROZEN_TASK_TARGETS, dtype=np.int32).nbytes)
             if not model_arm
-            else _tree_nbytes(model.init(jr.key(value.seed))) + 2 * 4 + expected_peak
+            else _tree_nbytes(
+                model.init(jr.key(value.seed, impl=PRNG_IMPLEMENTATION))
+            )
+            + 2 * 4
+            + expected_peak
         )
         if receipt.persistent_bytes != expected_persistent:
             raise ValueError("persistent-byte receipt mismatch")

@@ -31,6 +31,11 @@ Before comparison, pin the official environment dependencies and assets, indepen
 the official revision, implement continuous-action CEM with matched planning calls, add Perfect
 Memory and deep continual-learning controls, match episode/evaluation schedules, audit information
 available to every arm, qualify resource instrumentation, and freeze untouched scientific seeds.
+The read-only [external-reproduction gate](../runbooks/ftl-external-reproduction.md) now qualifies
+an already-present exact checkout and emits a precise blocker manifest without downloading,
+importing, executing, or writing an artifact. It deliberately remains non-execution-ready because
+the public environment repository contains neither the paper's OA/planner implementation nor a
+complete dependency or paper-protocol lock.
 
 The historical `ftl_world_model_decision_fidelity` artifact remains a separate immutable narrow
 open-loop diagnostic. This lane neither reads it nor changes its source inventory, schema, claim,

@@ -541,6 +541,16 @@ def catalog_payload() -> dict[str, object]:
         "development_only": True,
         "scientific_promotion_allowed": False,
         "frozen_seeds": list(FROZEN_SEEDS),
+        "heldout_qualification_schema": "asi.native_supervised_cl_qualification.v2",
+        "heldout_qualification_api": (
+            "alberta_framework.benchmarks.native_supervised_qualification."
+            "run_supplied_array_qualification"
+        ),
+        "canonical_asset_qualification_schema": "asi.native_supervised_cl_canonical.v3",
+        "canonical_asset_qualification_api": (
+            "alberta_framework.benchmarks.native_supervised_canonical."
+            "run_canonical_asset_qualification"
+        ),
         "benchmarks": [dataclasses.asdict(spec) for spec in CATALOG],
     }
 

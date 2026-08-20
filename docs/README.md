@@ -50,12 +50,26 @@ The package overview and development entry points are in
   to the current IPMNIST summary and the supersession status of append-only records.
 - [`research/sota-landscape.md`](research/sota-landscape.md) — current protocol-aware external
   comparison map for IPMNIST, Forager, and the other ASI lanes.
+- [`research/implementation-backlog.json`](research/implementation-backlog.json) —
+  machine-readable issue backlog derived from the external comparison map.
 - [`design/rtu-taylor-correction.md`](design/rtu-taylor-correction.md) — derivation and limits
   of the optional RTU approximation.
 
 ## Runbooks
 
+- [`runbooks/reference-life-scorecard-development-run.md`](runbooks/reference-life-scorecard-development-run.md)
+  — manual dispatch, valid-failure retention, fresh-dispatch recovery, independent
+  validation, and append-only publication for the permanently nonpromoting 144-shard
+  reference-life scorecard.
 - [`runbooks/foragax-open-screen.md`](runbooks/foragax-open-screen.md)
+- [`runbooks/continual-benchmark-suite.md`](runbooks/continual-benchmark-suite.md)
+- [`runbooks/optimization-readiness-development.md`](runbooks/optimization-readiness-development.md)
+- [`runbooks/noise-curvature-development.md`](runbooks/noise-curvature-development.md) —
+  Permanently nonpromoting five-seed/four-arm scheduler campaign, strict replay,
+  and create-only retention boundary.
+- [`runbooks/replay-frozen-development.md`](runbooks/replay-frozen-development.md) —
+  Permanently inconclusive five-seed/eight-arm replay/frozen campaign, strict
+  replay, and create-only retention boundary.
 
 Runbooks retain their stated issuance and promotion boundaries. An unissued or
 development-only runbook does not authorize a scientific result.

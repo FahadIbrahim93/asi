@@ -97,6 +97,25 @@ from alberta_framework.core.delight import (
     discrete_delightful_policy_gradient,
     stratify_delight_outcomes,
 )
+from alberta_framework.core.dreamer_sequence_control import (
+    DreamerActorParameters,
+    DreamerDecision,
+    DreamerLearnResult,
+    DreamerModelParameters,
+    DreamerReplayState,
+    DreamerResourceBudget,
+    DreamerSequenceConfig,
+    DreamerSequenceControl,
+    DreamerSequenceSample,
+    DreamerSequenceState,
+    DreamerValueParameters,
+)
+from alberta_framework.core.dreamer_sequence_control import (
+    DreamerTransition as DreamerSequenceTransition,
+)
+from alberta_framework.core.dreamer_sequence_control import (
+    lambda_returns as dreamer_lambda_returns,
+)
 from alberta_framework.core.dreaming import (
     ActionConditionedDreamWorld,
     BehaviorModelDreamPolicy,
@@ -810,6 +829,20 @@ __all__ = [
     "init_dream_rollout_state",
     "score_dream_candidates",
     "slice_imagined_transition",
+    # Recurrent sequence replay / latent imagination / actor-value control
+    "DreamerActorParameters",
+    "DreamerDecision",
+    "DreamerLearnResult",
+    "DreamerModelParameters",
+    "DreamerReplayState",
+    "DreamerResourceBudget",
+    "DreamerSequenceConfig",
+    "DreamerSequenceControl",
+    "DreamerSequenceSample",
+    "DreamerSequenceState",
+    "DreamerSequenceTransition",
+    "DreamerValueParameters",
+    "dreamer_lambda_returns",
     # Bounded experiential memory
     "ExperientialMemory",
     "ExperientialMemoryAccounting",

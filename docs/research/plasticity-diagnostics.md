@@ -73,6 +73,25 @@ native supervised suite but intentionally separate because its cumulative
 online protocol and hidden CBP network differ from that suite's generic linear
 IPMNIST slice.
 
+## Matched five-seed campaign contract
+
+`alberta_framework.evaluation.plasticity_diagnostics_campaign` fixes a
+five-seed, three-arm, seed-major campaign on the `bounded-development` profile.
+The caller supplies both the exact arrays and a bounded source manifest. The
+report binds the copied array bytes, caller-attested source label, complete
+profile, cumulative-permutation schedules, explicit Threefry roots, initial
+numeric states, current source inventory, runtime and devices, normalized
+per-arm records, and exact logical resource totals. The source label is
+provenance supplied by the caller; it is not authenticated proof that the bytes
+came from MNIST or any named provider.
+
+Validation reexecutes all 15 seed-by-arm cells and requires exact normalized
+report replay. Timing is discarded, the roster is fixed, negative outcomes are
+retained, and the only permitted decision is `inconclusive` because no
+selection rule is registered. The create-only writer refuses replacement and
+publishes read-only JSON. No campaign artifact is checked in and tests do not
+authorize a campaign run.
+
 ## Costly lanes remain closed
 
 Continual ImageNet uses 2,000 randomly selected binary tasks, 32×32 images,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -230,6 +231,11 @@ def test_v5_amendment_rejects_promotion_or_provenance_drift() -> None:
     with pytest.raises(ValueError, match="canonical path"):
         validate_v5_amendment(ROOT, _v5_raw(), amendment)
 
+    raw = _v5_raw()
+    raw["wall_clock_seconds"] += 1.0
+    with pytest.raises(ValueError, match="differs from its bound"):
+        validate_v5_amendment(ROOT, raw, _v5_amendment())
+
 
 @pytest.mark.parametrize(
     ("field", "replacement"),
@@ -271,6 +277,11 @@ def test_v6_amendment_requires_all_seed_controls_and_matched_bayes() -> None:
     amendment["controls"]["bayes"]["per_seed_bayes_accuracy"][1] += 0.01
     with pytest.raises(ValueError, match="SEM"):
         validate_v6_amendment(ROOT, _v6_raw(), amendment)
+
+    raw = _v6_raw()
+    raw["wall_clock_seconds"] += 1.0
+    with pytest.raises(ValueError, match="differs from its bound"):
+        validate_v6_amendment(ROOT, raw, _v6_amendment())
 
 
 def test_v6_amendment_recomputes_matched_headroom() -> None:
@@ -317,6 +328,29 @@ def test_strict_json_rejects_duplicates_and_nonfinite_numbers(tmp_path: Path) ->
     nonfinite.write_text(json.dumps({"value": float("nan")}), encoding="utf-8")
     with pytest.raises(ValueError, match="finite"):
         load_strict_json(nonfinite)
+
+
+def test_strict_json_rejects_oversize_symlink_and_fifo_before_unsafe_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    oversized = tmp_path / "oversized.json"
+    oversized.write_bytes(b" " * 16_000_001)
+    monkeypatch.setattr(os, "open", lambda *_args, **_kwargs: pytest.fail("opened oversized"))
+    with pytest.raises(ValueError, match="byte bound"):
+        load_strict_json(oversized)
+    monkeypatch.undo()
+
+    target = tmp_path / "target.json"
+    target.write_text("{}", encoding="utf-8")
+    link = tmp_path / "link.json"
+    link.symlink_to(target)
+    with pytest.raises(ValueError, match="non-symlink"):
+        load_strict_json(link)
+
+    fifo = tmp_path / "artifact.fifo"
+    os.mkfifo(fifo)
+    with pytest.raises(ValueError, match="regular"):
+        load_strict_json(fifo)
 
 
 @pytest.mark.parametrize("integer_type", [bool])

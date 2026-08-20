@@ -34,7 +34,11 @@ def test_all_catalog_lanes_construct_and_run_end_to_end(benchmark_id: str) -> No
     shape = (4, 4, 3) if n_classes == 100 else (4, 4)
     images, labels = _fixture(n_classes, shape)
     result = run_native_suite(
-        benchmark_id, images, labels, seed=FROZEN_SEEDS[0], examples_per_task=2,
+        benchmark_id,
+        images,
+        labels,
+        seed=FROZEN_SEEDS[0],
+        examples_per_task=2,
         replay_capacity=3,
     )
     assert tuple(arm.arm_id for arm in result.arms) == ARM_IDS
@@ -95,7 +99,11 @@ def test_result_binds_dataset_schedule_source_and_runtime_identities() -> None:
 def test_replay_and_mechanism_off_have_exact_causal_receipts() -> None:
     images, labels = _fixture(10, (4, 4))
     result = run_native_suite(
-        "split_mnist", images, labels, seed=FROZEN_SEEDS[2], examples_per_task=2,
+        "split_mnist",
+        images,
+        labels,
+        seed=FROZEN_SEEDS[2],
+        examples_per_task=2,
         replay_capacity=3,
     )
     online, replay, centroid, frozen = result.arms
@@ -112,12 +120,20 @@ def test_replay_and_mechanism_off_have_exact_causal_receipts() -> None:
 def test_jit_and_eager_sgd_paths_match_end_to_end_except_timing() -> None:
     images, labels = _fixture(10, (4, 4))
     compiled = run_native_suite(
-        "split_mnist", images, labels, seed=FROZEN_SEEDS[3], examples_per_task=1,
+        "split_mnist",
+        images,
+        labels,
+        seed=FROZEN_SEEDS[3],
+        examples_per_task=1,
         replay_capacity=2,
     )
     with jax.disable_jit():
         eager = run_native_suite(
-            "split_mnist", images, labels, seed=FROZEN_SEEDS[3], examples_per_task=1,
+            "split_mnist",
+            images,
+            labels,
+            seed=FROZEN_SEEDS[3],
+            examples_per_task=1,
             replay_capacity=2,
         )
     for left, right in zip(compiled.arms, eager.arms, strict=True):
@@ -160,3 +176,7 @@ def test_catalog_cli_is_metadata_only(capsys: pytest.CaptureFixture[str]) -> Non
     payload = json.loads(capsys.readouterr().out)
     assert payload == catalog_payload()
     assert payload["avalanche_revision"].endswith("eb075be393e1f458b2c352514ff6c17b5a2c0f4e")
+    assert payload["heldout_qualification_schema"] == "asi.native_supervised_cl_qualification.v2"
+    assert payload["canonical_asset_qualification_schema"] == (
+        "asi.native_supervised_cl_canonical.v3"
+    )

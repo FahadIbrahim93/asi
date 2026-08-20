@@ -26,3 +26,32 @@ selective-replay variants, evaluation matrices, published compute budgets, and o
 parity. Before comparison, locate and pin the Continual-Dreamer source snapshot, implement those
 components, match environment/dependency versions and all information boundaries, validate hardware
 accounting, reproduce official single-task controls, and freeze untouched scientific seeds.
+
+## Five-seed matched campaign
+
+`dreamer_continual_campaign.py` composes the native lane into a strict,
+permanently nonpromoting five-seed development campaign. The frozen workload
+uses the recurring targets `(0, 1, 0)`, four steps per task, replay capacity
+eight, and two imagination proposals per real step. The exact roster is five
+seeds by guarded imagination, its causal imagination-off twin, and the
+privileged task-aware normalization control. The privileged arm is never
+candidate-eligible.
+
+Every report binds current relevant source and lockfile bytes, runtime/JAX
+configuration, the synthetic transition and task schedule, explicit Threefry
+roots, execution-relevant initial world-model state, initial values, the
+deterministic guarded replay/anchor schedule, all normalized arm metrics, and
+exact replay/model/imagination/resource counters. Host-only birth and uptime
+telemetry are the only initial-state fields canonicalized to zero; elapsed
+timing is discarded. Validation reconstructs those identities, reexecutes all
+five three-arm runs, and exact-compares the normalized report. The writer
+validates before create-only, read-only publication. It creates no output by
+itself.
+
+The paired intervals are descriptive only and every decision is
+`inconclusive`: there is no registered selection rule. This machinery remains
+a tiny native mechanism test—not an RSSM, pixel encoder/decoder or
+reconstruction lane, learned actor-critic, multistep latent imagination agent,
+or official Continual-Dreamer reproduction. Source/checkpoint parity,
+MiniGrid/MiniHack and paper task schedules, selective replay, paper compute,
+untouched scientific seeds, measured RSS, and qualified timing remain open.

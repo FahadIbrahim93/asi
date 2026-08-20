@@ -82,13 +82,62 @@ The command reads and hashes local regular files below the root and prints a
 plan to stdout. It rejects symlinks, traversal, extra fields, malformed counts,
 hash drift, and oversized manifests. It never extracts or writes data.
 
+## Exact runner-input preflight
+
+The optional `asi.clear.runner-input.v1` preflight closes the structural gap
+between an opaque archive receipt and the files a future runner would consume.
+It still does not authorize execution. Supply it with
+`--runner-input-manifest PATH`; the CLI then emits the original qualification
+plan and a separate, nonauthorizing runner-input receipt.
+
+The runner-input manifest binds all of the following:
+
+- the exact dataset receipt and streaming protocol;
+- an `independently-reviewed-acquisition` HTTPS locator, content-addressed
+  provider snapshot, and archive identities equal to the dataset receipt;
+- content-addressed `asi.clear.acquisition-review.v1`,
+  `asi.clear.rights-storage-review.v1`, and `asi.clear.split-review.v1` JSON
+  documents, with the split review binding the exact prepared indexes;
+- explicit local-development-only decisions covering YFCC terms, Flickr asset
+  terms, takedown handling, and approved storage;
+- one canonical JSONL training index and one evaluation index for each labeled
+  bucket/year, with distinct index paths; and
+- globally unique sample IDs and paths, exact sample sizes and SHA-256 values,
+  globally unique sample content hashes, class indices `0..99`, full 100-class
+  coverage in every split, and training counts equal to the already-qualified
+  dataset receipt; and
+- an aggregate one-GiB index ceiling plus signed-64-bit sample/resource
+  accounting, rather than merely applying the index limit independently to
+  twenty files.
+
+Each JSONL record has the exact fields `sample_id`, `path`, `size_bytes`,
+`sha256`, and `class_index`. Paths are relative to the approved dataset root.
+The verifier requires the selected dataset root itself to be a real directory,
+then opens every path component through retained no-follow directory file
+descriptors. It rechecks the final directory entry and every directory binding
+after each bounded read, hashes every indexed file, and rejects symlink or
+hard-link aliases even when an alias is not otherwise referenced by the
+manifest. Root manifests, review JSON, and JSONL records reject duplicate keys,
+non-finite values, malformed input, oversized/partial lines, and unknown
+fields. Train/evaluation IDs, paths, inodes, and content hashes are globally
+disjoint.
+
+The receipt accounts for review, index, sample, training-observation,
+optimizer-update, model-query, and data-read totals and revalidates that
+arithmetic when constructed. Its identity includes the current verifier source
+and runtime. Review statements are parsed and cross-checked rather than treated
+as opaque blobs, but the caller supplies them: the receipt therefore records
+`external_reviews_authenticated: false`,
+`provider_snapshot_bytes_verified: false`,
+`redistribution_authorized: false`, and `execution_authorized: false`.
+
 ## Remaining comparability gates
 
-- Resolve a content-addressed provider snapshot and published checksums, or
-  archive an independently reviewed acquisition receipt.
-- Review YFCC/Flickr asset terms, takedown behavior, and approved storage.
-- Parse the prepared metadata and independently verify class and bucket counts;
-  archive-byte identity alone does not prove semantic split parity.
+- Populate the new preflight with a real content-addressed provider snapshot,
+  independently reviewed acquisition receipt, rights/storage review, and
+  locally prepared split indexes. The schema and verifier exist; no real CLEAR
+  reviews or asset receipts are bundled in this repository, and the current
+  preflight does not possess or authenticate the provider-snapshot bytes.
 - Implement a runner outside the #1578 native-suite adapter, then add image,
   label, transform, metric, JIT/parity, and end-to-end tests.
 - Receipt exact model, optimizer, accelerator, preprocessing, and optional

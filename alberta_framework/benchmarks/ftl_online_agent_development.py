@@ -25,7 +25,6 @@ import jax.random as jr
 import numpy as np
 
 import alberta_framework.core.ftl_world_model as ftl_world_model_module
-from alberta_framework._scan_resources import ScanBudget, require_scan_steps
 from alberta_framework.benchmarks.development_provenance import (
     DevelopmentIdentity,
     collect_development_identity,
@@ -40,14 +39,14 @@ OFFICIAL_CODE_REVISION = "sail-sg/ContinualBench@a4fdb3b94a07a40d76e28d3aeab0f8c
 FROZEN_SEEDS = (1701, 1702, 1703, 1704)
 FROZEN_GOALS = ((2.0, 0.0), (0.0, 2.0), (-2.0, 0.0))
 ARM_IDS = ("sparse_ftl_online", "sparse_ftl_frozen", "privileged_dynamics_mpc")
-ACTION_DELTAS = np.asarray(((1, 0), (-1, 0), (0, 1), (0, -1)), dtype=np.float32)
-ACTION_DELTAS.flags.writeable = False
+ACTION_DELTAS = ((1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0))
+ACTION_DELTA_BYTES = (
+    len(ACTION_DELTAS) * len(ACTION_DELTAS[0]) * np.dtype(np.float32).itemsize
+)
 MAX_STEPS_PER_TASK = 16
-_MPC_ENUMERATION_BUDGET = ScanBudget("FTL MPC enumeration", maximum_steps=4)
-MAX_PLANNING_HORIZON = _MPC_ENUMERATION_BUDGET.maximum_steps
 WORKLOAD_REGISTRY = (
     ("arm_ids", ARM_IDS),
-    ("action_deltas", ((1, 0), (-1, 0), (0, 1), (0, -1))),
+    ("action_deltas", ACTION_DELTAS),
     ("frozen_goals", FROZEN_GOALS),
     ("frozen_seeds", FROZEN_SEEDS),
     ("max_steps_per_task", MAX_STEPS_PER_TASK),
@@ -126,6 +125,9 @@ class ArmResult:
             or self.candidate_eligible != expected_eligible
         ):
             raise ValueError("privileged control must be excluded from candidate comparison")
+        if type(self.receipt) is not ResourceReceipt:
+            raise ValueError("receipt must be an exact ResourceReceipt")
+        ResourceReceipt.__post_init__(self.receipt)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -149,13 +151,15 @@ class DevelopmentResult:
         if self.seed not in FROZEN_SEEDS:
             raise ValueError("seed is outside the frozen development schedule")
         _int(self.steps_per_task, "steps_per_task", 1, MAX_STEPS_PER_TASK)
-        _int(self.planning_horizon, "planning_horizon", 1, MAX_PLANNING_HORIZON)
+        _int(self.planning_horizon, "planning_horizon", 1, 4)
         if (
             type(self.arms) is not tuple
             or any(type(arm) is not ArmResult for arm in self.arms)
             or tuple(x.arm_id for x in self.arms) != ARM_IDS
         ):
             raise ValueError("arms differ from the frozen roster")
+        for arm in self.arms:
+            ArmResult.__post_init__(arm)
         if type(self.identity) is not DevelopmentIdentity:
             raise ValueError("identity must be exact")
         if (
@@ -184,20 +188,22 @@ def _action_vector(action: int) -> jax.Array:
     return jax.nn.one_hot(jnp.asarray(action), 4, dtype=jnp.float32)
 
 
+def _action_delta(action: int) -> np.ndarray:
+    """Materialize one immutable registry entry at the numerical use site."""
+    return np.asarray(ACTION_DELTAS[action], dtype=np.float32)
+
+
 def _mpc_action(
     observation: np.ndarray,
     goal: np.ndarray,
     horizon: int,
     predict: Callable[[np.ndarray, int], np.ndarray],
 ) -> tuple[int, int, int]:
-    host_horizon = require_scan_steps(
-        "planning_horizon", horizon, _MPC_ENUMERATION_BUDGET
-    )
-    candidate_count = 4**host_horizon
+    sequences = tuple(itertools.product(range(4), repeat=horizon))
     best_score = -math.inf
     best_action = 0
     queries = 0
-    for sequence in itertools.product(range(4), repeat=host_horizon):
+    for sequence in sequences:
         imagined = observation.copy()
         for action in sequence:
             imagined = np.asarray(predict(imagined, action), dtype=np.float32)
@@ -205,7 +211,7 @@ def _mpc_action(
         score = -float(np.sum((imagined - goal) ** 2))
         if score > best_score:
             best_score, best_action = score, sequence[0]
-    return best_action, queries, candidate_count
+    return best_action, queries, len(sequences)
 
 
 def _run_arm(seed: int, steps: int, horizon: int, arm_id: str) -> ArmResult:
@@ -225,7 +231,7 @@ def _run_arm(seed: int, steps: int, horizon: int, arm_id: str) -> ArmResult:
         for _ in range(steps):
             if arm_id == "privileged_dynamics_mpc":
                 def predict(obs: np.ndarray, action: int) -> np.ndarray:
-                    return np.asarray(obs + ACTION_DELTAS[action], dtype=np.float32)
+                    return np.asarray(obs + _action_delta(action), dtype=np.float32)
             else:
                 current_state = state
 
@@ -237,7 +243,7 @@ def _run_arm(seed: int, steps: int, horizon: int, arm_id: str) -> ArmResult:
             action, arm_queries, arm_candidates = _mpc_action(observation, goal, horizon, predict)
             queries += arm_queries
             candidates += arm_candidates
-            next_observation = observation + ACTION_DELTAS[action]
+            next_observation = observation + _action_delta(action)
             total -= float(np.sum((next_observation - goal) ** 2))
             if arm_id == "sparse_ftl_online":
                 result = model.update(state, observation, _action_vector(action), next_observation)
@@ -267,7 +273,7 @@ def _run_arm(seed: int, steps: int, horizon: int, arm_id: str) -> ArmResult:
             planner_candidates=candidates,
             logical_compute_units=(steps * len(FROZEN_GOALS) + queries + candidates + updates),
             persistent_bytes=(
-                int(ACTION_DELTAS.nbytes)
+                ACTION_DELTA_BYTES
                 if arm_id == "privileged_dynamics_mpc"
                 else max(initial_bytes, final_bytes)
             ),
@@ -285,7 +291,7 @@ def run_development_lane(
     if host_seed not in FROZEN_SEEDS:
         raise ValueError("seed is outside the frozen development schedule")
     steps = _int(steps_per_task, "steps_per_task", 1, MAX_STEPS_PER_TASK)
-    horizon = _int(planning_horizon, "planning_horizon", 1, MAX_PLANNING_HORIZON)
+    horizon = _int(planning_horizon, "planning_horizon", 1, 4)
     result = DevelopmentResult(
         schema=SCHEMA,
         seed=host_seed,
@@ -384,7 +390,7 @@ def validate_result(value: object) -> DevelopmentResult:
         if arm.receipt.logical_compute_units != expected_compute:
             raise ValueError("logical-compute receipt mismatch")
         expected_bytes = (
-            int(ACTION_DELTAS.nbytes)
+            ACTION_DELTA_BYTES
             if arm.arm_id == "privileged_dynamics_mpc"
             else expected_model_bytes
         )

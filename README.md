@@ -240,13 +240,28 @@ The console scripts are grouped by responsibility; every command supports `--hel
 | Commands | Purpose |
 |---|---|
 | `alberta-step1-smoke`, `alberta-step2-smoke` | Nonpromoting mechanism smoke checks |
-| `asi-native-supervised-catalog`, `asi-plasticity-diagnostic` | Inspect or run bounded, permanently nonpromoting supervised diagnostics |
+| `asi-benchmark-catalog` | List benchmark protocols or perform read-only local readiness checks |
+| `asi-native-supervised-catalog`, `asi-native-supervised-canonical`, `asi-plasticity-diagnostic`, `asi-nap-ipmnist` | Inspect or run bounded, permanently nonpromoting supervised and plasticity diagnostics; the canonical command verifies caller-held official MNIST/CIFAR-100 bytes and never downloads them |
+| `asi-pretrained-feature-qualification` | Inspect fail-closed official RanDumb/RanPAC/PROL checkpoint, provenance, and cost blockers; never downloads or runs them |
 | `asi-adamo-diagnostic` | Catalog or run the bounded, permanently nonpromoting AdamO dynamical-isometry comparator |
+| `asi-adamo-matched-development` | Run the complete five-seed AdamO development campaign to a new result path |
+| `asi-adalin-matched-development` | Run the create-only, five-seed AdaLin development campaign from an explicit NPZ dataset |
+| `asi-activation-feature-ipmnist` | Run one bounded, permanently nonpromoting activation/feature IPMNIST arm |
 | `asi-clear-qualification` | Verify local CLEAR archive identities and emit a permanently nonpromoting matched setup plan |
 | `asi-coom-qualification-smoke` | Inspect or run the bounded, synthetic, permanently nonpromoting COOM qualification smoke |
+| `asi-coom-external-preflight` | Inspect fail-closed official COOM archive, runtime, and trace blockers without downloading or executing them |
 | `asi-cora-catalog` | Inspect the blocked CORA qualification catalog without importing external runtimes |
+| `asi-cora-external-qualification` | Inspect fail-closed official CORA Procgen qualification blockers |
 | `asi-forager-rerun-preflight` | Report the fail-closed, read-only readiness state for a matched-current Forager rerun |
 | `asi-telapa-qualification-smoke` | Inspect or run the bounded, permanently nonpromoting TeLAPA archive smoke |
+| `asi-activation-feature-matched` | Run the complete frozen 5-seed x 11-arm development comparison to a new result path |
+| `asi-bounded-elastic-ipmnist` | Run the complete fixed-budget 5-seed x 4-arm development comparison to a new result path |
+| `asi-cchain-matched-development` | Run the frozen 5-seed x 4-arm C-CHAIN development campaign to a new result path |
+| `asi-action-conditioned-latent`, `asi-action-conditioned-latent-matched` | Run the bounded action-latent lane or its create-only, five-seed matched campaign |
+| `asi-jepa-transfer-feasibility`, `asi-jepa-transfer-matched` | Run the native JEPA-transfer check or its create-only, five-seed matched campaign |
+| `asi-vjepa-external-qualification` | Inspect fail-closed official V-JEPA 2-AC source, checkpoint, data, license, runtime, and visual-token adapter blockers |
+| `asi-dreamer-sequence-development` | Run the bounded, permanently nonpromoting recurrent Dreamer sequence-control development lane |
+| `asi-ftl-external-readiness` | Inspect fail-closed external FTL source, runtime, asset, and protocol blockers |
 | `asi-reference-life-scorecard` | Run or validate the permanently nonpromoting reference-life development scorecard |
 | `asi-ipmnist-ceiling` | Produce new, atomic no-replace stationary/carried/full or batch ceiling diagnostics |
 | `asi-ipmnist-campaign` | Recompute paired frontiers or ceiling summaries from explicit input directories |
@@ -426,11 +441,16 @@ consumed seeds, or modify immutable `outputs/` records. See
 
 - [Foragax open development screen](docs/runbooks/foragax-open-screen.md)
 - [Maintained IPMNIST campaign tools](docs/runbooks/ipmnist-maintained-tools.md)
+- [Optimization Readiness development execution](docs/runbooks/optimization-readiness-development.md)
+- [Noise-curvature matched development campaign](docs/runbooks/noise-curvature-development.md)
+- [Replay/frozen matched development campaign](docs/runbooks/replay-frozen-development.md)
 
 ### Research and historical audits
 
 - [CORA continual-RL qualification](docs/research/cora-qualification.md)
 - [IPMNIST theory](docs/research/ipmnist-theory.md)
+- [Gradual-transition family and matched campaign](docs/research/gradual-transition-family.md)
+- [Dreamer-family native lane and matched campaign](docs/research/dreamer-continual-development.md)
 - [Current IPMNIST campaign index](docs/research/ipmnist-campaign-index.md)
 - [RTU Taylor-correction derivation](docs/design/rtu-taylor-correction.md)
 - [Dated repository anti-LARP audit](docs/audits/repository-larp-audit.md)
@@ -441,6 +461,7 @@ consumed seeds, or modify immutable `outputs/` records. See
 ### Repository and benchmark records
 
 - [Forager benchmark](FORAGER_BENCHMARK.md)
+- [Native supervised continual-learning development suite](docs/research/native-supervised-suite.md)
 - [Vendoring and fork history](VENDORING.md)
 - [Changelog](CHANGELOG.md)
 - [Citation metadata](CITATION.cff)

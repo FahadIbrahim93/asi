@@ -277,7 +277,6 @@ def _source_identity() -> dict[str, str]:
         Path("alberta_framework/benchmarks/bimu.py"),
         Path("alberta_framework/benchmarks/upgd_ipmnist.py"),
         Path("alberta_framework/evaluation/bimu_matched_nonpromoting.py"),
-        Path("uv.lock"),
     )
     return {str(path): hashlib.sha256((root / path).read_bytes()).hexdigest() for path in paths}
 

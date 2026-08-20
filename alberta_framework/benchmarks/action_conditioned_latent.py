@@ -27,8 +27,10 @@ import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
 
+import alberta_framework.core.ftl_world_model as ftl_world_model_module
 import alberta_framework.core.latent_world_model as latent_world_model_module
 import alberta_framework.core.sarsa as sarsa_module
+import alberta_framework.core.world_model as world_model_module
 import alberta_framework.streams.closed_loop as closed_loop_module
 from alberta_framework.benchmarks.development_provenance import (
     DevelopmentIdentity,
@@ -36,27 +38,39 @@ from alberta_framework.benchmarks.development_provenance import (
     identity_from_payload,
     require_current_identity,
 )
+from alberta_framework.core.ftl_world_model import SparseFTLWorldModel, SparseFTLWorldModelConfig
 from alberta_framework.core.latent_world_model import LatentWorldModel, LatentWorldModelConfig
 from alberta_framework.core.sarsa import SARSAAgent, SARSAConfig
+from alberta_framework.core.world_model import OneStepWorldModel, WorldModelConfig
 from alberta_framework.streams.closed_loop import SwitchingTwoStateConfig, SwitchingTwoStateMDP
 
-ACTION_LATENT_SCHEMA = "asi.action_conditioned_latent.development.v1"
-FROZEN_DEVELOPMENT_SEEDS = (1_575_000, 1_575_001, 1_575_002, 1_575_003)
+ACTION_LATENT_SCHEMA = "asi.action_conditioned_latent.development.v3"
+FROZEN_DEVELOPMENT_SEEDS = (
+    1_575_000,
+    1_575_001,
+    1_575_002,
+    1_575_003,
+    1_575_004,
+)
 FROZEN_ARM_IDS = (
     "latent_action_interactions",
     "latent_no_interactions",
     "latent_action_masked",
     "latent_decision_off",
+    "reconstruction_control",
+    "one_step_ftl_control",
     "mechanism_off",
     "sarsa_control",
 )
-PINNED_RESEARCH = MappingProxyType({
-    "dreamer_cdp_paper": "arXiv:2603.07083v2",
-    "dreamer_cdp_code": "a851fa3e3d70b624b094ee1810ad4bb602346092",
-    "jedi_paper": "arXiv:2605.13013v1",
-    "jepa_wm_paper": "arXiv:2512.24497v3",
-    "jepa_wm_code": "13cf1d9c7e476f53c17714d2e0f1dc239a883ce0",
-})
+PINNED_RESEARCH = MappingProxyType(
+    {
+        "dreamer_cdp_paper": "arXiv:2603.07083v2",
+        "dreamer_cdp_code": "a851fa3e3d70b624b094ee1810ad4bb602346092",
+        "jedi_paper": "arXiv:2605.13013v1",
+        "jepa_wm_paper": "arXiv:2512.24497v3",
+        "jepa_wm_code": "13cf1d9c7e476f53c17714d2e0f1dc239a883ce0",
+    }
+)
 PINNED_RESEARCH_ITEMS = tuple(sorted(PINNED_RESEARCH.items()))
 _MAX_STEPS = 4096
 _MAX_SEEDS = 16
@@ -72,7 +86,13 @@ WORKLOAD_REGISTRY = (
 def _current_identity() -> DevelopmentIdentity:
     return collect_development_identity(
         lane_module=sys.modules[__name__],
-        dependency_modules=(latent_world_model_module, sarsa_module, closed_loop_module),
+        dependency_modules=(
+            ftl_world_model_module,
+            latent_world_model_module,
+            sarsa_module,
+            world_model_module,
+            closed_loop_module,
+        ),
         workload_registry=WORKLOAD_REGISTRY,
         paper_registry=PINNED_RESEARCH,
     )
@@ -122,13 +142,9 @@ class ActionLatentProtocol:
 
     def __post_init__(self) -> None:
         steps = _exact_int(self.steps, name="steps", minimum=4, maximum=_MAX_STEPS)
-        phase_length = _exact_int(
-            self.phase_length, name="phase_length", minimum=2, maximum=steps
-        )
+        phase_length = _exact_int(self.phase_length, name="phase_length", minimum=2, maximum=steps)
         _exact_int(self.warmup_steps, name="warmup_steps", minimum=1, maximum=steps)
-        _exact_int(
-            self.exploration_period, name="exploration_period", minimum=2, maximum=steps
-        )
+        _exact_int(self.exploration_period, name="exploration_period", minimum=2, maximum=steps)
         if type(self.seeds) is not tuple or not 1 <= len(self.seeds) <= _MAX_SEEDS:
             raise ValueError("seeds must be a bounded exact tuple")
         if self.seeds != FROZEN_DEVELOPMENT_SEEDS:
@@ -152,6 +168,7 @@ class ActionLatentArmReceipt:
     reward_sha256: str
     environment_steps: int
     model_updates: int
+    agent_updates: int
     training_queries: int
     decision_queries: int
     persistent_mechanism_bytes: int
@@ -180,6 +197,7 @@ class ActionLatentArmReceipt:
         for name in (
             "environment_steps",
             "model_updates",
+            "agent_updates",
             "training_queries",
             "decision_queries",
             "persistent_mechanism_bytes",
@@ -188,14 +206,24 @@ class ActionLatentArmReceipt:
             _exact_int(getattr(self, name), name=name, minimum=0, maximum=_INT32_MAX)
         if self.environment_steps < 1 or self.persistent_environment_bytes < 1:
             raise ValueError("environment resources must be positive")
-        if self.model_updates != self.training_queries:
-            raise ValueError("each model update must record its prequential training query")
+        if self.model_updates + self.agent_updates != self.training_queries:
+            raise ValueError(
+                "each model or agent update must record its prequential training query"
+            )
         mechanism_enabled = self.arm_id != "mechanism_off"
         if mechanism_enabled != (self.persistent_mechanism_bytes > 0):
             raise ValueError("persistent resources disagree with arm mechanism")
-        model_arm = self.arm_id.startswith("latent_")
+        model_arm = self.arm_id.startswith("latent_") or self.arm_id in {
+            "reconstruction_control",
+            "one_step_ftl_control",
+        }
         if model_arm != (self.model_updates > 0):
             raise ValueError("model updates disagree with arm mechanism")
+        agent_arm = self.arm_id == "sarsa_control"
+        if agent_arm != (self.agent_updates > 0):
+            raise ValueError("agent-update receipt disagrees with the control arm")
+        if model_arm != (self.mean_prequential_loss is not None):
+            raise ValueError("prequential loss disagrees with arm mechanism")
         if self.negative_outcome_retained is not True:
             raise ValueError("negative outcomes must remain retained")
 
@@ -233,12 +261,11 @@ class ActionLatentResult:
         if any(arm.environment_steps != self.protocol.steps for arm in self.arms):
             raise ValueError("all arms must consume the matched environment horizon")
         by_seed = {
-            seed: [arm for arm in self.arms if arm.seed == seed]
-            for seed in self.protocol.seeds
+            seed: [arm for arm in self.arms if arm.seed == seed] for seed in self.protocol.seeds
         }
         for seed, receipts in by_seed.items():
             decision_off = receipts[3]
-            mechanism_off = receipts[4]
+            mechanism_off = receipts[6]
             if (
                 decision_off.action_sha256 != mechanism_off.action_sha256
                 or decision_off.reward_sha256 != mechanism_off.reward_sha256
@@ -246,8 +273,7 @@ class ActionLatentResult:
             ):
                 raise ValueError("decision-off must have exact mechanism-off control parity")
             eligible_decisions = sum(
-                step >= self.protocol.warmup_steps
-                and step % self.protocol.exploration_period != 0
+                step >= self.protocol.warmup_steps and step % self.protocol.exploration_period != 0
                 for step in range(self.protocol.steps)
             )
             expected_decision_queries = (
@@ -255,6 +281,8 @@ class ActionLatentResult:
                 2 * eligible_decisions,
                 2 * eligible_decisions,
                 0,
+                2 * eligible_decisions,
+                2 * eligible_decisions,
                 0,
                 self.protocol.steps + 1,
             )
@@ -265,11 +293,16 @@ class ActionLatentResult:
                 self.protocol.steps,
                 self.protocol.steps,
                 self.protocol.steps,
+                self.protocol.steps,
+                self.protocol.steps,
                 0,
                 0,
             )
             if tuple(arm.model_updates for arm in receipts) != expected_updates:
                 raise ValueError("model-update receipts differ from the frozen schedule")
+            expected_agent_updates = (0, 0, 0, 0, 0, 0, 0, self.protocol.steps)
+            if tuple(arm.agent_updates for arm in receipts) != expected_agent_updates:
+                raise ValueError("agent-update receipts differ from the frozen schedule")
             expected_environment_bytes = _expected_environment_bytes(
                 seed, phase_length=self.protocol.phase_length
             )
@@ -311,7 +344,11 @@ def validate_action_latent_payload(payload: object) -> ActionLatentResult:
         raise ValueError("payload fields differ from the schema")
     protocol_raw = root["protocol"]
     if type(protocol_raw) is not dict or set(protocol_raw) != {
-        "steps", "phase_length", "warmup_steps", "exploration_period", "seeds"
+        "steps",
+        "phase_length",
+        "warmup_steps",
+        "exploration_period",
+        "seeds",
     }:
         raise ValueError("protocol payload differs from the schema")
     protocol_dict = cast(dict[str, object], protocol_raw)
@@ -381,26 +418,68 @@ def _sarsa_agent() -> SARSAAgent:
     )
 
 
+def _reconstruction_model() -> OneStepWorldModel:
+    """Dense one-step reconstruction-plus-reward control."""
+    return OneStepWorldModel(
+        WorldModelConfig(
+            observation_dim=2,
+            n_actions=2,
+            hidden_sizes=(),
+            step_size=0.03,
+            sparsity=0.0,
+            use_layer_norm=False,
+        )
+    )
+
+
+def _one_step_ftl_model() -> SparseFTLWorldModel:
+    """Sparse FTL joint next-observation/reward predictor.
+
+    The third input channel is a fixed zero at decision time and the third
+    target channel is the observed reward.  Consequently the model's third
+    next-observation prediction is an honest one-step reward prediction while
+    its first two channels reconstruct the next observation.
+    """
+    return SparseFTLWorldModel(
+        SparseFTLWorldModelConfig(
+            observation_dim=3,
+            action_dim=2,
+            projection_dim=4,
+            bins=4,
+        )
+    )
+
+
 def _expected_environment_bytes(seed: int, *, phase_length: int) -> int:
     env = SwitchingTwoStateMDP(SwitchingTwoStateConfig(phase_length=phase_length))
-    env_key, _mechanism_key = jr.split(jr.key(seed))
+    env_key, _mechanism_key = jr.split(jr.key(seed, impl="threefry2x32"))
     return _tree_nbytes(env.init(env_key))
 
 
 def _expected_mechanism_bytes(arm_id: str, *, seed: int) -> int:
     if arm_id == "mechanism_off":
         return 0
-    _env_key, mechanism_key = jr.split(jr.key(seed))
+    _env_key, mechanism_key = jr.split(jr.key(seed, impl="threefry2x32"))
     if arm_id.startswith("latent_"):
         model = _latent_model(interactions=arm_id != "latent_no_interactions")
         return _tree_nbytes(model.init(mechanism_key))
+    if arm_id == "reconstruction_control":
+        return _tree_nbytes(_reconstruction_model().init(mechanism_key))
+    if arm_id == "one_step_ftl_control":
+        return _tree_nbytes(_one_step_ftl_model().init(mechanism_key))
     if arm_id == "sarsa_control":
         return _tree_nbytes(_sarsa_agent().init(2, mechanism_key))
     raise ValueError("unsupported arm_id")
 
 
 def _base_actions(seed: int, steps: int) -> tuple[int, ...]:
-    values = jr.randint(jr.fold_in(jr.key(seed), 91), (steps,), 0, 2, dtype=jnp.int32)
+    values = jr.randint(
+        jr.fold_in(jr.key(seed, impl="threefry2x32"), 91),
+        (steps,),
+        0,
+        2,
+        dtype=jnp.int32,
+    )
     return tuple(int(value) for value in np.asarray(values))
 
 
@@ -425,6 +504,52 @@ def select_latent_action(
     return jnp.argmax(rewards).astype(jnp.int32)
 
 
+@functools.partial(jax.jit, static_argnums=(0,))
+def _select_reconstruction_action(
+    model: OneStepWorldModel,
+    state: object,
+    observation: jax.Array,
+) -> jax.Array:
+    model_state = cast(Any, state)
+    rewards = jnp.stack(
+        tuple(
+            model.predict(model_state, observation, jnp.asarray(action, dtype=jnp.int32)).reward
+            for action in range(2)
+        )
+    )
+    return jnp.argmax(rewards).astype(jnp.int32)
+
+
+def _ftl_observation(observation: jax.Array) -> jax.Array:
+    return jnp.concatenate(
+        (
+            jnp.asarray(observation, dtype=jnp.float32),
+            jnp.zeros((1,), dtype=jnp.float32),
+        )
+    )
+
+
+@functools.partial(jax.jit, static_argnums=(0,))
+def _select_one_step_ftl_action(
+    model: SparseFTLWorldModel,
+    state: object,
+    observation: jax.Array,
+) -> jax.Array:
+    model_state = cast(Any, state)
+    augmented = _ftl_observation(observation)
+    rewards = jnp.stack(
+        tuple(
+            model.predict(
+                model_state,
+                augmented,
+                jax.nn.one_hot(action, 2, dtype=jnp.float32),
+            ).next_observation[2]
+            for action in range(2)
+        )
+    )
+    return jnp.argmax(rewards).astype(jnp.int32)
+
+
 def _run_latent_arm(
     protocol: ActionLatentProtocol,
     *,
@@ -432,7 +557,7 @@ def _run_latent_arm(
     arm_id: str,
 ) -> ActionLatentArmReceipt:
     env = SwitchingTwoStateMDP(SwitchingTwoStateConfig(phase_length=protocol.phase_length))
-    env_key, model_key = jr.split(jr.key(seed))
+    env_key, model_key = jr.split(jr.key(seed, impl="threefry2x32"))
     env_state = env.init(env_key)
     observation = env.observe(env_state)
     base_actions = _base_actions(seed, protocol.steps)
@@ -486,6 +611,7 @@ def _run_latent_arm(
         reward_sha256=_trace_hash(rewards, float_trace=True),
         environment_steps=protocol.steps,
         model_updates=protocol.steps,
+        agent_updates=0,
         training_queries=protocol.steps,
         decision_queries=decision_queries,
         persistent_mechanism_bytes=max(initial_bytes, _tree_nbytes(model_state)),
@@ -494,11 +620,126 @@ def _run_latent_arm(
     )
 
 
-def _run_mechanism_off(
+def _run_reconstruction_control(
     protocol: ActionLatentProtocol, *, seed: int
 ) -> ActionLatentArmReceipt:
+    """Run the matched dense observation-reconstruction control."""
     env = SwitchingTwoStateMDP(SwitchingTwoStateConfig(phase_length=protocol.phase_length))
-    env_key, _unused_model_key = jr.split(jr.key(seed))
+    env_key, model_key = jr.split(jr.key(seed, impl="threefry2x32"))
+    env_state = env.init(env_key)
+    observation = env.observe(env_state)
+    base_actions = _base_actions(seed, protocol.steps)
+    model = _reconstruction_model()
+    model_state = model.init(model_key)
+    initial_bytes = _tree_nbytes(model_state)
+    actions: list[int] = []
+    rewards: list[float] = []
+    losses: list[float] = []
+    decision_queries = 0
+    for step in range(protocol.steps):
+        use_base = step < protocol.warmup_steps or step % protocol.exploration_period == 0
+        if use_base:
+            action = base_actions[step]
+        else:
+            decision_queries += 2
+            action = int(_select_reconstruction_action(model, model_state, observation))
+        next_observation, reward, env_state = env.step(
+            env_state, jnp.asarray(action, dtype=jnp.int32), jr.fold_in(env_key, step)
+        )
+        update = model.update(
+            model_state,
+            observation,
+            jnp.asarray(action, dtype=jnp.int32),
+            reward,
+            next_observation,
+        )
+        if not bool(update.update_applied):
+            raise RuntimeError("reconstruction control rejected a valid matched transition")
+        model_state = update.state
+        observation = next_observation
+        actions.append(action)
+        rewards.append(float(reward))
+        losses.append(float(update.prediction_error))
+    return ActionLatentArmReceipt(
+        arm_id="reconstruction_control",
+        seed=seed,
+        return_sum=float(sum(rewards)),
+        late_return_sum=float(sum(rewards[-protocol.phase_length :])),
+        mean_prequential_loss=float(np.mean(np.asarray(losses, dtype=np.float64))),
+        action_sha256=_trace_hash(actions),
+        reward_sha256=_trace_hash(rewards, float_trace=True),
+        environment_steps=protocol.steps,
+        model_updates=protocol.steps,
+        agent_updates=0,
+        training_queries=protocol.steps,
+        decision_queries=decision_queries,
+        persistent_mechanism_bytes=max(initial_bytes, _tree_nbytes(model_state)),
+        persistent_environment_bytes=_tree_nbytes(env_state),
+        negative_outcome_retained=True,
+    )
+
+
+def _run_one_step_ftl_control(
+    protocol: ActionLatentProtocol, *, seed: int
+) -> ActionLatentArmReceipt:
+    """Run the matched sparse FTL one-step reconstruction/reward control."""
+    env = SwitchingTwoStateMDP(SwitchingTwoStateConfig(phase_length=protocol.phase_length))
+    env_key, model_key = jr.split(jr.key(seed, impl="threefry2x32"))
+    env_state = env.init(env_key)
+    observation = env.observe(env_state)
+    base_actions = _base_actions(seed, protocol.steps)
+    model = _one_step_ftl_model()
+    model_state = model.init(model_key)
+    initial_bytes = _tree_nbytes(model_state)
+    actions: list[int] = []
+    rewards: list[float] = []
+    losses: list[float] = []
+    decision_queries = 0
+    for step in range(protocol.steps):
+        use_base = step < protocol.warmup_steps or step % protocol.exploration_period == 0
+        if use_base:
+            action = base_actions[step]
+        else:
+            decision_queries += 2
+            action = int(_select_one_step_ftl_action(model, model_state, observation))
+        next_observation, reward, env_state = env.step(
+            env_state, jnp.asarray(action, dtype=jnp.int32), jr.fold_in(env_key, step)
+        )
+        update = model.update(
+            model_state,
+            _ftl_observation(observation),
+            jax.nn.one_hot(action, 2, dtype=jnp.float32),
+            jnp.concatenate(
+                (jnp.asarray(next_observation, dtype=jnp.float32), reward.reshape((1,)))
+            ),
+        )
+        model_state = update.state
+        observation = next_observation
+        actions.append(action)
+        rewards.append(float(reward))
+        losses.append(float(update.squared_error))
+    return ActionLatentArmReceipt(
+        arm_id="one_step_ftl_control",
+        seed=seed,
+        return_sum=float(sum(rewards)),
+        late_return_sum=float(sum(rewards[-protocol.phase_length :])),
+        mean_prequential_loss=float(np.mean(np.asarray(losses, dtype=np.float64))),
+        action_sha256=_trace_hash(actions),
+        reward_sha256=_trace_hash(rewards, float_trace=True),
+        environment_steps=protocol.steps,
+        model_updates=protocol.steps,
+        agent_updates=0,
+        training_queries=protocol.steps,
+        decision_queries=decision_queries,
+        persistent_mechanism_bytes=max(initial_bytes, _tree_nbytes(model_state)),
+        persistent_environment_bytes=_tree_nbytes(env_state),
+        negative_outcome_retained=True,
+    )
+
+
+def _run_mechanism_off(protocol: ActionLatentProtocol, *, seed: int) -> ActionLatentArmReceipt:
+    env = SwitchingTwoStateMDP(SwitchingTwoStateConfig(phase_length=protocol.phase_length))
+    env_key, _unused_model_key = jr.split(jr.key(seed, impl="threefry2x32"))
     state = env.init(env_key)
     actions = _base_actions(seed, protocol.steps)
     rewards: list[float] = []
@@ -517,6 +758,7 @@ def _run_mechanism_off(
         reward_sha256=_trace_hash(rewards, float_trace=True),
         environment_steps=protocol.steps,
         model_updates=0,
+        agent_updates=0,
         training_queries=0,
         decision_queries=0,
         persistent_mechanism_bytes=0,
@@ -527,7 +769,7 @@ def _run_mechanism_off(
 
 def _run_sarsa(protocol: ActionLatentProtocol, *, seed: int) -> ActionLatentArmReceipt:
     env = SwitchingTwoStateMDP(SwitchingTwoStateConfig(phase_length=protocol.phase_length))
-    env_key, agent_key = jr.split(jr.key(seed))
+    env_key, agent_key = jr.split(jr.key(seed, impl="threefry2x32"))
     env_state = env.init(env_key)
     observation = env.observe(env_state)
     agent = _sarsa_agent()
@@ -538,9 +780,7 @@ def _run_sarsa(protocol: ActionLatentProtocol, *, seed: int) -> ActionLatentArmR
     actions: list[int] = []
     rewards: list[float] = []
     for step in range(protocol.steps):
-        next_observation, reward, env_state = env.step(
-            env_state, action, jr.fold_in(env_key, step)
-        )
+        next_observation, reward, env_state = env.step(env_state, action, jr.fold_in(env_key, step))
         next_action, next_key = agent.select_action(state, next_observation)
         update = agent.update(
             state,
@@ -569,7 +809,8 @@ def _run_sarsa(protocol: ActionLatentProtocol, *, seed: int) -> ActionLatentArmR
         reward_sha256=_trace_hash(rewards, float_trace=True),
         environment_steps=protocol.steps,
         model_updates=0,
-        training_queries=0,
+        agent_updates=protocol.steps,
+        training_queries=protocol.steps,
         decision_queries=protocol.steps + 1,
         persistent_mechanism_bytes=max(initial_bytes, _tree_nbytes(state)),
         persistent_environment_bytes=_tree_nbytes(env_state),
@@ -590,6 +831,8 @@ def run_action_conditioned_latent_lane(
             arm_id: _run_latent_arm(protocol, seed=seed, arm_id=arm_id)
             for arm_id in FROZEN_ARM_IDS[:4]
         }
+        reconstruction = _run_reconstruction_control(protocol, seed=seed)
+        one_step_ftl = _run_one_step_ftl_control(protocol, seed=seed)
         off = _run_mechanism_off(protocol, seed=seed)
         decision_off = latent_receipts["latent_decision_off"]
         # The model trains behind an explicitly disabled decision interface;
@@ -599,7 +842,15 @@ def run_action_conditioned_latent_lane(
             or decision_off.reward_sha256 != off.reward_sha256
         ):
             raise RuntimeError("mechanism-off transcript parity failed")
-        receipts.extend((*latent_receipts.values(), off, _run_sarsa(protocol, seed=seed)))
+        receipts.extend(
+            (
+                *latent_receipts.values(),
+                reconstruction,
+                one_step_ftl,
+                off,
+                _run_sarsa(protocol, seed=seed),
+            )
+        )
     return ActionLatentResult(
         schema=ACTION_LATENT_SCHEMA,
         protocol=protocol,
@@ -643,6 +894,8 @@ __all__ = [
     "ActionLatentArmReceipt",
     "ActionLatentProtocol",
     "ActionLatentResult",
+    "_run_one_step_ftl_control",
+    "_run_reconstruction_control",
     "run_action_conditioned_latent_lane",
     "select_latent_action",
     "validate_action_latent_payload",

@@ -1,6 +1,6 @@
 # Continual-learning comparison landscape
 
-Last primary-source check: 2026-08-17.
+Last primary-source check: 2026-08-19.
 
 This is ASI's mutable comparison map. It answers a narrower and more useful
 question than "are we SOTA?": which results are comparable to each ASI lane,
@@ -55,12 +55,16 @@ local same-runner development ranking, not a paper-level SOTA claim.
   baseline. Neither number is comparable to ASI's whole-stream metric. This
   corrects the dated `outputs/ipmnist_screening/SOTA_LANDSCAPE_2026.md`, which
   called BiMU the nearest larger number while omitting the larger MESU entry in
-  the same table.
+  the same table. A bounded 3-seed by 2-arm matched executor and append-only
+  validator are implemented, but the campaign has not run; see the
+  [runbook](../runbooks/bimu-matched-development.md).
 - [AdaLin (CoLLAs 2025)](https://arxiv.org/abs/2505.09486) evaluates 400
   permuted-MNIST tasks using 10,000 images per task, one epoch, batch size 16,
   and a 100-by-100 MLP. Its curves are relevant evidence about adaptive
   activations and plasticity, but its data budget, batching, network, and
-  reporting do not define an exact-protocol leaderboard entry.
+  reporting do not define an exact-protocol leaderboard entry. ASI's
+  [matched development campaign](adalin-matched-development.md) is a bounded,
+  permanently nonpromoting mechanism check, not a paper reproduction.
 - [Plasticity of Growing and Elastic Neural Networks
   (2026)](https://arxiv.org/abs/2608.01475) studies online permuted MNIST and
   FashionMNIST with 10,000 or 40,000 examples per task, per-example SGD at
@@ -70,7 +74,10 @@ local same-runner development ranking, not a paper-level SOTA claim.
   particularly relevant Alberta-adjacent direction for autonomous structure,
   but the longer tasks, boundary access, SGD configuration, and changing
   parameter budget make its curves non-comparable to ASI's fixed 5,000-example
-  target without a matched port and explicit resource accounting.
+  target. ASI's [#1562 development adaptation](bounded-elastic-comparison.md)
+  provides a fixed-envelope matched port with source/runtime/dataset identity
+  and explicit accounting. No campaign result exists, and the adaptation is
+  not paper-protocol parity.
 - [Learning Continually by Spectral Regularization
   (ICLR 2025)](https://openreview.net/forum?id=Hcb2cgPbMg),
   [Plastic Learning with Deep Fourier Features
@@ -100,7 +107,8 @@ local same-runner development ranking, not a paper-level SOTA claim.
   ablations, with output-churn/full-logit-NTK diagnostics and strict resource
   receipts. No comparison has been run, and the receipt freezes the substantial
   supervised/online adaptation gaps; this is not a reproduction of the paper's
-  RL results. [Calibrated Partial Resets
+  RL results. The complete campaign and remaining gates are documented in the
+  [#1565 comparison note](cchain-comparison.md). [Calibrated Partial Resets
   (2026)](https://arxiv.org/abs/2607.24996) reports utility-scaled partial
   resets on Continual MetaWorld, Continual MinAtar, and SlipperyAnt. ASI pins
   CPR paper v1 and official repository commit
@@ -134,16 +142,31 @@ local same-runner development ranking, not a paper-level SOTA claim.
   correct-class log probability, omit RL eligibility traces, and include
   diagonal-normalization, clipping, fixed-step, and head-only feature
   controls. The implementation and its tests are development infrastructure;
-  no screening result exists until a matched campaign is run.
+  no screening result exists until a matched campaign is run. The additive
+  [control runbook](../runbooks/intentional-updates-control.md) now exercises
+  the pinned TD(0) and trace equations through a recurring continuing stream
+  with TD(0), TD(λ), and Q-learning consumers plus exact fixed-step reductions. It
+  remains a linear two-state ASI adaptation, not a reproduction or result.
 - [Optimization Readiness](https://arxiv.org/abs/2605.09044v1) evaluates whether
   a checkpoint diagnostic prospectively ranks future relative loss reduction.
   Its empirical estimator uses a full-validation-set gradient for gradient
   strength and the same numerator over 128 independently sampled mini-batch
   squared-gradient norms for reliability; it compares against representation,
-  eNTK, and curvature rank diagnostics. ASI has only a development-only
-  equation-level utility and protocol descriptor for this direction. It has no
-  completed ranking result, and any future run must separately freeze tasks,
-  checkpoints, sampling, future-gain rollouts, and resource accounting.
+  eNTK, and curvature rank diagnostics. ASI now has both an equation-level
+  utility and a bounded, model-bound linear squared-loss execution slice. The
+  latter derives the full gradient, 128 independently sampled size-four
+  gradients, representation/curvature ranks, norms, and 128-rollout future
+  gains at 1/10/100 SGD steps; its validator reruns the execution from the
+  bound task arrays and checkpoint. This is development infrastructure, not a
+  paper reproduction or completed ranking result: the paper-scale model,
+  checkpoint panel, external tasks, eNTK comparator, and retained campaign
+  remain open.
+- [Gradual task transitions](https://arxiv.org/abs/2602.09234v2) studies input
+  interpolation, output interpolation through a uniform target, and gradual
+  old/new task sampling. ASI's [bounded transition-family adapter](gradual-transition-family.md)
+  implements the latter two definitions as permanently nonpromoting paired
+  micro-phases. It is an adaptation, not a paper reproduction or result; the
+  retained input-interpolation record remains separate.
 
 The defensible present statement is: ASI has a 20-seed local development leader
 at 0.87114 on its implementation of the ICLR-2024 protocol, but no current
@@ -196,6 +219,17 @@ systems, multi-epoch task learning, and task-ID methods answer different
 questions. They belong in an application comparison only after ASI names a
 matching allowance and metric; importing their headline accuracy into the
 IPMNIST or Forager table would be misleading.
+
+[When Does Continual Learning Require Learning](https://arxiv.org/abs/2607.07847v1)
+adds a mechanism-agnostic sequential evaluation for large language models across domain shift,
+temporal drift, and discrete knowledge updates. Its
+[official code](https://github.com/anneharrington/studying-cl) compares prompt adaptation,
+supervised/self-distillation updates, online reinforcement learning, and context compression on
+one Qwen3-8B backbone. It is a useful application-level reminder that external memory and weight
+updates solve different forms of change, but its pretrained model, offline/GPU stages, datasets,
+and metric suite are not comparable to ASI's current online-control or IPMNIST lanes. Treat it as
+a future application-protocol reference, not a current benchmark implementation priority or SOTA
+number for this repository.
 
 ## Alberta Plan and adjacent programs
 
@@ -274,8 +308,8 @@ planning/control, and continual retention/adaptation. ASI should not infer one f
 | Work | Main reported result | ASI use |
 |---|---|---|
 | [V-JEPA 2](https://arxiv.org/abs/2506.09985) | Large-scale self-supervised video model; action-conditioned post-training enables zero-shot image-goal robot planning. | R4 reference for physical prediction. Web-scale pretraining makes it incomparable to from-scratch continual learning; isolate architecture from imported data. |
-| [JEPA-WM physical planning study](https://arxiv.org/abs/2512.24497) / [code](https://github.com/facebookresearch/jepa-wms) | Studies architecture, objective, and planner choices and reports gains over DINO-WM and V-JEPA-2-AC on navigation/manipulation. | Best current design/ablation reference for latent physical planning; paper/code/checkpoints available. |
-| [Dreamer-CDP](https://arxiv.org/abs/2603.07083) / [code](https://github.com/fmi-basel/Dreamer-CDP) | JEPA-style continuous deterministic representation prediction matches reconstruction-based Dreamer on Crafter. | Highest-priority small reconstruction-free comparator; JAX and close to an actionable ablation. |
+| [JEPA-WM physical planning study](https://arxiv.org/abs/2512.24497) / [code](https://github.com/facebookresearch/jepa-wms) | Studies architecture, objective, and planner choices and reports gains over DINO-WM and V-JEPA-2-AC on navigation/manipulation. | Best current design/ablation reference for latent physical planning; paper/code/checkpoints available. ASI's [native feasibility lane](jepa-transfer-feasibility.md) imports none of those visual assets and is not a reproduction. |
+| [Dreamer-CDP](https://arxiv.org/abs/2603.07083) / [code](https://github.com/fmi-basel/Dreamer-CDP) | JEPA-style continuous deterministic representation prediction matches reconstruction-based Dreamer on Crafter. | Highest-priority small reconstruction-free comparator; JAX and close to an actionable ablation. ASI's [action-latent lane](action-conditioned-latent-protocol.md) is a nonvisual two-state mechanism check, not a reproduction. |
 | [JEDI](https://arxiv.org/abs/2605.13013) | End-to-end latent diffusion world model reports competitive Atari100k performance with lower VRAM and faster training/sampling than pixel diffusion. | Longer-term stochastic latent model; resource accounting is central, and it is not yet continual evidence. |
 | [NE-Dreamer](https://github.com/corl-team/nedreamer) | Decoder-free next-embedding prediction with a temporal transformer. | Candidate after Dreamer-CDP; reproduce only when its final paper/protocol is stable. |
 | [DayDreamer](https://github.com/danijar/daydreamer) | World-model learning on physical robots using replay and latent imagination. | Robotics systems reference for actor/learner separation, not evidence of continual adaptation or ASI readiness. |

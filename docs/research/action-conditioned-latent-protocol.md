@@ -31,26 +31,45 @@ paper result.
 
 ## Frozen development comparison
 
-Seeds `1575000..1575003`, horizon, phase schedule, initial-state derivation, and
+Seeds `1575000..1575004`, horizon, phase schedule, initial-state derivation, and
 exploration schedule are matched. The roster is:
 
 1. action-conditioned latent prediction with action×latent interactions;
 2. the same model without interaction features;
 3. an action-masked causal ablation;
 4. a trained model behind a disabled decision interface;
-5. exact no-model mechanism-off control; and
-6. the repository's live SARSA control agent as a stronger non-world-model
+5. a dense one-step model that reconstructs the next observation and predicts
+   reward through the same live immediate-reward decision interface;
+6. the sparse FTL model as a joint one-step next-observation/reward predictor
+   through that same decision interface;
+7. exact no-model mechanism-off control; and
+8. the repository's live SARSA control agent as a stronger non-world-model
    comparator.
 
 The decision-off and mechanism-off arms must have identical action/reward
-transcript hashes. Receipts count real environment steps, model updates,
-prequential training queries, decision queries, and exact persistent JAX-array
+transcript hashes. Receipts count real environment steps, world-model updates,
+SARSA agent updates, prequential training queries, decision queries, and exact persistent JAX-array
 bytes. Timing is omitted because no qualified timing protocol exists. Compact
 hashes are consistency bindings, not authenticated execution proof.
+Prequential losses remain objective-local diagnostics: the latent, dense
+reconstruction, and sparse FTL objectives use different target spaces and loss
+reductions, so their scalar losses are not a cross-arm decision metric. The
+matched causal comparison uses environment returns under the shared schedule.
 
 Run the bounded lane with `asi-action-conditioned-latent`. It prints a strict
 JSON receipt and never writes `outputs/`. Any negative result remains in the
 receipt; no result can promote scientific evidence.
+
+The complete campaign uses `asi-action-conditioned-latent-matched --output NEW.json`.
+It binds the entire current package Python-source tree, runtime and dependency
+versions, workload and paper registries, explicit Threefry roots, environment and
+mechanism initial states, transition/base-action/phase/decision schedules, the exact
+five-seed-by-eight-arm roster, and complete receipt resources. Process-clock fields in
+learner state are charged as persistent bytes but canonicalized to zero only for the
+algorithmic initial-state hash; timing is telemetry, not an initial learning condition.
+The strict validator reconstructs and reruns all 40 shards. Publication is atomic and
+create-only, and the campaign decision is always exactly `inconclusive`, regardless of
+the observed ordering. Adding the runner does not create a campaign result.
 
 ## Gates left open
 
@@ -64,3 +83,6 @@ receipt; no result can promote scientific evidence.
 - freeze untouched evaluation seeds only after development selection; and
 - validate robot sensing, control frequency, safety/veto, sim-to-real transfer,
   and hardware resource budgets.
+
+The five campaign seeds are consumed development seeds. They are ineligible for any
+future scientific promotion protocol.

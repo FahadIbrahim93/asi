@@ -10369,6 +10369,12 @@ def noise_curvature_development_result_payload(
     return validate_noise_curvature_development_result(payload)
 
 
+def _screening_root_key(seed: int) -> Array:
+    """Return the explicit Threefry root shared by matched screening arms."""
+
+    return jr.key(jnp.uint32(seed), impl="threefry2x32")
+
+
 def run_screening_config(
     data_x: np.ndarray | Array,
     data_y: np.ndarray | Array,
@@ -10449,7 +10455,7 @@ def run_screening_config(
     else:
         init_fn, step_fn = spec.factory(spec.hyperparameters)
 
-    root = jr.key(jnp.uint32(resolved_seed))
+    root = _screening_root_key(resolved_seed)
     key_init, key_schedule, key_noise = jr.split(root, 3)
     params = init_mlp_params(key_init, config)
     schedule = build_schedule(key_schedule, config, n_train)
@@ -10657,8 +10663,6 @@ def _is_finite_json_number(value: object) -> bool:
 def _require_screening_curve_domain(
     values: np.ndarray, field: str, *, context: str
 ) -> None:
-    if type(field) is not str:
-        raise ValueError(f"{context}: field must be an exact string")
     if field in {"per_task_accuracy", "per_task_plasticity"}:
         if np.any(values < 0.0) or np.any(values > 1.0):
             raise ValueError(f"{context}: {field} values must be in [0, 1]")
@@ -11427,8 +11431,6 @@ def merge_shards(
     and every comparison against the control are therefore computed over the
     same paired runs; an incomplete worker batch is rejected before ranking.
     """
-    if type(control_name) is not str:
-        raise ValueError("control is invalid")
     normalized_paths = [Path(path) for path in paths]
     input_bindings = _artifact_file_bindings(
         normalized_paths, context="screening shard input"

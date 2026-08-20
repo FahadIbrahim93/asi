@@ -40,7 +40,7 @@ PAPER_URL = "https://arxiv.org/abs/2606.09762v1"
 OFFICIAL_CODE = None
 OFFICIAL_CODE_SEARCH_DATE = "2026-08-17"
 ARMS = ("adamw_control", "adamo_inert", "adamo_l1e3", "adam_iso_joint_l1e3")
-FROZEN_DEVELOPMENT_SEEDS = (15600, 15601, 15602, 15603)
+FROZEN_DEVELOPMENT_SEEDS = (15600, 15601, 15602, 15603, 15604)
 _MAX_DATASET_BYTES = 256 * 1024 * 1024
 _HEX = frozenset("0123456789abcdef")
 

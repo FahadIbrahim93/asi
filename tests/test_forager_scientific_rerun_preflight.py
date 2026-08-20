@@ -5,6 +5,8 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import shutil
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -27,6 +29,16 @@ def _runner(
         return preflight.ProcessResult(returncode, stdout, stderr)
 
     return run
+
+
+def test_default_runner_drains_but_retains_only_bounded_process_output() -> None:
+    command = (
+        sys.executable,
+        "-c",
+        "import os\nfor _ in range(33): os.write(1, b'x' * 65536)",
+    )
+    with pytest.raises(preflight.ForagerScientificRerunPreflightError, match="exceeds"):
+        preflight._default_runner(command)
 
 
 def test_exact_frozen_schedule_and_whole_campaign_accounting() -> None:
@@ -72,6 +84,51 @@ def test_pinned_record_audit_rejects_links(tmp_path: Path, link_kind: str) -> No
                 preflight.audit_pinned_identity_records(tmp_path)
         finally:
             destination.unlink()
+
+
+def test_pinned_record_audit_rejects_symlinked_project_root(tmp_path: Path) -> None:
+    linked_root = tmp_path / "linked-project"
+    linked_root.symlink_to(_PROJECT_ROOT, target_is_directory=True)
+    with pytest.raises(
+        preflight.ForagerScientificRerunPreflightError,
+        match="safely open project root",
+    ):
+        preflight.audit_pinned_identity_records(linked_root)
+
+
+def test_pinned_record_audit_rejects_symlinked_project_root_ancestor(
+    tmp_path: Path,
+) -> None:
+    real_parent = tmp_path / "real-parent"
+    project_root = real_parent / "project"
+    for relative_text in preflight.PINNED_IDENTITY_RECORDS:
+        relative = Path(relative_text)
+        destination = project_root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(_PROJECT_ROOT / relative, destination)
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    with pytest.raises(
+        preflight.ForagerScientificRerunPreflightError,
+        match="safely open project root",
+    ):
+        preflight.audit_pinned_identity_records(linked_parent / "project")
+
+
+def test_pinned_record_audit_rejects_symlinked_ancestor(tmp_path: Path) -> None:
+    backing = tmp_path / "backing"
+    for relative_text in preflight.PINNED_IDENTITY_RECORDS:
+        relative = Path(relative_text)
+        source = _PROJECT_ROOT / relative
+        destination = backing / relative.relative_to("outputs")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+    (tmp_path / "outputs").symlink_to(backing, target_is_directory=True)
+    with pytest.raises(
+        preflight.ForagerScientificRerunPreflightError,
+        match="safely open pinned identity record directory outputs",
+    ):
+        preflight.audit_pinned_identity_records(tmp_path)
 
 
 def test_current_checkout_is_precisely_blocked_without_runtime_or_resolver(
@@ -132,6 +189,32 @@ def test_local_inspection_reports_absent_and_rejects_wrong_or_hostile_output(
         preflight.inspect_local_image(runner=_runner(0, b"not-json"))
     with pytest.raises(preflight.ForagerScientificRerunPreflightError, match="wrong exact type"):
         preflight.inspect_local_image(runner=lambda _command: object())  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("status", "runtime", "observed"),
+    (
+        ("runtime_unavailable", "/usr/bin/docker", None),
+        ("runtime_unavailable", None, "sha256:" + "1" * 64),
+        ("image_absent", "/usr/bin/docker", "sha256:" + "1" * 64),
+        ("image_absent", None, None),
+        ("inspection_failed", None, None),
+        ("exact_present", None, preflight.REQUIRED_IMAGE_ID),
+    ),
+)
+def test_local_inspection_rejects_incoherent_status_receipts(
+    status: str, runtime: str | None, observed: str | None
+) -> None:
+    with pytest.raises(
+        preflight.ForagerScientificRerunPreflightError,
+        match="status receipt",
+    ):
+        preflight.LocalImageInspection(  # type: ignore[arg-type]
+            status,
+            runtime,
+            observed,
+            "forged status receipt",
+        )
 
 
 def test_hostile_plan_and_report_mutations_fail_closed(

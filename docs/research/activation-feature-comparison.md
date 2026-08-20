@@ -1,9 +1,10 @@
 # Low-cost activation and feature comparison (#1566)
 
 This is a permanently nonpromoting development lane. It does not contain a
-benchmark result or establish external state of the art. The executable is
-`asi-activation-feature-ipmnist`; it runs one arm through the current IPMNIST
-screening runner and only creates a new, immutable receipt path.
+benchmark result or establish external state of the art. The shard executable
+is `asi-activation-feature-ipmnist`. The complete comparison executable is
+`asi-activation-feature-matched`; it runs the frozen 5-seed × 11-arm roster and
+only creates a new, immutable result path.
 
 ## Audited sources
 
@@ -51,3 +52,14 @@ also changes the number of active affine parameters; both allocated and active
 counts are recorded. Before any scientific comparison, development runs still
 need paired multi-seed screening, full-horizon confirmation, resource-acceptable
 comparison to the live incumbent, and a separately frozen fresh-seed protocol.
+
+The complete campaign envelope recomputes the supplied dataset digest and each
+seed's Threefry-derived initial-parameter and schedule digests, binds the
+installed runner sources and live Python/JAX/NumPy/backend identity, checks the
+exact ordered roster, and recomputes aggregates. Publication validation reruns
+every shard under the current source and compares all deterministic receipt
+fields; wall-clock timing remains telemetry only. Every row remains
+`inconclusive` because this campaign has no registered decision rule. Its hashes
+are consistency bindings, not authenticated execution attestation. Run it only
+after the source revision to be measured is settled; do not write into an
+existing `outputs/` path.

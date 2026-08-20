@@ -158,6 +158,32 @@ def _revision(repository: str, commit: str) -> ExternalCodeRevision:
 # label.  Empty code revisions are an explicit blocker, never permission to
 # substitute an unofficial implementation.
 EXTERNAL_QUALIFICATION_PLANS: tuple[ExternalQualificationPlan, ...] = (
+    ExternalQualificationPlan(
+        1573,
+        "pretrained-feature-ceilings",
+        ("arXiv:2402.08823v3", "arXiv:2307.02251v3", "arXiv:2507.12305v1"),
+        (
+            _revision(
+                "https://github.com/drimpossible/RanDumb.git",
+                "14a51ee0c045bff642f6ffbfe481efa4d49a3033",
+            ),
+            _revision(
+                "https://github.com/McDonnell-Research-Lab/RanPAC.git",
+                "cf4b301d18b0c27db030f4371b72b768005ae58a",
+            ),
+            _revision(
+                "https://github.com/anwarmaxsum/PROL.git",
+                "bfff8418a4f603a24ae578f1e108bfac89af1e18",
+            ),
+        ),
+        COMMON_GATES
+        + (
+            "checkpoint_and_extractor_identity_verified",
+            "pretraining_dataset_and_cost_provenance_verified",
+            "frozen_extractor_smoke_matches",
+            "proxy_arms_not_misreported_as_ceilings",
+        ),
+    ),
     ExternalQualificationPlan(1574, "ftl-online-agent", ("arXiv:2507.09177v1",), (), COMMON_GATES),
     ExternalQualificationPlan(
         1575,

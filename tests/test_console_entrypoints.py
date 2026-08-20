@@ -21,15 +21,42 @@ _LAZY_SCRIPTS = {
     "alberta-foragax-oci": ("alberta_framework.console_entrypoints:official_foragax_oci_main"),
 }
 _ASI_SCRIPTS = {
+    "asi-benchmark-catalog": (
+        "alberta_framework.benchmarks.continual_benchmark_catalog:main"
+    ),
+    "asi-action-conditioned-latent-matched": (
+        "alberta_framework.evaluation.action_conditioned_latent_campaign:main"
+    ),
+    "asi-jepa-transfer-matched": (
+        "alberta_framework.evaluation.jepa_transfer_campaign:main"
+    ),
+    "asi-ftl-external-readiness": (
+        "alberta_framework.benchmarks.ftl_external_readiness:main"
+    ),
+    "asi-pretrained-feature-qualification": (
+        "alberta_framework.benchmarks.pretrained_feature_qualification:main"
+    ),
     "asi-nap-ipmnist": ("alberta_framework.benchmarks.nap_ipmnist:main"),
     "asi-native-supervised-catalog": (
         "alberta_framework.benchmarks.native_supervised_suite:main"
+    ),
+    "asi-native-supervised-canonical": (
+        "alberta_framework.benchmarks.native_supervised_canonical:main"
+    ),
+    "asi-vjepa-external-qualification": (
+        "alberta_framework.benchmarks.vjepa_external_qualification:main"
     ),
     "asi-plasticity-diagnostic": (
         "alberta_framework.benchmarks.plasticity_diagnostics:main"
     ),
     "asi-activation-feature-ipmnist": (
         "alberta_framework.benchmarks.activation_feature_ipmnist:main"
+    ),
+    "asi-activation-feature-matched": (
+        "alberta_framework.evaluation.activation_feature_matched_runner:main"
+    ),
+    "asi-bounded-elastic-ipmnist": (
+        "alberta_framework.evaluation.bounded_elastic_matched_runner:main"
     ),
     "asi-adamo-diagnostic": "alberta_framework.benchmarks.adamo_diagnostic:main",
     "asi-clear-qualification": (
@@ -38,12 +65,30 @@ _ASI_SCRIPTS = {
     "asi-coom-qualification-smoke": (
         "alberta_framework.benchmarks.coom_qualification:main"
     ),
+    "asi-coom-external-preflight": (
+        "alberta_framework.benchmarks.coom_external_preflight:main"
+    ),
+    "asi-dreamer-sequence-development": (
+        "alberta_framework.benchmarks.dreamer_sequence_development:main"
+    ),
     "asi-cora-catalog": ("alberta_framework.benchmarks.cora_development:main"),
+    "asi-cora-external-qualification": (
+        "alberta_framework.benchmarks.cora_external_qualification:main"
+    ),
     "asi-forager-rerun-preflight": (
         "alberta_framework.benchmarks.forager_scientific_rerun_preflight:main"
     ),
     "asi-telapa-qualification-smoke": (
         "alberta_framework.benchmarks.telapa_qualification:main"
+    ),
+    "asi-cchain-matched-development": (
+        "alberta_framework.evaluation.cchain_matched_runner:main"
+    ),
+    "asi-adamo-matched-development": (
+        "alberta_framework.evaluation.adamo_matched_runner:main"
+    ),
+    "asi-adalin-matched-development": (
+        "alberta_framework.evaluation.adalin_matched_runner:main"
     ),
     "asi-reference-life-scorecard": (
         "alberta_framework.benchmarks.reference_life_scorecard:main"

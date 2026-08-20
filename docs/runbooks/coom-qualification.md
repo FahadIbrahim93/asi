@@ -71,6 +71,55 @@ plumbing and are never summarized as performance.
 Use `asi-coom-qualification-smoke --catalog-only` to print the setup catalog or
 run the default bounded contract smoke. No option launches COOM.
 
+## External receipt preflight
+
+`asi-coom-external-preflight` is the next, still nonexecuting boundary. It
+accepts a caller-produced JSON manifest plus three local roots and verifies:
+
+- the exact official repository/commit assertion, a caller-supplied Git tree
+  OID, the actual local source-archive bytes and SHA-256, and a fixed five-role
+  source inventory;
+- the local license file bytes, a caller-attested MIT identifier, explicit
+  absence of authenticated license review, and explicit absence of ASI asset
+  redistribution approval;
+- a network-disabled Linux container digest, actual local runtime-lock bytes,
+  the declared ViZDoom executable bytes, the exact SciPy/Gymnasium pins, and
+  bounded package versions;
+- two task-bound file identities for every scenario (configuration and asset),
+  with a license identifier and no invented redistribution review;
+- the audited COOM defaults, ordered CD8 or CO8 roster, per-task action-space
+  hashes, seed, reset policy, and task-ID visibility; and
+- two identical one-step-per-task reset/step trace receipts bound to the exact
+  source-archive, runtime, asset, and configuration identities, with exact
+  reset-plus-step observation bytes, query, terminal, truncation, task-ID, and
+  persistent-environment accounting.
+
+Every referenced file is a bounded nonempty regular file below its caller-selected
+root. The verifier walks from the filesystem anchor through each root and file
+component without following links. It rejects links, hard-link aliases, path traversal, duplicate
+paths or JSON keys, file races, type aliases, unknown fields, hash drift, and
+trace drift. It never imports or invokes the external runtime and writes no
+artifact:
+
+```bash
+.venv/bin/asi-coom-external-preflight manifest.json \
+  --source-root /approved/coom-source \
+  --asset-root /approved/coom-assets \
+  --runtime-root /approved/coom-runtime
+```
+
+This receipt deliberately records `source_identity_authenticated=false`. A
+manifest can bind local bytes to a claimed commit, but without an independently
+approved upstream archive hash or authenticated Git-object resolution it cannot
+prove that those bytes came from that commit. The caller's runtime trace is
+also not ASI execution attestation. Asset roles, licenses, configuration meaning,
+and runtime-package declarations are caller assertions bound to bytes; the
+preflight does not semantically execute or authenticate those files. Consequently
+all issue-1582 qualification
+gates remain open even after a passing local preflight; the result says only
+that the caller's declared files, runtime, configuration, and repeated trace
+are internally consistent.
+
 ## Gates still open
 
 - retrieve and hash the exact pinned source tree, WAD/config assets, and any
@@ -81,7 +130,8 @@ run the default bounded contract smoke. No option launches COOM.
   preprocessing, reward normalization, termination/truncation, frame skip,
   seeds, evaluation cadence, task-ID visibility, and metric formulas at the pin;
 - establish deterministic reset/step traces in the real engine—the synthetic
-  hash is not a substitute;
+  hash is not a substitute; the local external preflight can check a caller's
+  repeated trace but cannot authenticate its execution;
 - freeze matched environment steps, gradient updates, replay bytes, evaluation
   queries, network bytes, accelerator memory, and timing;
 - reproduce from-scratch SAC controls required for forward transfer and retain

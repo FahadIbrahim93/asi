@@ -66,7 +66,7 @@ import platform
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import chex
 import jax
@@ -86,7 +86,6 @@ from alberta_framework.benchmarks.micro_continual import (
     SEARCH_TASKS,
     MicroStreamConfig,
     MicroTaskConfig,
-    _materialized_stream_scalars,
     build_micro_stream,
     generate_stream,
 )
@@ -104,6 +103,8 @@ NONPROMOTING_POLICY: dict[str, object] = {
     "development_only": True,
     "scientific_promotion_allowed": False,
 }
+
+_SEARCH_RNG_IMPL = "threefry2x32"
 
 FLAG_NAMES: tuple[str, ...] = (
     "norm",
@@ -312,6 +313,9 @@ def champion_form_genome() -> np.ndarray:
     return genome_from_config(_CHAMPION_CONFIG)
 
 
+_SEEDED_GENOME_COUNT = 19
+
+
 def seed_genomes() -> Array:
     """Hand-designed seeds injected into the initial search population.
 
@@ -352,6 +356,8 @@ def seed_genomes() -> Array:
             variant = dict(base)
             variant.update(extra)
             rows.append(genome_from_config(variant))
+    if len(rows) != _SEEDED_GENOME_COUNT:
+        raise RuntimeError("seeded genome count drifted from the search preflight")
     return jnp.asarray(np.stack(rows), dtype=jnp.float32)
 
 
@@ -757,11 +763,15 @@ def _materialize_eval(
             hidden2=_GAUSS_HIDDEN2,
             n_classes=config.n_classes,
         )
-        key_init = jr.fold_in(jr.key(jnp.uint32(seed)), _INIT_DOMAIN)
+        key_init = jr.fold_in(
+            jr.key(jnp.uint32(seed), impl=_SEARCH_RNG_IMPL), _INIT_DOMAIN
+        )
         params = init_mlp_params(key_init, net)
         return jnp.asarray(stream.x), jnp.asarray(stream.y), params, config.regime_length
     stream_digits = build_micro_stream(config, int(seed))
-    params = init_mlp_params(jr.key(np.uint32(seed)), _net_config(config))
+    params = init_mlp_params(
+        jr.key(np.uint32(seed), impl=_SEARCH_RNG_IMPL), _net_config(config)
+    )
     return (
         jnp.asarray(stream_digits.xs),
         jnp.asarray(stream_digits.ys),
@@ -771,7 +781,7 @@ def _materialize_eval(
 
 
 def evaluate_population(
-    genomes: object,
+    genomes: Array,
     config: EvalConfig,
     *,
     seeds: Sequence[int],
@@ -791,32 +801,23 @@ def evaluate_population(
     if type(batch_size) is not int or batch_size < 1:
         raise ValueError("batch_size must be a positive built-in int")
     batch_size = _require_search_int("batch_size", batch_size, minimum=1)
-    actual_type = type(genomes)
-    if actual_type is not np.ndarray and not issubclass(
-        actual_type, (jax.Array, jax.core.Tracer)
-    ):
-        raise ValueError("genomes must be an exact trusted NumPy or JAX array")
-    trusted_genomes = cast(Any, genomes)
-    shape = trusted_genomes.shape
-    if type(shape) is not tuple or len(shape) != 2:
+    trusted_genomes = _require_trusted_genomes(genomes)
+    if trusted_genomes.ndim != 2 or trusted_genomes.shape[1] != GENOME_SIZE:
         raise ValueError(
-            f"genomes must have shape (n_genomes, {GENOME_SIZE}), got {shape}"
+            "genomes must have shape "
+            f"(n_genomes, {GENOME_SIZE}), got {tuple(trusted_genomes.shape)}"
         )
-    n_peek = _require_search_int("n_random", shape[0], minimum=0)
+    n_peek = _require_search_int(
+        "n_random", int(trusted_genomes.shape[0]), minimum=1
+    )
     n_tasks, task_length = _eval_stream_bounds(config)
     _require_search_work_unit(
-        n_random=n_peek, n_tasks=n_tasks, task_length=task_length
-    )
-    _require_logical_steps(
-        candidate_evals=n_peek,
-        stream_steps=n_tasks * task_length,
-        seed_count=len(seeds),
+        n_random=n_peek,
+        n_tasks=n_tasks,
+        task_length=task_length,
+        n_seeds=len(seeds),
     )
     genomes = jnp.asarray(trusted_genomes, dtype=jnp.float32)
-    if genomes.ndim != 2 or genomes.shape[1] != GENOME_SIZE:
-        raise ValueError(
-            f"genomes must have shape (n_genomes, {GENOME_SIZE}), got {tuple(genomes.shape)}"
-        )
     if not bool(jnp.all(jnp.isfinite(genomes))):
         raise ValueError("genomes must contain only finite values")
     n_genomes = int(genomes.shape[0])
@@ -857,8 +858,6 @@ def penalized_fitness(accuracy: np.ndarray, genomes: np.ndarray | Array) -> np.n
 
 def random_genomes(key: Array, n: int) -> Array:
     """Uniform random genomes (flags ~ Bernoulli(0.5) via thresholding)."""
-    n = _require_search_int("n_random", n, minimum=0)
-    _require_search_work_unit(n_random=n)
     return jr.uniform(key, (n, GENOME_SIZE), jnp.float32, 0.0, 1.0)
 
 
@@ -913,15 +912,63 @@ _SEARCH_INT_MAX_FALLBACK = 10_000_000
 _SEARCH_CANDIDATE_EVALS_MAX = 16_384
 _SEARCH_STREAM_STEPS_MAX = 10_000_000
 _SEARCH_CANDIDATE_ROWS_MAX = 12_288
-# Twice the complete maintained default Gaussian search, baseline-tuning, and
-# holdout workload (2,014,080,000 candidate-example steps). This is a logical
-# work ceiling, not a performance or timing claim.
-_SEARCH_LOGICAL_STEPS_MAX = 4_028_160_000
-_SEARCH_STREAM_NAMED_BYTES_MAX = 512 * 1024**2
-_N_SEEDED_GENOMES = 19
-_BASELINE_RANDOM = 256
-_BASELINE_GENERATIONS = 4
-_BASELINE_CHILDREN = 64
+
+# Documented run_search / tune_champion_baseline defaults. The Cartesian
+# logical-work ceiling is 4× the larger maintained protocol (gauss-v1
+# search+holdout at 16×5000), which also covers the digits MICRO_SUITE default.
+_DEFAULT_N_RANDOM = 3072
+_DEFAULT_POPULATION = 256
+_DEFAULT_GENERATIONS = 12
+_DEFAULT_ELITE = 32
+_DEFAULT_CHILDREN = _DEFAULT_POPULATION - _DEFAULT_ELITE
+_DEFAULT_EVAL_SEEDS = 2
+_DEFAULT_HOLDOUT_SEEDS = 3
+_DEFAULT_TOP_K = 12
+_DEFAULT_BASELINE_N_RANDOM = 256
+_DEFAULT_BASELINE_GENERATIONS = 4
+_DEFAULT_BASELINE_CHILDREN = 64
+_DEFAULT_SEARCH_EVALS = (
+    _DEFAULT_N_RANDOM
+    + _DEFAULT_POPULATION * (1 + _DEFAULT_GENERATIONS)
+    + _DEFAULT_CHILDREN * _DEFAULT_GENERATIONS
+)
+_DEFAULT_BASELINE_EVALS = (
+    1
+    + _DEFAULT_BASELINE_N_RANDOM
+    + _DEFAULT_BASELINE_CHILDREN * _DEFAULT_BASELINE_GENERATIONS
+)
+_DEFAULT_HOLDOUT_EVALS = 2 + _DEFAULT_TOP_K
+_DEFAULT_DIGITS_SEARCH_STEPS = 8 * 500 * 3
+_DEFAULT_DIGITS_HOLDOUT_STEPS = 8 * 500 + 12 * 300
+_DEFAULT_GAUSS_STEPS = 16 * 5000 * 2
+
+
+def _default_protocol_logical_work(search_steps: int, holdout_steps: int) -> int:
+    return (
+        _DEFAULT_SEARCH_EVALS * search_steps * _DEFAULT_EVAL_SEEDS
+        + _DEFAULT_BASELINE_EVALS * search_steps * _DEFAULT_EVAL_SEEDS
+        + _DEFAULT_HOLDOUT_EVALS * holdout_steps * _DEFAULT_HOLDOUT_SEEDS
+    )
+
+
+_SEARCH_LOGICAL_WORK_MAX = 4 * max(
+    _default_protocol_logical_work(
+        _DEFAULT_DIGITS_SEARCH_STEPS, _DEFAULT_DIGITS_HOLDOUT_STEPS
+    ),
+    _default_protocol_logical_work(_DEFAULT_GAUSS_STEPS, _DEFAULT_GAUSS_STEPS),
+)
+
+
+def _require_trusted_genomes(value: object) -> np.ndarray | Array:
+    """Exact-gate trusted array identity before shape, class, or conversion."""
+    actual_type = type(value)
+    if not (
+        actual_type is np.ndarray
+        or issubclass(actual_type, jax.Array)
+        or issubclass(actual_type, jax.core.Tracer)
+    ):
+        raise TypeError("genomes must be a trusted array")
+    return value  # type: ignore[return-value]
 
 
 def _require_search_int(name: str, value: object, *, minimum: int) -> int:
@@ -933,6 +980,31 @@ def _require_search_int(name: str, value: object, *, minimum: int) -> int:
     return value
 
 
+def _search_candidate_evals(
+    *,
+    n_random: int,
+    population: int = 0,
+    generations: int = 0,
+    children: int = 0,
+) -> int:
+    return n_random + population * (1 + generations) + children * generations
+
+
+def _require_logical_product(evals: int, steps: int, seeds: int) -> int:
+    if type(evals) is not int or type(steps) is not int or type(seeds) is not int:
+        raise ValueError("search logical work factors must be integers")
+    if evals < 0 or steps < 0 or seeds < 0:
+        raise ValueError("search logical work factors must be non-negative")
+    if evals == 0 or steps == 0 or seeds == 0:
+        return 0
+    if evals > _SEARCH_LOGICAL_WORK_MAX // steps:
+        raise ValueError("search logical work exceeds the protocol budget")
+    product = evals * steps
+    if product > _SEARCH_LOGICAL_WORK_MAX // seeds:
+        raise ValueError("search logical work exceeds the protocol budget")
+    return product * seeds
+
+
 def _require_search_work_unit(
     *,
     n_random: int,
@@ -941,6 +1013,7 @@ def _require_search_work_unit(
     children: int = 0,
     n_tasks: int | None = None,
     task_length: int | None = None,
+    n_seeds: int = 1,
 ) -> None:
     """Reject combined products before JAX allocation, stream build, or range."""
     candidate_rows = n_random
@@ -950,70 +1023,76 @@ def _require_search_work_unit(
         candidate_rows = children
     if candidate_rows > _SEARCH_CANDIDATE_ROWS_MAX:
         raise ValueError("search candidate arrays exceed the protocol budget")
-    candidate_evals = n_random + population * (1 + generations) + children * generations
+    candidate_evals = _search_candidate_evals(
+        n_random=n_random,
+        population=population,
+        generations=generations,
+        children=children,
+    )
     if candidate_evals > _SEARCH_CANDIDATE_EVALS_MAX:
         raise ValueError("search candidate evaluations exceed the protocol budget")
-    if (
-        n_tasks is not None
-        and task_length is not None
-        and n_tasks * task_length > _SEARCH_STREAM_STEPS_MAX
-    ):
-        raise ValueError("search stream steps exceed the protocol budget")
+    if n_tasks is not None and task_length is not None:
+        if n_tasks * task_length > _SEARCH_STREAM_STEPS_MAX:
+            raise ValueError("search stream steps exceed the protocol budget")
+        _require_logical_product(candidate_evals, n_tasks * task_length, n_seeds)
 
 
-def _require_logical_steps(
-    *, candidate_evals: int, stream_steps: int, seed_count: int
+def _require_search_protocol_work(
+    *,
+    search_evals: int,
+    search_steps: int,
+    n_eval_seeds: int,
+    baseline_evals: int,
+    holdout_evals: int,
+    holdout_steps: int,
+    n_holdout_seeds: int,
 ) -> None:
-    logical_steps = candidate_evals * stream_steps * seed_count
-    if logical_steps > _SEARCH_LOGICAL_STEPS_MAX:
-        raise ValueError("search candidate-example steps exceed the protocol budget")
+    total = 0
+    for evals, steps, seeds in (
+        (search_evals, search_steps, n_eval_seeds),
+        (baseline_evals, search_steps, n_eval_seeds),
+        (holdout_evals, holdout_steps, n_holdout_seeds),
+    ):
+        piece = _require_logical_product(evals, steps, seeds)
+        if total > _SEARCH_LOGICAL_WORK_MAX - piece:
+            raise ValueError("search logical work exceeds the protocol budget")
+        total += piece
 
 
 def _eval_stream_bounds(config: EvalConfig) -> tuple[int, int]:
-    if type(config) is MicroStreamConfig:
-        named_bytes = 4 * _materialized_stream_scalars(
-            n_regimes=config.n_regimes,
-            regime_length=config.regime_length,
-            dim=config.dim,
-            n_classes=config.n_classes,
-            n_components=config.n_components,
-        )
-        if named_bytes > _SEARCH_STREAM_NAMED_BYTES_MAX:
-            raise ValueError("search stream named arrays exceed the byte budget")
+    if isinstance(config, MicroStreamConfig):
         return config.n_regimes, config.regime_length
-    if type(config) is MicroTaskConfig:
-        steps = config.n_tasks * config.task_length
-        named_bytes = steps * (4 * config.input_dim + 8)
-        if named_bytes > _SEARCH_STREAM_NAMED_BYTES_MAX:
-            raise ValueError("search stream named arrays exceed the byte budget")
-        return config.n_tasks, config.task_length
-    raise ValueError("evaluation config must have an exact registered type")
+    return config.n_tasks, config.task_length
 
 
 def _selected_stream_steps(
-    suite: Mapping[str, EvalConfig], task_names: Sequence[str]
+    suite: Mapping[str, EvalConfig], names: Sequence[str]
 ) -> int:
     total = 0
-    for name in task_names:
-        if name not in suite:
-            raise ValueError("task name is absent from the selected suite")
+    for name in names:
         n_tasks, task_length = _eval_stream_bounds(suite[name])
-        _require_search_work_unit(
-            n_random=0, n_tasks=n_tasks, task_length=task_length
-        )
+        _require_search_work_unit(n_random=0, n_tasks=n_tasks, task_length=task_length)
         total += n_tasks * task_length
     return total
 
 
 def _require_suite_streams(
     suite: Mapping[str, EvalConfig],
+    *,
+    selected: Sequence[str] | None = None,
+    n_seeds: int = 1,
     **work_kwargs: int,
 ) -> None:
-    for config in suite.values():
-        n_tasks, task_length = _eval_stream_bounds(config)
-        _require_search_work_unit(
-            n_tasks=n_tasks, task_length=task_length, **work_kwargs
-        )
+    names = tuple(selected) if selected is not None else tuple(suite.keys())
+    stream_steps = _selected_stream_steps(suite, names)
+    candidate_evals = _search_candidate_evals(
+        n_random=work_kwargs.get("n_random", 0),
+        population=work_kwargs.get("population", 0),
+        generations=work_kwargs.get("generations", 0),
+        children=work_kwargs.get("children", 0),
+    )
+    _require_search_work_unit(**work_kwargs)
+    _require_logical_product(candidate_evals, stream_steps, n_seeds)
 
 
 def evaluate_suite(
@@ -1114,12 +1193,16 @@ def _resolved_suite(
             task_length=task_length if task_length is not None else 5000,
         )
     elif n_tasks is not None or task_length is not None:
-        for bounded_config in MICRO_SUITE.values():
+        for suite_task_config in MICRO_SUITE.values():
             _require_search_work_unit(
                 n_random=0,
-                n_tasks=n_tasks if n_tasks is not None else bounded_config.n_tasks,
+                n_tasks=(
+                    n_tasks if n_tasks is not None else suite_task_config.n_tasks
+                ),
                 task_length=(
-                    task_length if task_length is not None else bounded_config.task_length
+                    task_length
+                    if task_length is not None
+                    else suite_task_config.task_length
                 ),
             )
     suite: dict[str, EvalConfig]
@@ -1129,7 +1212,8 @@ def _resolved_suite(
             for name, stream_config in suite.items():
                 assert isinstance(stream_config, MicroStreamConfig)
                 pool = min(
-                    stream_config.recurrence_pool, max(2, stream_config.n_regimes)
+                    stream_config.recurrence_pool,
+                    max(2, stream_config.n_regimes),
                 )
                 suite[name] = dataclasses.replace(
                     stream_config, regime_length=task_length, recurrence_pool=pool
@@ -1137,11 +1221,13 @@ def _resolved_suite(
         return suite
     suite = dict(MICRO_SUITE)
     if n_tasks is not None or task_length is not None:
-        for task_name, resolved_task_config in suite.items():
+        for name, resolved_task_config in suite.items():
             assert isinstance(resolved_task_config, MicroTaskConfig)
-            suite[task_name] = dataclasses.replace(
+            suite[name] = dataclasses.replace(
                 resolved_task_config,
-                n_tasks=n_tasks if n_tasks is not None else resolved_task_config.n_tasks,
+                n_tasks=(
+                    n_tasks if n_tasks is not None else resolved_task_config.n_tasks
+                ),
                 task_length=(
                     task_length
                     if task_length is not None
@@ -1158,9 +1244,9 @@ def tune_champion_baseline(
     eval_seeds: Sequence[int],
     batch_size: int,
     suite: Mapping[str, EvalConfig],
-    n_random: int = _BASELINE_RANDOM,
-    generations: int = _BASELINE_GENERATIONS,
-    children: int = _BASELINE_CHILDREN,
+    n_random: int = _DEFAULT_BASELINE_N_RANDOM,
+    generations: int = _DEFAULT_BASELINE_GENERATIONS,
+    children: int = _DEFAULT_BASELINE_CHILDREN,
 ) -> tuple[np.ndarray, float, list[tuple[np.ndarray, float]]]:
     """Tune the champion STRUCTURE's continuous constants at micro scale.
 
@@ -1177,16 +1263,16 @@ def tune_champion_baseline(
     generations = _require_search_int("generations", generations, minimum=0)
     children = _require_search_int("children", children, minimum=1)
     batch_size = _require_search_int("batch_size", batch_size, minimum=1)
-    task_names = _require_unique_task_names(task_names, name="task_names")
     eval_seeds = require_unique_jax_seeds(eval_seeds, name="eval_seeds")
-    candidate_evals = 1 + n_random + children * generations
-    _require_search_work_unit(
-        n_random=n_random, generations=generations, children=children
-    )
-    _require_logical_steps(
-        candidate_evals=candidate_evals,
-        stream_steps=_selected_stream_steps(suite, task_names),
-        seed_count=len(eval_seeds),
+    task_names = _require_unique_task_names(task_names, name="task_names")
+    _require_suite_streams(
+        suite,
+        selected=task_names,
+        n_seeds=len(eval_seeds),
+        n_random=n_random,
+        population=1,
+        generations=generations,
+        children=children,
     )
     champion = champion_form_genome()
     flags = jnp.asarray(champion[:_N_FLAGS])
@@ -1230,13 +1316,13 @@ def tune_champion_baseline(
 
 def run_search(
     *,
-    n_random: int = 3072,
-    population: int = 256,
-    generations: int = 12,
-    elite: int = 32,
+    n_random: int = _DEFAULT_N_RANDOM,
+    population: int = _DEFAULT_POPULATION,
+    generations: int = _DEFAULT_GENERATIONS,
+    elite: int = _DEFAULT_ELITE,
     eval_seeds: Sequence[int] = (0, 1),
     holdout_seeds: Sequence[int] = (101, 102, 103),
-    top_k: int = 12,
+    top_k: int = _DEFAULT_TOP_K,
     batch_size: int = 256,
     search_seed: int = 0,
     task_names: Sequence[str] = SEARCH_TASKS,
@@ -1258,12 +1344,10 @@ def run_search(
     elite = _require_search_int("elite", elite, minimum=1)
     top_k = _require_search_int("top_k", top_k, minimum=1)
     batch_size = _require_search_int("batch_size", batch_size, minimum=1)
-    if elite > population:
-        raise ValueError("elite must not exceed population")
-    if population > max(n_random, _N_SEEDED_GENOMES):
-        raise ValueError("population must not exceed the initial candidate pool")
-    if generations > 0 and elite == population:
-        raise ValueError("evolution requires at least one child")
+    if elite > population or (generations > 0 and elite == population):
+        raise ValueError(
+            "elite must be less than population when generations are positive"
+        )
     eval_seeds = require_unique_jax_seeds(eval_seeds, name="eval_seeds")
     holdout_seeds = require_unique_jax_seeds(holdout_seeds, name="holdout_seeds")
     search_seed = require_jax_seed(search_seed, name="search_seed")
@@ -1274,26 +1358,36 @@ def run_search(
     if set(eval_seeds) & set(holdout_seeds):
         raise ValueError("search seeds and holdout seeds must be disjoint")
     registry = dict(MICRO_SUITE if suite is None else suite)
-    n_children_per_generation = population - elite
+    initial_candidates = max(n_random, _SEEDED_GENOME_COUNT)
+    if population > initial_candidates:
+        raise ValueError("population must not exceed the initial candidate pool")
+    n_children = population - elite
+    if generations > 0:
+        _require_search_int("children", n_children, minimum=1)
+    search_steps = _selected_stream_steps(registry, task_names)
+    holdout_steps = _selected_stream_steps(registry, holdout_names)
     _require_search_work_unit(
-        n_random=n_random,
+        n_random=initial_candidates,
         population=population,
         generations=generations,
-        children=n_children_per_generation,
+        children=n_children,
     )
-    initial_evals = max(n_random, _N_SEEDED_GENOMES)
-    baseline_evals = 1 + _BASELINE_RANDOM + _BASELINE_CHILDREN * _BASELINE_GENERATIONS
-    search_stream_steps = _selected_stream_steps(registry, task_names)
-    holdout_stream_steps = _selected_stream_steps(registry, holdout_names)
-    logical_steps = (
-        (initial_evals + n_children_per_generation * generations + baseline_evals)
-        * search_stream_steps
-        * len(eval_seeds)
-        + (top_k + 2) * holdout_stream_steps * len(holdout_seeds)
+    _require_search_protocol_work(
+        search_evals=_search_candidate_evals(
+            n_random=initial_candidates,
+            population=population,
+            generations=generations,
+            children=n_children,
+        ),
+        search_steps=search_steps,
+        n_eval_seeds=len(eval_seeds),
+        baseline_evals=_DEFAULT_BASELINE_EVALS,
+        holdout_evals=2 + top_k,
+        holdout_steps=holdout_steps,
+        n_holdout_seeds=len(holdout_seeds),
     )
-    _require_logical_steps(candidate_evals=1, stream_steps=logical_steps, seed_count=1)
     started = time.monotonic()
-    root = jr.key(np.uint32(search_seed))
+    root = jr.key(np.uint32(search_seed), impl=_SEARCH_RNG_IMPL)
     key_random, key_evolve, key_baseline = jr.split(root, 3)
 
     seeds_block = seed_genomes()
@@ -1373,7 +1467,7 @@ def run_search(
         )
 
     # --- budget-matched champion-form baseline (structure frozen, constants tuned).
-    tuned_baseline, tuned_baseline_search_accuracy, baseline_tuning_evals = (
+    tuned_baseline, tuned_baseline_search_accuracy, baseline_evals = (
         tune_champion_baseline(
             key_baseline,
             task_names=task_names,
@@ -1382,7 +1476,7 @@ def run_search(
             suite=registry,
         )
     )
-    for genome_row, accuracy_value in baseline_tuning_evals:
+    for genome_row, accuracy_value in baseline_evals:
         archive_genomes.append(genome_row)
         archive_accuracy.append(accuracy_value)
         archive_fitness.append(
@@ -1496,6 +1590,7 @@ def run_search(
         "candidates": candidate_rows,
         "promoted": promoted,
         "environment": {
+            "agent_rng_impl": _SEARCH_RNG_IMPL,
             "jax": jax.__version__,
             "numpy": np.__version__,
             "python": platform.python_version(),
