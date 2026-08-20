@@ -192,9 +192,7 @@ def _arm_payload(
 def run_adamo_diagnostic(
     inputs: np.ndarray, labels: np.ndarray, *, profile: str, seed: int,
 ) -> dict[str, object]:
-    """Run only the consumed contract-smoke qualification surface."""
-    if type(profile) is not str or profile != "contract-smoke":
-        raise ValueError("public AdamO diagnostics are restricted to contract-smoke")
+    """Run a public diagnostic with the already-consumed qualification schedule."""
     return _run_adamo_diagnostic_schedule(
         inputs,
         labels,
@@ -680,7 +678,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--catalog", action="store_true")
     parser.add_argument("--dataset", type=Path)
-    parser.add_argument("--profile", choices=("contract-smoke",), default="contract-smoke")
+    parser.add_argument("--profile", choices=tuple(PROFILES), default="contract-smoke")
     parser.add_argument("--seed", type=int)
     args = parser.parse_args(argv)
     if args.catalog:
@@ -689,7 +687,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(json.dumps({
             "schema": SCHEMA, "paper_revision": ADAMO_PAPER_REVISION,
             "official_code": None,
-            "profiles": {"contract-smoke": asdict(PROFILES["contract-smoke"].config)},
+            "profiles": {name: asdict(value.config) for name, value in PROFILES.items()},
             "arms": list(ARMS), "frozen_development_seeds": list(FROZEN_DEVELOPMENT_SEEDS),
             "development_only": True, "negative_outcomes_retained": True,
             "scientific_promotion_allowed": False,
@@ -698,6 +696,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.dataset is None:
         parser.error("--dataset is required unless --catalog is used")
     seed = FROZEN_DEVELOPMENT_SEEDS[0] if args.seed is None else args.seed
+    if seed not in FROZEN_DEVELOPMENT_SEEDS:
+        parser.error("--seed must name one consumed public diagnostic seed")
     inputs, labels = _load_dataset(args.dataset)
     print(json.dumps(run_adamo_diagnostic(inputs, labels, profile=args.profile, seed=seed),
                      sort_keys=True, separators=(",", ":")))

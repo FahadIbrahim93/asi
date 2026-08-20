@@ -43,10 +43,10 @@ Run only on a caller-materialized NPZ containing exactly float32 `inputs` and in
   --profile contract-smoke --seed 15600
 ```
 
-That public function/CLI surface is restricted to the consumed `contract-smoke` roster. It cannot
-select `bounded-development` or any prospectively reserved matched seed. The bounded executor is a
-private capability-gated dependency of the still-disabled matched campaign; publication remains
-separately gated as well.
+That public function/CLI surface is restricted to the consumed `15600`--`15603` roster for both
+registered profiles. It cannot select any prospectively reserved matched seed. The fresh-schedule
+executor is a private capability-gated dependency of the still-disabled matched campaign;
+publication remains separately gated as well.
 
 Receipts bind exact dataset and current-source hashes, runtime identity, data steps, observations,
 updates, logical model queries, reverse-mode Jacobian rows, persistent numeric bytes, peak Gram

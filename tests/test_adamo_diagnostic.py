@@ -116,7 +116,7 @@ def test_contract_and_matched_seed_schedules_are_disjoint(
             profile="contract-smoke",
             seed=FROZEN_MATCHED_DEVELOPMENT_SEEDS[0],
         )
-    with pytest.raises(ValueError, match="contract-smoke"):
+    with pytest.raises(ValueError, match="selected frozen"):
         run_adamo_diagnostic(
             *tiny_data,
             profile="bounded-development",
@@ -135,13 +135,32 @@ def test_public_function_cannot_consume_reserved_matched_seed(
         raise AssertionError("reserved matched execution must not start")
 
     monkeypatch.setattr(diagnostic, "run_screening_config", forbidden_run)
-    with pytest.raises(ValueError, match="contract-smoke"):
+    with pytest.raises(ValueError, match="selected frozen"):
         run_adamo_diagnostic(
             *tiny_data,
             profile="bounded-development",
             seed=FROZEN_MATCHED_DEVELOPMENT_SEEDS[0],
         )
     assert calls == 0
+
+
+def test_public_bounded_profile_retains_consumed_schedule_compatibility(
+    tiny_data: tuple[np.ndarray, np.ndarray], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def capture_schedule(*args: object, **kwargs: object) -> dict[str, object]:
+        captured.update(kwargs)
+        return {"profile": kwargs["profile"], "seed": kwargs["seed"]}
+
+    monkeypatch.setattr(diagnostic, "_run_adamo_diagnostic_schedule", capture_schedule)
+    result = run_adamo_diagnostic(
+        *tiny_data,
+        profile="bounded-development",
+        seed=FROZEN_DEVELOPMENT_SEEDS[0],
+    )
+    assert result == {"profile": "bounded-development", "seed": FROZEN_DEVELOPMENT_SEEDS[0]}
+    assert captured["seed_schedule"] == FROZEN_DEVELOPMENT_SEEDS
 
 
 def test_public_cli_cannot_consume_reserved_matched_seed_before_loading(
@@ -286,6 +305,7 @@ def test_catalog_cli_is_read_only_json(capsys: pytest.CaptureFixture[str]) -> No
     assert main(["--catalog"]) == 0
     catalog = json.loads(capsys.readouterr().out)
     assert catalog["arms"] == list(ARMS)
+    assert set(catalog["profiles"]) == {"contract-smoke", "bounded-development"}
     assert catalog["negative_outcomes_retained"] is True
     assert catalog["scientific_promotion_allowed"] is False
 
