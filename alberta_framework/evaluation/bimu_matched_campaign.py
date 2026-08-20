@@ -466,7 +466,6 @@ def run_bimu_shard(
     *,
     data_home: Path | None = None,
     plan_document: object | None = None,
-    _loaded_arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None,
     _on_first_dispatch: Callable[[], None] | None = None,
 ) -> dict[str, object]:
     """Execute exactly one authorized arm/seed shard in this process."""
@@ -487,12 +486,7 @@ def run_bimu_shard(
     execution_identity = _current_identity()
     if not _json_exact_equal(plan_doc["identity"], execution_identity):
         _fail("campaign identity changed after the plan was validated")
-    if _loaded_arrays is None:
-        arrays = load_frozen_bimu_dataset(data_home)
-    else:
-        if type(_loaded_arrays) is not tuple or tuple.__len__(_loaded_arrays) != 4:
-            raise TypeError("preloaded campaign arrays must be one exact four-item tuple")
-        arrays = _validated_arrays(*_loaded_arrays, plan=FROZEN_BIMU_MATCHED_PLAN)
+    arrays = load_frozen_bimu_dataset(data_home)
     started_wall = time.perf_counter()
     started_cpu = time.process_time()
     if _on_first_dispatch is not None:
@@ -1195,10 +1189,6 @@ def _require_live_parent(destination: Path, parent_descriptor: int) -> None:
 ShardReservation = tuple[Path, int, int, str]
 
 
-class _CompletedShardAdmissionError(ValueError):
-    """A completed payload failed structural or dataset-bound replay admission."""
-
-
 def _reserve_destination(path: Path, *, root: Path) -> ShardReservation:
     """Reserve one exact artifact before plan/data/replay/execution work."""
 
@@ -1307,8 +1297,6 @@ def publish_json(
     *,
     root: Path,
     _reservation: ShardReservation | None = None,
-    _completed_replay_arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
-    | None = None,
 ) -> None:
     """Publish one canonical file without replacement and verify its held inode.
 
@@ -1326,7 +1314,7 @@ def publish_json(
     if path != campaign_path(root, "plan"):
         _require_registered_root(root)
 
-    def validate(candidate: object, *, require_completed_replay: bool) -> None:
+    def validate(candidate: object) -> None:
         if path == campaign_path(root, "plan"):
             validate_plan_document(candidate)
         elif path == campaign_path(root, "aggregate"):
@@ -1334,20 +1322,8 @@ def publish_json(
         else:
             if type(candidate) is dict and candidate.get("schema") == FAILED_SHARD_SCHEMA:
                 validate_failed_bimu_shard(candidate)
-            elif not require_completed_replay:
-                validate_bimu_shard(candidate)
             else:
-                try:
-                    if (
-                        type(_completed_replay_arrays) is not tuple
-                        or tuple.__len__(_completed_replay_arrays) != 4
-                    ):
-                        _fail("completed shard publication requires strict replay arrays")
-                    validate_bimu_shard_by_reexecution(candidate, *_completed_replay_arrays)
-                except Exception as exc:
-                    raise _CompletedShardAdmissionError(
-                        "completed shard failed strict dataset-bound admission"
-                    ) from exc
+                validate_bimu_shard(candidate)
 
     owns_reservation = _reservation is None
     reservation = _reserve_destination(path, root=root) if _reservation is None else _reservation
@@ -1371,7 +1347,7 @@ def publish_json(
     file_descriptor: int | None = None
     published_identity: tuple[int, int] | None = None
     try:
-        validate(value, require_completed_replay=True)
+        validate(value)
         raw = _canonical(value) + b"\n"
         shard_path = campaign_path(
             root,
@@ -1455,7 +1431,7 @@ def publish_json(
             )
         except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
             raise RuntimeError("published campaign artifact is not strict JSON") from exc
-        validate(decoded, require_completed_replay=False)
+        validate(decoded)
         os.fsync(parent_descriptor)
         _require_live_parent(destination, parent_descriptor)
     except BaseException:
@@ -1598,32 +1574,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             first_dispatch = True
 
         try:
-            failed_attempt = False
             try:
                 plan = _load_plan(root)
-                arrays = load_frozen_bimu_dataset(args.data_home)
                 shard = run_bimu_shard(
                     args.arm,
                     args.seed,
+                    data_home=args.data_home,
                     plan_document=plan,
-                    _loaded_arrays=arrays,
                     _on_first_dispatch=mark_first_dispatch,
                 )
+                validate_bimu_shard(shard)
             except Exception:
-                failed_attempt = True
-            else:
-                try:
-                    publish_json(
-                        destination,
-                        shard,
-                        root=root,
-                        _reservation=reservation,
-                        _completed_replay_arrays=arrays,
-                    )
-                    durable_result_published = True
-                except _CompletedShardAdmissionError:
-                    failed_attempt = True
-            if failed_attempt:
                 failed = build_failed_bimu_shard(args.arm, args.seed)
                 publish_json(destination, failed, root=root, _reservation=reservation)
                 durable_result_published = True
@@ -1636,6 +1597,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     }
                 )
                 return 1
+            publish_json(destination, shard, root=root, _reservation=reservation)
+            durable_result_published = True
         except BaseException:
             if first_dispatch and not durable_result_published:
                 reservation_to_cleanup = None
