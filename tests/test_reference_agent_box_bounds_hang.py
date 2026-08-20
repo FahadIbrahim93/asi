@@ -11,6 +11,14 @@ from alberta_framework.reference_agent import _MAX_ARRAY_ELEMENTS, _MAX_ARRAY_RA
 pytestmark = pytest.mark.unit
 
 
+class _HostileSequence:
+    def __len__(self) -> int:
+        raise AssertionError("hostile sequence measured")
+
+    def __iter__(self):
+        raise AssertionError("hostile sequence iterated")
+
+
 def test_box_rejects_oversized_range_bounds_before_tuple_hang() -> None:
     started = time.perf_counter()
     with pytest.raises(ValueError, match="array element limit"):
@@ -63,3 +71,14 @@ def test_box_still_accepts_matched_bounds() -> None:
     assert spec.high == (1.0, 1.0)
     encoded = spec.encode((0.0, 0.5))
     assert encoded.shape == (2,)
+
+
+def test_box_rejects_custom_sequences_without_hooks() -> None:
+    with pytest.raises(ValueError, match="exact bounded sequence"):
+        SpaceSpec.box(
+            shape=(2,),
+            dtype="float32",
+            low=_HostileSequence(),  # type: ignore[arg-type]
+            high=(1.0, 1.0),
+            semantic_id="obs",
+        )

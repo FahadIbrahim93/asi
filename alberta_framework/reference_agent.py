@@ -17,7 +17,7 @@ import math
 import re
 import threading
 from collections.abc import Mapping, Sequence
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 
@@ -180,13 +180,48 @@ def _require_bounded_sequence_length(
     name: str,
     maximum: int,
 ) -> int:
-    try:
-        count = len(value)  # type: ignore[arg-type]
-    except TypeError as exc:
-        raise ValueError(f"{name} must be a sized sequence") from exc
+    if type(value) not in (list, tuple, range, np.ndarray):
+        raise ValueError(f"{name} must be an exact bounded sequence")
+    sequence = cast(list[object] | tuple[object, ...] | range | np.ndarray[Any, Any], value)
+    count = len(sequence)
     if type(count) is not int or count < 0 or count > maximum:
-        raise ValueError(f"{name} exceed the array element limit")
+        raise ValueError(f"{name} exceeds the array element limit")
     return count
+
+
+def _require_builtin_value_shape(
+    value: object,
+    *,
+    expected: tuple[int, ...],
+    name: str,
+) -> None:
+    """Validate a bounded builtin nested sequence before NumPy conversion."""
+    if type(value) is np.ndarray:
+        array = value
+        if array.size > _MAX_ARRAY_ELEMENTS or array.shape != expected:
+            raise ValueError(f"{name} shape must be {expected}, got {array.shape}")
+        return
+    if not expected:
+        if type(value) in (list, tuple, range):
+            raise ValueError(f"{name} shape must be {expected}")
+        return
+    if type(value) is range:
+        count = _require_bounded_sequence_length(
+            value, name=name, maximum=_MAX_ARRAY_ELEMENTS
+        )
+        if len(expected) != 1 or count != expected[0]:
+            raise ValueError(f"{name} shape must be {expected}, got ({count},)")
+        return
+    if type(value) not in (list, tuple):
+        raise ValueError(f"{name} must be an exact bounded sequence or numeric array")
+    count = _require_bounded_sequence_length(
+        value, name=name, maximum=_MAX_ARRAY_ELEMENTS
+    )
+    if count != expected[0]:
+        raise ValueError(f"{name} shape must be {expected}, got ({count},)")
+    children = cast(list[object] | tuple[object, ...], value)
+    for child in children:
+        _require_builtin_value_shape(child, expected=expected[1:], name=name)
 
 
 def _numeric_array(value: Any, *, name: str) -> np.ndarray[Any, Any]:
@@ -479,15 +514,12 @@ class SpaceSpec:
                     raise ValueError(
                         f"space value dtype must be exactly {self.dtype}, got {supplied_name}"
                     )
-            if self.shape != () and not hasattr(value, "dtype"):
-                expected = _shape_size(self.shape)
-                count = _require_bounded_sequence_length(
-                    value, name="space value", maximum=_MAX_ARRAY_ELEMENTS
+            if self.shape != () and supplied_dtype is None:
+                _require_builtin_value_shape(
+                    value,
+                    expected=self.shape,
+                    name="space value",
                 )
-                if count != expected:
-                    raise ValueError(
-                        f"space value shape must be {self.shape}, got ({count},)"
-                    )
             array = _numeric_array(value, name="space value")
             if array.shape != self.shape:
                 raise ValueError(f"space value shape must be {self.shape}, got {array.shape}")

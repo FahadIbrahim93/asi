@@ -37,6 +37,7 @@ import jax.random as jr
 import numpy as np
 from jax import Array
 
+from alberta_framework._scan_resources import ScanBudget, require_scan_steps
 from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core.associative_memory import (
     AssociativeFeatureFamily,
@@ -99,7 +100,8 @@ _INT32_MAX: int = 2**31 - 1
 _MAX_CONFIG_SEQUENCE_LENGTH: int = 4096
 # Public last-fit in tests is run_arrays length 2 and smoke steps=8.
 # Origin scanned INT32-legal array lengths — hang, not leftover INT32 math.
-_PIPELINE_SCAN_MAX: int = 10_000
+_PIPELINE_SCAN_BUDGET = ScanBudget("Step 1-4 pipeline", maximum_steps=10_000)
+_PIPELINE_SCAN_MAX: int = _PIPELINE_SCAN_BUDGET.maximum_steps
 
 _ACTUAL_INT_TYPES: tuple[type, ...] = (
     int,
@@ -1698,11 +1700,14 @@ class AlbertaPipeline:
         """
         state = self._state_contract(state)
         observations = self._observation_operand("observations", observations, batched=True)
-        steps = observations.shape[0]
-        if type(steps) is not int or not 1 <= steps <= _PIPELINE_SCAN_MAX:
+        try:
+            steps = require_scan_steps(
+                "observations length", observations.shape[0], _PIPELINE_SCAN_BUDGET
+            )
+        except ValueError:
             raise ValueError(
                 f"observations must contain between 1 and {_PIPELINE_SCAN_MAX} steps"
-            )
+            ) from None
         rewards = _trusted_array_metadata(
             "rewards", rewards, shape=(steps,), dtype=jnp.float32
         )
@@ -1845,7 +1850,7 @@ def run_pipeline_smoke(
     seed: int = 0,
 ) -> AlbertaPipelineSmokeResult:
     """Run a deterministic Step 1-4 pipeline smoke probe."""
-    steps = _require_int("steps", steps, minimum=1, maximum=_PIPELINE_SCAN_MAX)
+    steps = require_scan_steps("steps", steps, _PIPELINE_SCAN_BUDGET)
     seed = require_jax_seed(seed, name="seed")
     if config is None:
         cfg = AlbertaPipelineConfig()
