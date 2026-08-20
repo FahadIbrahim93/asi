@@ -7,6 +7,7 @@ import importlib
 import importlib.metadata
 import json
 import math
+import os
 import platform
 import stat
 from collections.abc import Sequence
@@ -68,7 +69,9 @@ FUTURE_INVOCATION_REQUIREMENTS = [
     "digest-pinned built image",
     "network disabled",
     "read-only root filesystem",
-    "bounded tmpfs",
+    "read-only dataset mount",
+    "bounded no-execute tmpfs",
+    "approved CPU, memory, PID, wall-clock, and output-byte limits",
     "separately approved exact MNIST archive",
     "NEW create-only output path",
 ]
@@ -252,9 +255,9 @@ def _validate_plan(plan: dict[str, JsonValue]) -> None:
             raise ValueError(f"{relative} differs from the qualification plan")
     runtime = _exact_keys(
         plan["runtime"],
-        ("platform", "python", "python_implementation", "pip", "setuptools", "accelerator",
-         "torch_cuda", "package_versions", "compatibility_deviations",
-         "future_invocation_requirements"),
+        ("platform", "python", "python_implementation", "uid", "gid", "pip", "setuptools",
+         "wheel", "accelerator", "torch_cuda", "package_versions",
+         "compatibility_deviations", "future_invocation_requirements"),
         name="runtime",
     )
     if runtime["package_versions"] != PACKAGE_VERSIONS:
@@ -333,8 +336,11 @@ def _validate_runtime(plan: dict[str, JsonValue]) -> None:
         "platform": "linux-x86_64",
         "python": "3.8.18",
         "python_implementation": "CPython",
+        "uid": 65_532,
+        "gid": 65_532,
         "pip": "23.0.1",
         "setuptools": "57.5.0",
+        "wheel": "0.43.0",
         "accelerator": "cpu",
         "torch_cuda": None,
     }
@@ -345,15 +351,26 @@ def _validate_runtime(plan: dict[str, JsonValue]) -> None:
         or platform.machine() != "x86_64"
         or platform.python_version() != "3.8.18"
         or platform.python_implementation() != "CPython"
+        or os.getuid() != 65_532
+        or os.getgid() != 65_532
     ):
         raise ValueError("host runtime differs from the prospective image")
-    if importlib.metadata.version("pip") != "23.0.1" or importlib.metadata.version(
-        "setuptools"
-    ) != "57.5.0":
-        raise ValueError("base packaging runtime differs")
-    for distribution, expected in PACKAGE_VERSIONS.items():
-        if importlib.metadata.version(distribution) != expected:
-            raise ValueError(f"runtime package differs: {distribution}")
+    expected_distributions = {
+        **PACKAGE_VERSIONS,
+        "pip": "23.0.1",
+        "setuptools": "57.5.0",
+        "wheel": "0.43.0",
+    }
+    distributions = list(importlib.metadata.distributions())
+    installed_distributions = {
+        str(distribution.metadata["Name"]).lower().replace("_", "-"): distribution.version
+        for distribution in distributions
+    }
+    if (
+        len(installed_distributions) != len(distributions)
+        or installed_distributions != expected_distributions
+    ):
+        raise ValueError("complete installed distribution set differs")
     for module_name in ("numpy", "scipy", "torch", "torchvision", "lop.permuted_mnist.online_expr"):
         importlib.import_module(module_name)
     torch = importlib.import_module("torch")

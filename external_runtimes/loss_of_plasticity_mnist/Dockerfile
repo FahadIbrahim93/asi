@@ -16,7 +16,7 @@ COPY Dockerfile Dockerfile.source
 COPY requirements.in requirements.in
 COPY qualification-plan.json qualification-plan.json
 COPY verify_runtime.py verify_runtime.py
-RUN python verify_runtime.py
-
 USER 65532:65532
+RUN --network=none python verify_runtime.py
+
 ENTRYPOINT ["python", "/opt/qualification/verify_runtime.py"]

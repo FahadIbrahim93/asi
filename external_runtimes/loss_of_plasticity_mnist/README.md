@@ -3,7 +3,9 @@
 This directory defines a prospective, Linux/amd64, CPU-only runtime for issue
 #1583's first official-code qualification gate. It fetches the exact official
 source archive, installs a hash-locked Python 3.8/Torch 2.1 dependency set, and
-verifies source, license, configuration, runtime, and plan identities.
+verifies source, license, configuration, complete installed-distribution,
+runtime, and plan identities as a non-root user without build-step network
+access.
 
 It does not download MNIST, execute an experiment, emit a qualification
 receipt, create an `outputs/` artifact, establish paper/code parity, retain a
@@ -18,6 +20,7 @@ postdates the paper and applies cumulative input permutations; labels remain
 the original MNIST digits and must never be described as random labels.
 
 Any future runtime invocation must use a digest-pinned built image with network
-disabled, a read-only root filesystem, a bounded tmpfs, an exact separately
+disabled, a read-only root filesystem and dataset mount, a bounded no-execute
+tmpfs, approved CPU/memory/PID/wall-clock/output limits, an exact separately
 approved MNIST archive, and a NEW output path. Those gates are intentionally
 not implemented or authorized here.

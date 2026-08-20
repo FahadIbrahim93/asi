@@ -71,11 +71,15 @@ def test_runtime_is_hash_locked_cpu_only_and_never_executes_a_workload() -> None
     claims = plan["claims"]
     assert type(runtime) is dict and type(diagnostic) is dict and type(claims) is dict
     assert runtime["python"] == "3.8.18"
+    assert runtime["uid"] == 65_532
+    assert runtime["gid"] == 65_532
+    assert runtime["wheel"] == "0.43.0"
     assert runtime["package_versions"]["torch"] == "2.1.0+cpu"
     assert runtime["package_versions"]["scipy"] == "1.10.1"
     assert "SciPy 1.11.2" in runtime["compatibility_deviations"][0]
     assert "@sha256:e796941013b" in dockerfile
     assert "--require-hashes" in dockerfile
+    assert "USER 65532:65532\nRUN --network=none python verify_runtime.py" in dockerfile
     assert "torch-2.1.0%2Bcpu-cp38-cp38-linux_x86_64.whl" in lock
     assert "load_mnist.py" not in dockerfile
     assert "online_expr.py" not in dockerfile
@@ -93,6 +97,16 @@ def test_runtime_is_hash_locked_cpu_only_and_never_executes_a_workload() -> None
         "external_execution_authorized": False,
     }
     assert len(plan["blockers"]) == 9  # type: ignore[arg-type]
+    assert runtime["future_invocation_requirements"] == [
+        "digest-pinned built image",
+        "network disabled",
+        "read-only root filesystem",
+        "read-only dataset mount",
+        "bounded no-execute tmpfs",
+        "approved CPU, memory, PID, wall-clock, and output-byte limits",
+        "separately approved exact MNIST archive",
+        "NEW create-only output path",
+    ]
 
 
 def test_verifier_accepts_exact_plan_and_rejects_claim_or_source_drift(
