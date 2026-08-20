@@ -19,6 +19,7 @@ import secrets
 import stat
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path, PosixPath
 from typing import Any, Final, NoReturn, cast
 
@@ -464,6 +465,7 @@ def run_bimu_shard(
     *,
     data_home: Path | None = None,
     plan_document: object | None = None,
+    _loaded_arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> dict[str, object]:
     """Execute exactly one authorized arm/seed shard in this process."""
 
@@ -483,7 +485,12 @@ def run_bimu_shard(
     execution_identity = _current_identity()
     if not _json_exact_equal(plan_doc["identity"], execution_identity):
         _fail("campaign identity changed after the plan was validated")
-    arrays = load_frozen_bimu_dataset(data_home)
+    if _loaded_arrays is None:
+        arrays = load_frozen_bimu_dataset(data_home)
+    else:
+        if type(_loaded_arrays) is not tuple or tuple.__len__(_loaded_arrays) != 4:
+            raise TypeError("preloaded campaign arrays must be one exact four-item tuple")
+        arrays = _validated_arrays(*_loaded_arrays, plan=FROZEN_BIMU_MATCHED_PLAN)
     started_wall = time.perf_counter()
     started_cpu = time.process_time()
     result = run_bimu_development(*arrays, config=config, seed=seed)
@@ -1184,6 +1191,30 @@ def _require_live_parent(destination: Path, parent_descriptor: int) -> None:
 ShardReservation = tuple[Path, int, int, str]
 
 
+@dataclass(frozen=True, slots=True)
+class _CompletedShardReplayProof:
+    """Private proof that one exact completed payload passed dataset-bound replay."""
+
+    payload_sha256: str
+    shard_sha256: str
+    dataset_sha256: str
+
+
+def _prove_completed_shard_by_reexecution(
+    value: object,
+    arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+) -> _CompletedShardReplayProof:
+    if type(arrays) is not tuple or tuple.__len__(arrays) != 4:
+        raise TypeError("replay arrays must be one exact four-item tuple")
+    validated_arrays = _validated_arrays(*arrays, plan=FROZEN_BIMU_MATCHED_PLAN)
+    shard = validate_bimu_shard_by_reexecution(value, *validated_arrays)
+    return _CompletedShardReplayProof(
+        payload_sha256=hashlib.sha256(_canonical(shard)).hexdigest(),
+        shard_sha256=cast(str, shard["shard_sha256"]),
+        dataset_sha256=FROZEN_BIMU_MATCHED_PLAN.dataset_sha256,
+    )
+
+
 def _reserve_destination(path: Path, *, root: Path) -> ShardReservation:
     """Reserve one exact artifact before plan/data/replay/execution work."""
 
@@ -1257,6 +1288,7 @@ def publish_json(
     *,
     root: Path,
     _reservation: ShardReservation | None = None,
+    _completed_replay_proof: _CompletedShardReplayProof | None = None,
 ) -> None:
     """Publish one canonical file without replacement and verify its held inode.
 
@@ -1283,7 +1315,16 @@ def publish_json(
             if type(candidate) is dict and candidate.get("schema") == FAILED_SHARD_SCHEMA:
                 validate_failed_bimu_shard(candidate)
             else:
-                validate_bimu_shard(candidate)
+                completed = validate_bimu_shard(candidate)
+                if type(_completed_replay_proof) is not _CompletedShardReplayProof:
+                    _fail("completed shard publication requires a strict reexecution proof")
+                expected_proof = _CompletedShardReplayProof(
+                    payload_sha256=hashlib.sha256(_canonical(completed)).hexdigest(),
+                    shard_sha256=cast(str, completed["shard_sha256"]),
+                    dataset_sha256=FROZEN_BIMU_MATCHED_PLAN.dataset_sha256,
+                )
+                if _completed_replay_proof != expected_proof:
+                    _fail("completed shard reexecution proof does not match the payload")
 
     owns_reservation = _reservation is None
     reservation = _reserve_destination(path, root=root) if _reservation is None else _reservation
@@ -1528,13 +1569,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         try:
             try:
                 plan = _load_plan(root)
+                arrays = load_frozen_bimu_dataset(args.data_home)
                 shard = run_bimu_shard(
                     args.arm,
                     args.seed,
-                    data_home=args.data_home,
                     plan_document=plan,
+                    _loaded_arrays=arrays,
                 )
-                validate_bimu_shard(shard)
+                replay_proof = _prove_completed_shard_by_reexecution(shard, arrays)
             except Exception:
                 failed = build_failed_bimu_shard(args.arm, args.seed)
                 publish_json(destination, failed, root=root, _reservation=reservation)
@@ -1547,7 +1589,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     }
                 )
                 return 1
-            publish_json(destination, shard, root=root, _reservation=reservation)
+            publish_json(
+                destination,
+                shard,
+                root=root,
+                _reservation=reservation,
+                _completed_replay_proof=replay_proof,
+            )
         finally:
             _release_shard_reservation(reservation)
         _print_json({"status": "complete", "shard": str(destination)})
