@@ -237,8 +237,8 @@ def _bounded_pair_sequence_length(
 ) -> int:
     """Return a pair-sequence length after rejecting oversized host collections."""
 
-    allowed: tuple[type, ...] = (tuple, list) if allow_list else (tuple,)
-    if type(value) not in allowed:
+    value_type = type(value)
+    if value_type is not tuple and (not allow_list or value_type is not list):
         kind = "tuple or list" if allow_list else "tuple"
         raise TypeError(f"{name} must be an exact {kind}")
     count = len(cast(tuple[object, ...] | list[object], value))
@@ -248,12 +248,13 @@ def _bounded_pair_sequence_length(
 
 
 def _integer_pairs(
-    value: object, *, name: str
+    value: object, *, name: str, allow_list: bool = False
 ) -> tuple[tuple[int, int], ...]:
-    _bounded_pair_sequence_length(value, name=name)
+    _bounded_pair_sequence_length(value, name=name, allow_list=allow_list)
     pairs: list[tuple[int, int]] = []
-    for index, pair in enumerate(cast(tuple[object, ...], value)):
-        if type(pair) is not tuple or len(pair) != 2:
+    sequence = cast(tuple[object, ...] | list[object], value)
+    for index, pair in enumerate(sequence):
+        if type(pair) is not tuple or tuple.__len__(pair) != 2:
             raise ValueError(f"{name}[{index}] must be an exact integer pair")
         left, right = pair
         if type(left) is not int or type(right) is not int:
@@ -523,10 +524,10 @@ def count_relevant_context_pairs(
 ) -> int:
     """Count unique canonical context products over relevant input channels."""
 
-    _bounded_pair_sequence_length(pairs, name="pairs", allow_list=True)
+    normalized_pairs = _integer_pairs(pairs, name="pairs", allow_list=True)
     relevant_pairs = {
         (min(left, right), max(left, right))
-        for left, right in pairs
+        for left, right in normalized_pairs
         if ((left >= input_dim) ^ (right >= input_dim)) and min(left, right) < relevant_dim
     }
     return len(relevant_pairs)
@@ -540,8 +541,8 @@ def count_relevant_context_pairs_by_task(
 ) -> tuple[int, int]:
     """Count unique relevant products for the supplied C and D cues separately."""
 
-    _bounded_pair_sequence_length(pairs, name="pairs", allow_list=True)
-    canonical_pairs = {(min(left, right), max(left, right)) for left, right in pairs}
+    normalized_pairs = _integer_pairs(pairs, name="pairs", allow_list=True)
+    canonical_pairs = {(min(left, right), max(left, right)) for left, right in normalized_pairs}
     counts = tuple(
         sum(
             1
