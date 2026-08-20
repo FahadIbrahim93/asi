@@ -113,7 +113,7 @@ def _owner_comment(
         "created_at": timestamp,
         "updated_at": timestamp,
         "html_url": (
-            f"https://github.com/elizaOS/asi/issues/{issue}"
+            f"https://github.com/SlopDotCash/asi/issues/{issue}"
             f"#issuecomment-{comment_id}"
         ),
     }
@@ -467,7 +467,7 @@ def test_launch_atomically_claims_namespace_and_writes_bound_receipts(tmp_path: 
     namespace = _claim_local_launch(
         protocol_key="issue184",
         root=tmp_path,
-        repository="elizaOS/asi",
+        repository="SlopDotCash/asi",
         ref_name="ipmnist-prereg-example",
         cpuset="0-2",
         data_home=data_home,
@@ -491,7 +491,7 @@ def test_launch_atomically_claims_namespace_and_writes_bound_receipts(tmp_path: 
         _claim_local_launch(
             protocol_key="issue184",
             root=tmp_path,
-            repository="elizaOS/asi",
+            repository="SlopDotCash/asi",
             ref_name="ipmnist-prereg-example",
             cpuset="0-2",
             data_home=data_home,
@@ -518,7 +518,7 @@ def test_launch_rejects_existing_cache_or_noncanonical_remote_tag(tmp_path: Path
     kwargs = {
         "protocol_key": "issue184",
         "root": tmp_path,
-        "repository": "elizaOS/asi",
+        "repository": "SlopDotCash/asi",
         "ref_name": "ipmnist-prereg-example",
         "cpuset": "0-2",
         "data_home": data_home,
@@ -639,7 +639,7 @@ def _write_protocol_receipts(root: Path, protocol_key: str) -> Path:
     authorization = {
         "amendment_comment_id": 123,
         "amendment_comment_url": (
-            f"https://github.com/elizaOS/asi/issues/{protocol.issue}#issuecomment-123"
+            f"https://github.com/SlopDotCash/asi/issues/{protocol.issue}#issuecomment-123"
         ),
         "amendment_created_at": "2026-08-16T09:00:00Z",
         "amendment_updated_at": "2026-08-16T09:00:00Z",
@@ -647,7 +647,7 @@ def _write_protocol_receipts(root: Path, protocol_key: str) -> Path:
         "amendment_sha256": _canonical_sha256(amendment),
         "authorization_comment_id": 456,
         "authorization_comment_url": (
-            f"https://github.com/elizaOS/asi/issues/{protocol.issue}#issuecomment-456"
+            f"https://github.com/SlopDotCash/asi/issues/{protocol.issue}#issuecomment-456"
         ),
         "authorization_created_at": "2026-08-16T09:01:00Z",
         "authorization_updated_at": "2026-08-16T09:01:00Z",
@@ -1749,7 +1749,7 @@ def test_result_validation_rejects_external_hard_link_alias(tmp_path: Path) -> N
             "amendment",
             [
                 "--repository",
-                "elizaOS/asi",
+                "SlopDotCash/asi",
                 "--ref-name",
                 "ipmnist-prereg-example",
                 "--cpuset",
@@ -1762,7 +1762,7 @@ def test_result_validation_rejects_external_hard_link_alias(tmp_path: Path) -> N
             "authorization",
             [
                 "--repository",
-                "elizaOS/asi",
+                "SlopDotCash/asi",
                 "--ref-name",
                 "ipmnist-prereg-example",
                 "--cpuset",
@@ -1775,7 +1775,7 @@ def test_result_validation_rejects_external_hard_link_alias(tmp_path: Path) -> N
             "launch",
             [
                 "--repository",
-                "elizaOS/asi",
+                "SlopDotCash/asi",
                 "--ref-name",
                 "ipmnist-prereg-example",
                 "--cpuset",

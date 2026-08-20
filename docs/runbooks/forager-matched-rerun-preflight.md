@@ -1,7 +1,7 @@
 # Matched Forager rerun preflight
 
 `asi-forager-rerun-preflight` is a read-only, non-executing readiness check for
-[issue #1584](https://github.com/elizaOS/asi/issues/1584).
+[issue #1584](https://github.com/SlopDotCash/asi/issues/1584).
 It does not pull, build, load, or run an OCI image; prepare an output directory; read reward arrays;
 or authorize a campaign. A blocked report exits 2 and is not an execution receipt.
 

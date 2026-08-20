@@ -1,6 +1,6 @@
 # ASI — agent guide
 
-ASI is elizaOS's JAX continual-learning research and hillclimbing project. Its
+ASI is SlopDotCash's JAX continual-learning research and hillclimbing project. Its
 north star is one end-to-end agent that keeps learning through an operational
 life, retains and reuses useful knowledge, adapts without whole-agent or
 task-by-task reinitialization, operates within explicit compute, memory, and

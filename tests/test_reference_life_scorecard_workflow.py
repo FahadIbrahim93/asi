@@ -36,7 +36,7 @@ def test_reference_life_scorecard_fails_closed_on_source_and_runtime() -> None:
     text = WORKFLOW.read_text(encoding="utf-8")
 
     assert "launch_sha:" in text
-    assert text.count("if: github.repository == 'elizaOS/asi'") == 2
+    assert text.count("if: github.repository == 'SlopDotCash/asi'") == 2
     assert text.count('test "$GITHUB_REF" = "refs/heads/main"') == 2
     assert text.count('test "$GITHUB_SHA" = "$LAUNCH_SHA"') == 2
     assert text.count('test "$WORKFLOW_SHA" = "$LAUNCH_SHA"') == 2

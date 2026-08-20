@@ -20,7 +20,7 @@ from typing import Any, Final, cast
 
 WORKFLOW_PATH: Final = ".github/workflows/ipmnist-prereg.yml"
 DRIVER_PATH: Final = ".github/scripts/ipmnist_prereg.py"
-AUTHORIZED_REPOSITORY: Final = "elizaOS/asi"
+AUTHORIZED_REPOSITORY: Final = "SlopDotCash/asi"
 AUTHORIZED_LOGIN: Final = "lalalune"
 AUTHORIZED_USER_ID: Final = 18_633_264
 AUTHORIZED_ASSOCIATION: Final = "MEMBER"

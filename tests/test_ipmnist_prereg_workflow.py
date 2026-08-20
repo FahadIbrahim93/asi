@@ -40,7 +40,7 @@ _SEAL_GLOBALS = cast(dict[str, Any], _seal_completion_bundle.__globals__)
 def test_artifact_redirect_does_not_forward_github_api_authorization() -> None:
     handler = cast(Any, _DRIVER["_AuthorizationStrippingRedirectHandler"])()
     request = urllib.request.Request(
-        "https://api.github.com/repos/elizaOS/asi/actions/artifacts/1/zip",
+        "https://api.github.com/repos/SlopDotCash/asi/actions/artifacts/1/zip",
         headers={"Authorization": "Bearer secret"},
     )
     redirected = handler.redirect_request(
@@ -370,7 +370,7 @@ def _launch_api_payloads(comment: dict[str, Any]) -> tuple[dict[str, Any], list[
         "run_attempt": 1,
         "path": ".github/workflows/ipmnist-prereg.yml",
         "created_at": "2026-08-16T10:00:00Z",
-        "html_url": "https://github.com/elizaOS/asi/actions/runs/123",
+        "html_url": "https://github.com/SlopDotCash/asi/actions/runs/123",
     }
     return current, [comment]
 
@@ -393,7 +393,7 @@ def _verify_with_comment(
     monkeypatch.setitem(_DRIVER_GLOBALS, "_github_pages", lambda *_args, **_kwargs: comments)
     arguments: dict[str, Any] = {
         "protocol_key": "issue51",
-        "repository": "elizaOS/asi",
+        "repository": "SlopDotCash/asi",
         "source": "1" * 40,
         "tree": "2" * 40,
         "uv_lock_sha256": "3" * 64,
@@ -428,7 +428,7 @@ def _authorization_comment(**overrides: Any) -> dict[str, Any]:
         "author_association": "MEMBER",
         "created_at": "2026-08-16T09:00:00Z",
         "updated_at": "2026-08-16T09:00:00Z",
-        "html_url": "https://github.com/elizaOS/asi/issues/51#issuecomment-456",
+        "html_url": "https://github.com/SlopDotCash/asi/issues/51#issuecomment-456",
     }
     comment.update(overrides)
     return comment
@@ -454,7 +454,7 @@ def test_launch_authorization_ignores_consumed_dispatches_for_prior_sources(
         "run_attempt": 1,
         "path": ".github/workflows/ipmnist-prereg.yml",
         "created_at": "2026-08-15T10:00:00Z",
-        "html_url": "https://github.com/elizaOS/asi/actions/runs/122",
+        "html_url": "https://github.com/SlopDotCash/asi/actions/runs/122",
         "status": "completed",
         "conclusion": "cancelled",
     }
@@ -535,7 +535,7 @@ def test_launch_authorization_requires_strictly_pre_dispatch_timestamp(
         {"id": -1},
         {"id": 456.0},
         {"html_url": None},
-        {"html_url": "https://github.com/elizaOS/asi/issues/51#issuecomment-999"},
+        {"html_url": "https://github.com/SlopDotCash/asi/issues/51#issuecomment-999"},
         {"html_url": "https://attacker.invalid/issues/51#issuecomment-456"},
     ],
 )
@@ -604,7 +604,7 @@ def _issue188_authorization_comment(**overrides: Any) -> dict[str, Any]:
         "author_association": "MEMBER",
         "created_at": "2026-08-16T09:30:00Z",
         "updated_at": "2026-08-16T09:30:00Z",
-        "html_url": "https://github.com/elizaOS/asi/issues/188#issuecomment-456",
+        "html_url": "https://github.com/SlopDotCash/asi/issues/188#issuecomment-456",
     }
     comment.update(overrides)
     return comment
@@ -627,7 +627,7 @@ def _issue188_amendment_comment(**overrides: Any) -> dict[str, Any]:
         "author_association": "MEMBER",
         "created_at": "2026-08-16T09:00:00Z",
         "updated_at": "2026-08-16T09:00:00Z",
-        "html_url": "https://github.com/elizaOS/asi/issues/188#issuecomment-455",
+        "html_url": "https://github.com/SlopDotCash/asi/issues/188#issuecomment-455",
     }
     comment.update(overrides)
     return comment
@@ -645,7 +645,7 @@ def _verify_issue188(
         "run_attempt": 1,
         "path": ".github/workflows/ipmnist-prereg.yml",
         "created_at": "2026-08-16T10:00:00Z",
-        "html_url": "https://github.com/elizaOS/asi/actions/runs/123",
+        "html_url": "https://github.com/SlopDotCash/asi/actions/runs/123",
     }
     monkeypatch.setitem(_DRIVER_GLOBALS, "_github_json", lambda *_args, **_kwargs: current)
     monkeypatch.setitem(_DRIVER_GLOBALS, "_workflow_runs", lambda *_args, **_kwargs: [current])
@@ -654,7 +654,7 @@ def _verify_issue188(
         dict[str, Any],
         _verify_launch_authorization(
             protocol_key="issue188",
-            repository="elizaOS/asi",
+            repository="SlopDotCash/asi",
             source="1" * 40,
             tree="2" * 40,
             uv_lock_sha256="3" * 64,
@@ -688,7 +688,7 @@ def test_issue188_requires_one_exact_amendment_before_final_authorization(
         {"id": -1},
         {"id": 455.0},
         {"html_url": None},
-        {"html_url": "https://github.com/elizaOS/asi/issues/188#issuecomment-999"},
+        {"html_url": "https://github.com/SlopDotCash/asi/issues/188#issuecomment-999"},
         {"html_url": "https://attacker.invalid/issues/188#issuecomment-455"},
     ],
 )
@@ -792,7 +792,7 @@ def test_issue184_requires_prerequisite_closure_before_amendment(
             "author_association": "MEMBER",
             "created_at": "2026-08-16T09:00:00Z",
             "updated_at": "2026-08-16T09:00:00Z",
-            "html_url": "https://github.com/elizaOS/asi/issues/184#issuecomment-455",
+            "html_url": "https://github.com/SlopDotCash/asi/issues/184#issuecomment-455",
         },
         {
             "id": 456,
@@ -801,7 +801,7 @@ def test_issue184_requires_prerequisite_closure_before_amendment(
             "author_association": "MEMBER",
             "created_at": "2026-08-16T09:30:00Z",
             "updated_at": "2026-08-16T09:30:00Z",
-            "html_url": "https://github.com/elizaOS/asi/issues/184#issuecomment-456",
+            "html_url": "https://github.com/SlopDotCash/asi/issues/184#issuecomment-456",
         },
     ]
     current = {
@@ -812,7 +812,7 @@ def test_issue184_requires_prerequisite_closure_before_amendment(
         "run_attempt": 1,
         "path": ".github/workflows/ipmnist-prereg.yml",
         "created_at": "2026-08-16T10:00:00Z",
-        "html_url": "https://github.com/elizaOS/asi/actions/runs/123",
+        "html_url": "https://github.com/SlopDotCash/asi/actions/runs/123",
     }
     monkeypatch.setitem(_DRIVER_GLOBALS, "_github_json", lambda *_args, **_kwargs: current)
     monkeypatch.setitem(_DRIVER_GLOBALS, "_workflow_runs", lambda *_args, **_kwargs: [current])
@@ -828,7 +828,7 @@ def test_issue184_requires_prerequisite_closure_before_amendment(
     )
     payload = _verify_launch_authorization(
         protocol_key="issue184",
-        repository="elizaOS/asi",
+        repository="SlopDotCash/asi",
         run_id=123,
         run_attempt=1,
         token="token",
@@ -841,7 +841,7 @@ def test_issue184_requires_prerequisite_closure_before_amendment(
     with pytest.raises(RuntimeError, match="closed before"):
         _verify_launch_authorization(
             protocol_key="issue184",
-            repository="elizaOS/asi",
+            repository="SlopDotCash/asi",
             run_id=123,
             run_attempt=1,
             token="token",
@@ -878,7 +878,7 @@ def test_workflow_run_search_binds_source_and_paginates_exact_total(
         return responses.pop(0)
 
     monkeypatch.setitem(_WORKFLOW_RUN_GLOBALS, "_github_json", fake_github_json)
-    runs = _workflow_runs("elizaOS/asi", source="1" * 40, token="token")
+    runs = _workflow_runs("SlopDotCash/asi", source="1" * 40, token="token")
 
     assert [run["id"] for run in runs] == list(range(1, 102))
     assert len(calls) == 2
@@ -895,7 +895,7 @@ def test_workflow_run_search_rejects_unsearchable_or_changing_total(
         lambda *_args, **_kwargs: {"total_count": 1001, "workflow_runs": []},
     )
     with pytest.raises(RuntimeError, match="1,000"):
-        _workflow_runs("elizaOS/asi", source="1" * 40, token="token")
+        _workflow_runs("SlopDotCash/asi", source="1" * 40, token="token")
 
     responses = [
         {
@@ -910,7 +910,7 @@ def test_workflow_run_search_rejects_unsearchable_or_changing_total(
         lambda *_args, **_kwargs: responses.pop(0),
     )
     with pytest.raises(RuntimeError, match="changed during pagination"):
-        _workflow_runs("elizaOS/asi", source="1" * 40, token="token")
+        _workflow_runs("SlopDotCash/asi", source="1" * 40, token="token")
 
 
 def test_workflow_run_search_never_skips_a_malformed_page(
@@ -933,7 +933,7 @@ def test_workflow_run_search_never_skips_a_malformed_page(
 
     monkeypatch.setitem(_WORKFLOW_RUN_GLOBALS, "_github_json", fake_github_json)
     with pytest.raises(RuntimeError, match="malformed result page"):
-        _workflow_runs("elizaOS/asi", source="1" * 40, token="token")
+        _workflow_runs("SlopDotCash/asi", source="1" * 40, token="token")
 
     assert len(calls) == 2
     assert calls[-1].endswith("page=2")
@@ -955,7 +955,7 @@ def test_workflow_run_search_rejects_duplicate_ids_across_pages(
         lambda *_args, **_kwargs: responses.pop(0),
     )
     with pytest.raises(RuntimeError, match="repeated a workflow run ID"):
-        _workflow_runs("elizaOS/asi", source="1" * 40, token="token")
+        _workflow_runs("SlopDotCash/asi", source="1" * 40, token="token")
 
 
 def test_workflow_installs_exact_uv_managed_python() -> None:
@@ -1051,7 +1051,7 @@ def test_completion_seal_copies_runner_and_binds_fresh_reconstruction(
         "tree": "2" * 40,
         "uv_lock_sha256": "3" * 64,
         "run_id": 123,
-        "run_url": "https://github.com/elizaOS/asi/actions/runs/123",
+        "run_url": "https://github.com/SlopDotCash/asi/actions/runs/123",
     }
     result = {
         "schema": "asi.ipmnist_prereg.result_validation.v1",
@@ -1128,7 +1128,7 @@ def test_issue184_prerequisite_requires_eligible_committed_result_live_success_a
             "tree": "2" * 40,
             "uv_lock_sha256": "3" * 64,
             "run_id": 123,
-            "run_url": "https://github.com/elizaOS/asi/actions/runs/123",
+            "run_url": "https://github.com/SlopDotCash/asi/actions/runs/123",
         },
         "result_validation": result,
         "runner_receipt": "outputs/ipmnist_screening/replication_r1/runner.v2.json",
@@ -1170,7 +1170,7 @@ def test_issue184_prerequisite_requires_eligible_committed_result_live_success_a
                 "run_attempt": 1,
                 "status": "completed",
                 "conclusion": "success",
-                "html_url": "https://github.com/elizaOS/asi/actions/runs/123",
+                "html_url": "https://github.com/SlopDotCash/asi/actions/runs/123",
                 "created_at": "2026-05-18T08:59:00Z",
                 "updated_at": "2026-08-16T08:59:00Z",
             }
@@ -1201,7 +1201,7 @@ def test_issue184_prerequisite_requires_eligible_committed_result_live_success_a
     )
     receipt = _verify_prerequisite_completion(
         _PROTOCOLS["issue184"],
-        repository="elizaOS/asi",
+        repository="SlopDotCash/asi",
         launch_source="5" * 40,
         root=tmp_path,
         token="token",
@@ -1218,7 +1218,7 @@ def test_issue184_prerequisite_requires_eligible_committed_result_live_success_a
     with pytest.raises(RuntimeError, match="registered 90-day"):
         _verify_prerequisite_completion(
             _PROTOCOLS["issue184"],
-            repository="elizaOS/asi",
+            repository="SlopDotCash/asi",
             launch_source="5" * 40,
             root=tmp_path,
             token="token",
@@ -1229,7 +1229,7 @@ def test_issue184_prerequisite_requires_eligible_committed_result_live_success_a
     with pytest.raises(RuntimeError, match="created before the workflow run"):
         _verify_prerequisite_completion(
             _PROTOCOLS["issue184"],
-            repository="elizaOS/asi",
+            repository="SlopDotCash/asi",
             launch_source="5" * 40,
             root=tmp_path,
             token="token",
@@ -1240,7 +1240,7 @@ def test_issue184_prerequisite_requires_eligible_committed_result_live_success_a
     with pytest.raises(RuntimeError, match="artifact digest mismatch"):
         _verify_prerequisite_completion(
             _PROTOCOLS["issue184"],
-            repository="elizaOS/asi",
+            repository="SlopDotCash/asi",
             launch_source="5" * 40,
             root=tmp_path,
             token="token",
@@ -1268,7 +1268,7 @@ def test_issue184_prerequisite_requires_eligible_committed_result_live_success_a
     with pytest.raises(RuntimeError, match="differ"):
         _verify_prerequisite_completion(
             _PROTOCOLS["issue184"],
-            repository="elizaOS/asi",
+            repository="SlopDotCash/asi",
             launch_source="5" * 40,
             root=tmp_path,
             token="token",
@@ -1301,7 +1301,7 @@ def test_issue184_prerequisite_rejects_ineligible_incumbent_outcome(
             "tree": "2" * 40,
             "uv_lock_sha256": "3" * 64,
             "run_id": 123,
-            "run_url": "https://github.com/elizaOS/asi/actions/runs/123",
+            "run_url": "https://github.com/SlopDotCash/asi/actions/runs/123",
         },
         "result_validation": result,
         "runner_receipt": "outputs/ipmnist_screening/replication_r1/runner.v2.json",
@@ -1317,7 +1317,7 @@ def test_issue184_prerequisite_rejects_ineligible_incumbent_outcome(
     with pytest.raises(RuntimeError, match="all-positive live incumbent"):
         _verify_prerequisite_completion(
             _PROTOCOLS["issue184"],
-            repository="elizaOS/asi",
+            repository="SlopDotCash/asi",
             launch_source="5" * 40,
             root=tmp_path,
             token="token",

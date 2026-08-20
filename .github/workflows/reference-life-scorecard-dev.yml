@@ -18,7 +18,7 @@ concurrency:
 jobs:
   shards:
     name: ${{ matrix.environment }} / ${{ matrix.arm }} / ${{ matrix.seed }}
-    if: github.repository == 'elizaOS/asi'
+    if: github.repository == 'SlopDotCash/asi'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
@@ -94,7 +94,7 @@ jobs:
 
   aggregate:
     name: aggregate and validate
-    if: github.repository == 'elizaOS/asi'
+    if: github.repository == 'SlopDotCash/asi'
     needs: shards
     runs-on: ubuntu-latest
     timeout-minutes: 30

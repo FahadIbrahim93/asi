@@ -1,17 +1,17 @@
 {
   "kind": "slop-project-authority",
-  "policyRevision": "2026-08-18.1",
+  "policyRevision": "2026-08-20.1",
   "projectId": "asi",
-  "proposal": "https://github.com/elizaOS/slopdotcash/issues/115",
+  "proposal": "https://github.com/SlopDotCash/slopdotcash/issues/115",
   "repository": {
-    "fullName": "elizaOS/asi",
+    "fullName": "SlopDotCash/asi",
     "id": "1332593244",
     "integrationBranch": "main"
   },
   "schemaVersion": "1",
   "steward": {
-    "actorId": "186240462",
-    "login": "elizaOS",
-    "nodeId": "O_kgDOCxnNzg"
+    "actorId": "318901292",
+    "login": "SlopDotCash",
+    "nodeId": "O_kgDOEwIMLA"
   }
 }

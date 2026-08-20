@@ -42,7 +42,7 @@ required before any state-of-the-art claim.
 
 ## Identity and compatibility
 
-This repository is [`elizaOS/asi`](https://github.com/elizaOS/asi). It began from
+This repository is [`SlopDotCash/asi`](https://github.com/SlopDotCash/asi). It began from
 [`lalalune/alberta`](https://github.com/lalalune/alberta) at fork point `2ac3533` and is now a
 substantially divergent development line. [VENDORING.md](VENDORING.md) records that history.
 
@@ -173,7 +173,7 @@ fork's version, Python floor, or dependency extras.
 Install ASI from a checkout instead:
 
 ```bash
-git clone https://github.com/elizaOS/asi.git
+git clone https://github.com/SlopDotCash/asi.git
 cd asi
 python3.12 -m venv .venv
 .venv/bin/python -m pip install -e .
