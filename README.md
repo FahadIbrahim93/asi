@@ -244,7 +244,7 @@ The console scripts are grouped by responsibility; every command supports `--hel
 | `asi-native-supervised-catalog`, `asi-native-supervised-canonical`, `asi-plasticity-diagnostic`, `asi-nap-ipmnist` | Inspect or run bounded, permanently nonpromoting supervised and plasticity diagnostics; the canonical command verifies caller-held official MNIST/CIFAR-100 bytes and never downloads them |
 | `asi-pretrained-feature-qualification` | Inspect fail-closed official RanDumb/RanPAC/PROL checkpoint, provenance, and cost blockers; never downloads or runs them |
 | `asi-adamo-diagnostic` | Catalog or run the bounded, permanently nonpromoting AdamO dynamical-isometry comparator |
-| `asi-adamo-matched-development` | Run the complete five-seed AdamO development campaign to a new result path |
+| `asi-adamo-matched-development` | Run and immutably retain the frozen AdamO IPMNIST development campaign |
 | `asi-adalin-matched-development` | Run the create-only, five-seed AdaLin development campaign from an explicit NPZ dataset |
 | `asi-activation-feature-ipmnist` | Run one bounded, permanently nonpromoting activation/feature IPMNIST arm |
 | `asi-clear-qualification` | Verify local CLEAR archive identities and emit a permanently nonpromoting matched setup plan |

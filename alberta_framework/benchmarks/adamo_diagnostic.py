@@ -28,19 +28,21 @@ from jax import Array
 from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.benchmarks.ipmnist_screening import (
     ScreeningRunResult,
+    _array_bundle_sha256,
     run_screening_config,
     screening_spec,
 )
 from alberta_framework.benchmarks.upgd_ipmnist import IPMNISTConfig, mlp_logits
 from alberta_framework.core.adamo import ADAMO_PAPER_REVISION, gram_working_bytes
 
-SCHEMA = "asi.adamo_dynamical_isometry_diagnostic.v1"
+SCHEMA = "asi.adamo_dynamical_isometry_diagnostic.v2"
 COMPARISON_ID = "adamo-arxiv-2606.09762v1-ipmnist-adapter-v1"
 PAPER_URL = "https://arxiv.org/abs/2606.09762v1"
 OFFICIAL_CODE = None
 OFFICIAL_CODE_SEARCH_DATE = "2026-08-17"
 ARMS = ("adamw_control", "adamo_inert", "adamo_l1e3", "adam_iso_joint_l1e3")
-FROZEN_DEVELOPMENT_SEEDS = (15600, 15601, 15602, 15603, 15604)
+FROZEN_DEVELOPMENT_SEEDS = (15600, 15601, 15602, 15603)
+FROZEN_MATCHED_DEVELOPMENT_SEEDS = (15610, 15611, 15612, 15613)
 _MAX_DATASET_BYTES = 256 * 1024 * 1024
 _HEX = frozenset("0123456789abcdef")
 
@@ -188,8 +190,13 @@ def run_adamo_diagnostic(
     if type(profile) is not str or profile not in PROFILES:
         raise ValueError("profile must name one registered AdamO diagnostic profile")
     resolved_seed = require_jax_seed(seed, name="seed")
-    if resolved_seed not in FROZEN_DEVELOPMENT_SEEDS:
-        raise ValueError("seed is not in the frozen, consumed development schedule")
+    frozen_seeds = (
+        FROZEN_DEVELOPMENT_SEEDS
+        if profile == "contract-smoke"
+        else FROZEN_MATCHED_DEVELOPMENT_SEEDS
+    )
+    if resolved_seed not in frozen_seeds:
+        raise ValueError("seed is not in the frozen development schedule for this profile")
     if type(inputs) is not np.ndarray or type(labels) is not np.ndarray:
         raise TypeError("inputs and labels must be exact numpy arrays")
     config = PROFILES[profile].config
@@ -241,10 +248,16 @@ def run_adamo_diagnostic(
         "official_parity_status": "blocked_no_author_maintained_code_located",
         "profile": profile,
         "seed": resolved_seed,
-        "frozen_development_seeds": list(FROZEN_DEVELOPMENT_SEEDS),
+        "frozen_development_seeds": list(frozen_seeds),
         "config": asdict(config),
         "dataset": {
             "sha256": _sha256_arrays(inputs, labels),
+            "x_sha256": _array_bundle_sha256(
+                "alberta.ipmnist_screening.materialized_x.v1", {"x": inputs}
+            ),
+            "y_sha256": _array_bundle_sha256(
+                "alberta.ipmnist_screening.materialized_y.v1", {"y": labels}
+            ),
             "loaded_numeric_bytes": inputs.nbytes + labels.nbytes,
             "rows": inputs.shape[0],
             "materialization": "caller-supplied-float32-inputs-int32-labels-v1",
@@ -314,7 +327,7 @@ def validate_adamo_diagnostic(payload: object) -> dict[str, object]:
         "negative_outcomes_retained", "scientific_promotion_allowed",
     }
     if set(result) != required:
-        raise ValueError("payload fields do not match the AdamO v1 schema")
+        raise ValueError("payload fields do not match the AdamO v2 schema")
     constants = {
         "schema": SCHEMA, "comparison_id": COMPARISON_ID,
         "paper_revision": ADAMO_PAPER_REVISION, "paper_url": PAPER_URL,
@@ -331,19 +344,26 @@ def validate_adamo_diagnostic(payload: object) -> dict[str, object]:
     if type(profile) is not str or profile not in PROFILES:
         raise ValueError("unknown profile")
     seed = _exact_int(result["seed"], "seed")
-    if seed not in FROZEN_DEVELOPMENT_SEEDS:
+    frozen_seeds = (
+        FROZEN_DEVELOPMENT_SEEDS
+        if profile == "contract-smoke"
+        else FROZEN_MATCHED_DEVELOPMENT_SEEDS
+    )
+    if seed not in frozen_seeds:
         raise ValueError("seed is outside the frozen development schedule")
-    if result["frozen_development_seeds"] != list(FROZEN_DEVELOPMENT_SEEDS):
+    if result["frozen_development_seeds"] != list(frozen_seeds):
         raise ValueError("frozen seed schedule drift")
     config = PROFILES[profile].config
     if result["config"] != asdict(config):
         raise ValueError("profile configuration drift")
     dataset = result["dataset"]
     if type(dataset) is not dict or set(dataset) != {
-        "sha256", "loaded_numeric_bytes", "rows", "materialization"
+        "sha256", "x_sha256", "y_sha256", "loaded_numeric_bytes", "rows", "materialization"
     }:
         raise ValueError("invalid dataset receipt")
     _digest(dataset["sha256"], "dataset.sha256")
+    _digest(dataset["x_sha256"], "dataset.x_sha256")
+    _digest(dataset["y_sha256"], "dataset.y_sha256")
     loaded_bytes = _exact_int(dataset["loaded_numeric_bytes"], "loaded_numeric_bytes", minimum=1)
     rows = _exact_int(dataset["rows"], "rows", minimum=config.task_length)
     if loaded_bytes != rows * (config.input_dim * 4 + 4) or loaded_bytes > _MAX_DATASET_BYTES:
@@ -502,7 +522,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--catalog", action="store_true")
     parser.add_argument("--dataset", type=Path)
     parser.add_argument("--profile", choices=tuple(PROFILES), default="contract-smoke")
-    parser.add_argument("--seed", type=int, default=FROZEN_DEVELOPMENT_SEEDS[0])
+    parser.add_argument("--seed", type=int)
     args = parser.parse_args(argv)
     if args.catalog:
         if args.dataset is not None:
@@ -512,14 +532,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             "official_code": None, "profiles": {name: asdict(value.config)
                                                    for name, value in PROFILES.items()},
             "arms": list(ARMS), "frozen_development_seeds": list(FROZEN_DEVELOPMENT_SEEDS),
+            "frozen_matched_development_seeds": list(FROZEN_MATCHED_DEVELOPMENT_SEEDS),
             "development_only": True, "negative_outcomes_retained": True,
             "scientific_promotion_allowed": False,
         }, sort_keys=True))
         return 0
     if args.dataset is None:
         parser.error("--dataset is required unless --catalog is used")
+    seed = args.seed
+    if seed is None:
+        seed = (
+            FROZEN_DEVELOPMENT_SEEDS[0]
+            if args.profile == "contract-smoke"
+            else FROZEN_MATCHED_DEVELOPMENT_SEEDS[0]
+        )
     inputs, labels = _load_dataset(args.dataset)
-    print(json.dumps(run_adamo_diagnostic(inputs, labels, profile=args.profile, seed=args.seed),
+    print(json.dumps(run_adamo_diagnostic(inputs, labels, profile=args.profile, seed=seed),
                      sort_keys=True, separators=(",", ":")))
     return 0
 

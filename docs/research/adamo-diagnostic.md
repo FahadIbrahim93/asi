@@ -41,8 +41,6 @@ Run only on a caller-materialized NPZ containing exactly float32 `inputs` and in
 .venv/bin/asi-adamo-diagnostic --catalog
 .venv/bin/asi-adamo-diagnostic --dataset /new/path/data.npz \
   --profile contract-smoke --seed 15600
-.venv/bin/asi-adamo-matched-development --dataset /new/path/data.npz \
-  --profile bounded-development --output /new/path/adamo-matched.json
 ```
 
 Receipts bind exact dataset and current-source hashes, runtime identity, data steps, observations,
@@ -51,19 +49,6 @@ workspace, and a named logical-compute convention. Timing is telemetry only. Suc
 means only that an uninterpreted development measurement was produced. Every outcome is retained;
 the validator permanently rejects promotion fields, unmatched axes, malformed numerics, resource
 drift, source drift, and a non-exact inert reduction.
-
-The complete campaign crosses the four arms with consumed development seeds
-`15600` through `15604`. It binds the exact supplied dataset, every
-Threefry-derived initialization and task/example schedule, the installed
-execution-source closure, and the complete Python/JAX/dependency runtime. Its
-aggregate records per-arm whole-stream curves, final diagnostic means, and
-summed additive work counters plus maximum per-shard memory envelopes. Strict
-publication validation reruns all five seed shards under the current source and
-compares every deterministic field;
-wall-clock timing remains telemetry only. The campaign decision must remain
-`inconclusive` because there is no registered decision rule. Its atomic
-no-replace writer replays before publication. Consistency hashes are not
-authenticated execution attestation.
 
 ## Comparability and execution gates
 
@@ -76,5 +61,26 @@ Newton-Schulz, ReLU-revival, empirical NTK, effective-rank, CNN, RL, or transfor
 Before a scientific comparison: locate and pin official code or independently verify equations;
 implement the exact paper dataset/task construction, architecture, initialization and full
 diagnostic definitions; qualify the missing model families; freeze a separate preregistered
-protocol and untouched seeds; and establish calibrated compute, memory, and timing gates. The five
-listed seeds are consumed development seeds and can never promote a claim.
+protocol and untouched seeds; and establish calibrated compute, memory, and timing gates. The four
+diagnostic seeds `15600`--`15603` are consumed development seeds and can never promote a claim.
+
+## Frozen matched campaign
+
+`asi-adamo-matched-development` is the only campaign entry point. It freezes fresh seeds
+`15610`--`15613`, the `bounded-development` profile, all four arms, canonical OpenML
+`mnist_784` version 1 rows 0--59999, a paired two-sided Student-t summary, and one immutable
+output at `outputs/adamo_matched_development/report.v1.json`. The command reserves that path
+before loading data or training and refuses overwrite, symlink traversal, incomplete seed/arm
+matrices, source/runtime/data drift, malformed receipts, reconstructed-statistic drift, and any
+promotion or parity field.
+
+```bash
+.venv/bin/asi-adamo-matched-development --data-home /path/to/openml-cache
+```
+
+This is a small IPMNIST adaptation: eight tasks of 64 updates on the existing
+784-300-150-10 ReLU MLP. It is neither a paper reproduction nor evidence. The report retains
+every seed receipt, per-arm steps/query/memory/compute/timing accounting, post-task
+Jacobian/isometry diagnostics, paired primary intervals, and negative or inconclusive outcomes.
+Timing remains telemetry and no campaign outcome may promote a claim. Consistency hashes are not
+authenticated execution attestation.
