@@ -8,6 +8,7 @@ reviewed authorization change.
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import hashlib
 import importlib.metadata
@@ -19,6 +20,7 @@ import secrets
 import stat
 import subprocess
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Final, cast
 
@@ -26,8 +28,9 @@ import jax
 import jax.random as jr
 import numpy as np
 
-from alberta_framework.benchmarks.adamo_diagnostic import _load_dataset, _sha256_arrays
+from alberta_framework.benchmarks.adamo_diagnostic import _load_dataset
 from alberta_framework.benchmarks.ipmnist_screening import (
+    _screening_dataset_provenance,
     _screening_runtime_environment,
     _screening_source_provenance,
     intentional_updates_development_record,
@@ -44,7 +47,7 @@ PAPER_REVISION: Final[str] = "arXiv:2604.19033v1"
 OFFICIAL_CODE_REVISION: Final[str] = (
     "sharifnassab/Intentional_RL@e86e26fd8613ac212e9a52c3fed8a01d0a31f685"
 )
-SEEDS: Final[tuple[int, ...]] = (25610, 25611, 25612, 25613)
+SEEDS: Final[tuple[int, ...]] = (31_561_001, 31_561_002, 31_561_003, 31_561_004)
 CONTROL_ARMS: Final[tuple[str, ...]] = (
     "fixed_td0",
     "intentional_td0",
@@ -59,6 +62,7 @@ _OFF_ALIASES: Final[dict[str, str]] = {
     "intentional_q_lambda_off": "fixed_q_lambda",
 }
 _EXECUTION_AUTHORIZED: Final[bool] = False
+_EXECUTION_CAPABILITY: Final[object] = object()
 _MAX_HORIZON: Final[int] = 10_000
 _MAX_JSON_NODES: Final[int] = 200_000
 _MAX_STRING_BYTES: Final[int] = 2 * 1024 * 1024
@@ -70,11 +74,11 @@ OUTPUT_PATH: Final[Path] = (
     _REPO_ROOT / "outputs/intentional_updates_matched_development/report.v1.json"
 )
 BONFERRONI_T_DF3: Final[float] = 5.391949071934058
-DATASET_FILE_SHA256: Final[str] = (
-    "58320c334531afce90c4899ea0c05976c9b9d1c10b7b37e8eb4289cabd0a00ba"
+DATASET_X_SHA256: Final[str] = (
+    "b8078cd833f53d89828a5e28d728517be9add34076f13fe973399f1f16381313"
 )
-DATASET_SEMANTIC_SHA256: Final[str] = (
-    "d25060db8f3f3f6ae7b0bb972e848733e15a1158f02021645e86a2923a5ee8a3"
+DATASET_Y_SHA256: Final[str] = (
+    "4f1dd9551f104f8153409e0add59f0a71568f7bad5a5f8e2274480c186fe219a"
 )
 SUPERVISED_CONFIG: Final[IPMNISTConfig] = IPMNISTConfig(
     n_tasks=8,
@@ -91,6 +95,8 @@ class _Reservation:
     directory_fd: int
     destination_name: str
     reservation_name: str
+    reservation_device: int
+    reservation_inode: int
 
 
 def frozen_plan() -> dict[str, object]:
@@ -99,16 +105,24 @@ def frozen_plan() -> dict[str, object]:
         "plan_id": PLAN_ID,
         "paper_revision": PAPER_REVISION,
         "official_code_revision": OFFICIAL_CODE_REVISION,
+        "source_identity": _source_identity(),
+        "runtime_identity": _runtime_identity(),
         "seeds": list(SEEDS),
         "protocol_families": ["supervised_ipmnist", "td_control"],
         "supervised_pair": ["intentional_updates_off", "intentional_updates_ipmnist"],
         "supervised_config": SUPERVISED_CONFIG.to_config(),
         "dataset": {
-            "file_sha256": DATASET_FILE_SHA256,
-            "semantic_sha256": DATASET_SEMANTIC_SHA256,
-            "keys": ["inputs", "labels"],
-            "dtypes": ["float32", "int32"],
-            "shapes": [[70000, 784], [70000]],
+            "schema": "alberta.ipmnist_screening.dataset_provenance.v1",
+            "source": {
+                "provider": "openml",
+                "name": "mnist_784",
+                "version": 1,
+                "row_start": 0,
+                "row_stop_exclusive": 60_000,
+            },
+            "materialization": "alberta.ipmnist.float32-neg1-pos1-int32-labels.v1",
+            "x": {"dtype": "<f4", "shape": [60_000, 784], "sha256": DATASET_X_SHA256},
+            "y": {"dtype": "<i4", "shape": [60_000], "sha256": DATASET_Y_SHA256},
         },
         "control_pairs": [
             ["fixed_td0", "intentional_td0"],
@@ -227,8 +241,16 @@ def _version(name: str) -> str:
 
 
 def _source_identity() -> dict[str, str]:
-    path = Path(__file__)
-    return {"intentional_updates_control.py": hashlib.sha256(path.read_bytes()).hexdigest()}
+    relative_paths = (
+        "alberta_framework/benchmarks/intentional_updates_control.py",
+        "alberta_framework/benchmarks/ipmnist_screening.py",
+        "alberta_framework/benchmarks/plasticity_comparators.py",
+        "alberta_framework/benchmarks/upgd_ipmnist.py",
+    )
+    return {
+        relative: hashlib.sha256((_REPO_ROOT / relative).read_bytes()).hexdigest()
+        for relative in relative_paths
+    }
 
 
 def _runtime_identity() -> dict[str, str]:
@@ -415,7 +437,29 @@ def _run(
 def run_control_shard(
     arm: str, *, seed: int, horizon: int = 512, phase_length: int = 64
 ) -> dict[str, object]:
-    """Run one bounded in-memory shard; this does not retain or promote it."""
+    """Fail closed until a separate reviewed transition authorizes execution."""
+    if _EXECUTION_AUTHORIZED is not True:
+        raise RuntimeError("Intentional Updates matched-development execution is not authorized")
+    return _run_control_shard_authorized(
+        arm,
+        seed=seed,
+        horizon=horizon,
+        phase_length=phase_length,
+        _capability=_EXECUTION_CAPABILITY,
+    )
+
+
+def _run_control_shard_authorized(
+    arm: str,
+    *,
+    seed: int,
+    horizon: int = 512,
+    phase_length: int = 64,
+    _capability: object,
+) -> dict[str, object]:
+    """Private bounded executor used by contract tests and a future gated campaign."""
+    if _capability is not _EXECUTION_CAPABILITY:
+        raise RuntimeError("private Intentional execution capability is invalid")
     if type(arm) is not str or (arm not in CONTROL_ARMS and arm not in _OFF_ALIASES):
         raise ValueError("arm must name one exact registered control arm")
     if type(seed) is not int or seed not in SEEDS:
@@ -514,6 +558,10 @@ def validate_control_shard(value: object) -> dict[str, object]:
     seed = record["seed"]
     horizon = config["horizon"]
     phase_length = config["phase_length"]
+    if not 1 <= horizon <= _MAX_HORIZON:
+        raise ValueError("control config horizon is outside the exact bound")
+    if not 1 <= phase_length <= horizon:
+        raise ValueError("control config phase_length is outside the exact bound")
     resources = _exact_object(
         record["resources"],
         frozenset(
@@ -593,7 +641,9 @@ def validate_control_shard(value: object) -> dict[str, object]:
 
 
 def _current_source() -> dict[str, object]:
-    return _screening_source_provenance(_REPO_ROOT)
+    result = dict(_screening_source_provenance(_REPO_ROOT))
+    result["intentional_updates_control_source_sha256"] = _source_identity()
+    return result
 
 
 def _current_runtime() -> dict[str, object]:
@@ -753,22 +803,19 @@ def build_report(
     supervised_records: object,
     control_records: object,
     *,
-    dataset_file_sha256: object,
-    dataset_semantic_sha256: object,
+    dataset_provenance: object,
     execution_source_commit: object,
 ) -> dict[str, object]:
     """Build the complete two-family development report without cross-family ranking."""
-    file_digest = _digest(dataset_file_sha256, length=64, context="dataset file")
-    semantic_digest = _digest(dataset_semantic_sha256, length=64, context="dataset semantic")
     commit = _digest(execution_source_commit, length=40, context="execution source commit")
-    if file_digest != DATASET_FILE_SHA256 or semantic_digest != DATASET_SEMANTIC_SHA256:
+    checked_dataset = _bounded_json(dataset_provenance, context="dataset provenance")
+    if checked_dataset != frozen_plan()["dataset"]:
         raise ValueError("dataset identity does not match the frozen plan")
     runs = _validated_runs(supervised_records, control_records)
     report: dict[str, object] = {
         "schema": REPORT_SCHEMA,
         "plan": frozen_plan(),
-        "dataset_file_sha256": file_digest,
-        "dataset_semantic_sha256": semantic_digest,
+        "dataset_provenance": checked_dataset,
         "execution_source_commit": commit,
         "source_provenance": _current_source(),
         "runtime_environment": _current_runtime(),
@@ -797,7 +844,7 @@ def validate_report(value: object, *, require_current_source: bool = True) -> di
         report,
         frozenset(
             {
-                "schema", "plan", "dataset_file_sha256", "dataset_semantic_sha256",
+                "schema", "plan", "dataset_provenance",
                 "execution_source_commit", "source_provenance", "runtime_environment",
                 "runs", "paired_comparisons", "development_disposition", "policy",
             }
@@ -810,12 +857,7 @@ def validate_report(value: object, *, require_current_source: bool = True) -> di
         frozen_plan(), sort_keys=True, separators=(",", ":")
     ):
         raise ValueError("report plan differs from the literal prospective plan")
-    if (
-        _digest(report["dataset_file_sha256"], length=64, context="dataset file")
-        != DATASET_FILE_SHA256
-        or _digest(report["dataset_semantic_sha256"], length=64, context="dataset semantic")
-        != DATASET_SEMANTIC_SHA256
-    ):
+    if report["dataset_provenance"] != frozen_plan()["dataset"]:
         raise ValueError("report dataset identity drift")
     commit = _digest(report["execution_source_commit"], length=40, context="execution commit")
     source = _bounded_json(report["source_provenance"], context="source provenance")
@@ -876,19 +918,27 @@ def validate_report(value: object, *, require_current_source: bool = True) -> di
 
 def _open_parent(path: Path) -> int:
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    descriptor = os.open(os.path.sep, flags)
     try:
-        return os.open(path.parent, flags)
-    except FileNotFoundError:
-        parent_fd = os.open(path.parent.parent, flags)
-        try:
+        for component in absolute.parent.parts[1:]:
+            if component in {"", ".", ".."}:
+                raise ValueError("output path contains an unsafe directory component")
+            created = False
             try:
-                os.mkdir(path.parent.name, 0o755, dir_fd=parent_fd)
-                os.fsync(parent_fd)
+                os.mkdir(component, 0o755, dir_fd=descriptor)
+                created = True
             except FileExistsError:
                 pass
-            return os.open(path.parent.name, flags, dir_fd=parent_fd)
-        finally:
-            os.close(parent_fd)
+            if created:
+                os.fsync(descriptor)
+            next_descriptor = os.open(component, flags, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
 
 
 def _reserve(path: Path) -> _Reservation:
@@ -897,43 +947,72 @@ def _reserve(path: Path) -> _Reservation:
     directory_fd = _open_parent(path)
     reservation_name = f".{path.name}.reservation"
     descriptor = -1
+    reservation_acquired = False
+    reservation_identity: tuple[int, int] | None = None
     try:
-        descriptor = os.open(
-            reservation_name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o400,
-            dir_fd=directory_fd,
-        )
-        marker = f"reserved:{path.name}\n".encode("ascii")
-        if os.write(descriptor, marker) != len(marker):
-            raise OSError("short immutable-output reservation write")
-        os.fsync(descriptor)
-        os.close(descriptor)
-        descriptor = -1
-        os.fsync(directory_fd)
         try:
             os.stat(path.name, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
             pass
         else:
             raise FileExistsError(f"refusing to overwrite immutable output: {path}")
-        return _Reservation(directory_fd, path.name, reservation_name)
+        descriptor = os.open(
+            reservation_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o400,
+            dir_fd=directory_fd,
+        )
+        reservation_acquired = True
+        marker = f"reserved:{path.name}\n".encode("ascii")
+        view = memoryview(marker)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise OSError("short immutable-output reservation write")
+            view = view[written:]
+        os.fsync(descriptor)
+        marker_stat = os.fstat(descriptor)
+        reservation_identity = (marker_stat.st_dev, marker_stat.st_ino)
+        os.close(descriptor)
+        descriptor = -1
+        os.fsync(directory_fd)
+        return _Reservation(
+            directory_fd,
+            path.name,
+            reservation_name,
+            marker_stat.st_dev,
+            marker_stat.st_ino,
+        )
     except BaseException:
         if descriptor >= 0:
             os.close(descriptor)
-        try:
-            os.unlink(reservation_name, dir_fd=directory_fd)
-            os.fsync(directory_fd)
-        except FileNotFoundError:
-            pass
+        if reservation_acquired:
+            try:
+                marker_stat = os.stat(
+                    reservation_name, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if (marker_stat.st_dev, marker_stat.st_ino) == reservation_identity:
+                    os.unlink(reservation_name, dir_fd=directory_fd)
+                    os.fsync(directory_fd)
+            except FileNotFoundError:
+                pass
         os.close(directory_fd)
         raise
 
 
 def _release(reservation: _Reservation) -> None:
     try:
-        os.unlink(reservation.reservation_name, dir_fd=reservation.directory_fd)
-        os.fsync(reservation.directory_fd)
+        marker = os.stat(
+            reservation.reservation_name,
+            dir_fd=reservation.directory_fd,
+            follow_symlinks=False,
+        )
+        if (marker.st_dev, marker.st_ino) == (
+            reservation.reservation_device,
+            reservation.reservation_inode,
+        ):
+            os.unlink(reservation.reservation_name, dir_fd=reservation.directory_fd)
+            os.fsync(reservation.directory_fd)
     except FileNotFoundError:
         pass
     finally:
@@ -960,13 +1039,28 @@ def _strict_reread(reservation: _Reservation, expected: bytes) -> object:
             remaining -= len(chunk)
         if os.read(descriptor, 1):
             raise ValueError("published report grew during strict reread")
+        final = os.fstat(descriptor)
+        stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(getattr(metadata, field) != getattr(final, field) for field in stable):
+            raise ValueError("published report changed during strict reread")
     finally:
         os.close(descriptor)
     actual = b"".join(chunks)
     if actual != expected:
         raise ValueError("published bytes differ from the validated generation")
     try:
-        return _bounded_json(json.loads(actual), context="published report")
+        def exact_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, item in pairs:
+                if key in result:
+                    raise ValueError("published report contains a duplicate JSON key")
+                result[key] = item
+            return result
+
+        return _bounded_json(
+            json.loads(actual.decode("utf-8"), object_pairs_hook=exact_object),
+            context="published report",
+        )
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         raise ValueError("published report is not strict JSON") from error
 
@@ -1003,7 +1097,8 @@ def _publish_reserved(reservation: _Reservation, report: dict[str, object]) -> N
             follow_symlinks=False,
         )
         os.fsync(reservation.directory_fd)
-        if _strict_reread(reservation, encoded) != report:
+        reread = _strict_reread(reservation, encoded)
+        if validate_report(reread, require_current_source=True) != report:
             raise ValueError("published semantic payload differs from validated report")
     finally:
         if descriptor >= 0:
@@ -1026,14 +1121,6 @@ def publish_report(path: Path, report: object) -> Path:
     return path
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _execution_commit() -> str:
     completed = subprocess.run(
         ("git", "rev-parse", "HEAD"),
@@ -1053,14 +1140,11 @@ def run_campaign(dataset_path: Path, output_path: Path = OUTPUT_PATH) -> dict[st
         raise ValueError("dataset and output must be exact pathlib.Path values")
     reservation = _reserve(output_path)
     try:
-        file_digest = _sha256_file(dataset_path)
-        if file_digest != DATASET_FILE_SHA256:
-            raise ValueError("dataset file does not match the frozen reviewed input")
         source_before = _current_source()
         runtime_before = _current_runtime()
         inputs, labels = _load_dataset(dataset_path)
-        semantic_digest = _sha256_arrays(inputs, labels)
-        if semantic_digest != DATASET_SEMANTIC_SHA256:
+        dataset_provenance = _screening_dataset_provenance(inputs, labels)
+        if dataset_provenance != frozen_plan()["dataset"]:
             raise ValueError("dataset numeric payload does not match the frozen reviewed input")
         supervised_records = [
             intentional_updates_development_record(
@@ -1076,7 +1160,11 @@ def run_campaign(dataset_path: Path, output_path: Path = OUTPUT_PATH) -> dict[st
             for arm in ("intentional_updates_off", "intentional_updates_ipmnist")
         ]
         control_records = [
-            run_control_shard(arm, seed=seed) for seed in SEEDS for arm in CONTROL_ARMS
+            _run_control_shard_authorized(
+                arm, seed=seed, _capability=_EXECUTION_CAPABILITY
+            )
+            for seed in SEEDS
+            for arm in CONTROL_ARMS
         ]
         if source_before != _current_source():
             raise RuntimeError("source identity changed during matched execution")
@@ -1085,8 +1173,7 @@ def run_campaign(dataset_path: Path, output_path: Path = OUTPUT_PATH) -> dict[st
         report = build_report(
             supervised_records,
             control_records,
-            dataset_file_sha256=file_digest,
-            dataset_semantic_sha256=semantic_digest,
+            dataset_provenance=dataset_provenance,
             execution_source_commit=_execution_commit(),
         )
         _publish_reserved(reservation, report)
@@ -1095,15 +1182,34 @@ def run_campaign(dataset_path: Path, output_path: Path = OUTPUT_PATH) -> dict[st
         _release(reservation)
 
 
+def main(argv: Sequence[str] | None = None) -> int:
+    """Inspect the frozen plan or reject execution while authorization is false."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--catalog", action="store_true")
+    parser.add_argument("--dataset", type=Path)
+    parser.add_argument("--output", type=Path, default=OUTPUT_PATH)
+    args = parser.parse_args(argv)
+    if args.catalog:
+        if args.dataset is not None:
+            parser.error("--catalog and --dataset are mutually exclusive")
+        print(json.dumps(frozen_plan(), sort_keys=True))
+        return 0
+    if args.dataset is None:
+        parser.error("--dataset is required unless --catalog is used")
+    run_campaign(args.dataset, args.output)
+    return 0
+
+
 __all__ = [
     "BONFERRONI_T_DF3",
     "CONTROL_ARMS",
-    "DATASET_FILE_SHA256",
-    "DATASET_SEMANTIC_SHA256",
+    "DATASET_X_SHA256",
+    "DATASET_Y_SHA256",
     "SEEDS",
     "SUPERVISED_CONFIG",
     "build_report",
     "frozen_plan",
+    "main",
     "publish_report",
     "run_campaign",
     "run_control_shard",

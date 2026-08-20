@@ -154,6 +154,26 @@ def test_campaign_execution_is_closed_before_independent_review() -> None:
         lane.run_campaign(Path("unused.npz"), Path("unused.json"))
 
 
+def test_execution_cli_fails_before_dataset_or_consumer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = {"dataset": 0, "consumer": 0}
+
+    def forbidden_dataset(*args: object, **kwargs: object) -> object:
+        calls["dataset"] += 1
+        raise AssertionError("dataset load occurred before authorization")
+
+    def forbidden_consumer(*args: object, **kwargs: object) -> object:
+        calls["consumer"] += 1
+        raise AssertionError("consumer ran before authorization")
+
+    monkeypatch.setattr(lane, "_load_dataset", forbidden_dataset)
+    monkeypatch.setattr(lane, "_run", forbidden_consumer)
+    with pytest.raises(RuntimeError, match="not authorized"):
+        lane.main(["--dataset", "unused.npz"])
+    assert calls == {"dataset": 0, "consumer": 0}
+
+
 def test_validator_bounds_config_before_reexecution(monkeypatch: pytest.MonkeyPatch) -> None:
     record = _control("fixed_td0", seed=lane.SEEDS[0], horizon=16, phase_length=4)
     hostile = copy.deepcopy(record)
@@ -213,8 +233,7 @@ def test_report_recomputes_all_four_bonferroni_paired_questions(
     monkeypatch.setattr(lane, "_current_runtime", lambda: {"backend": "cpu"})
     report = lane.build_report(
         *complete_records,
-        dataset_file_sha256=lane.DATASET_FILE_SHA256,
-        dataset_semantic_sha256=lane.DATASET_SEMANTIC_SHA256,
+        dataset_provenance=lane.frozen_plan()["dataset"],
         execution_source_commit="c" * 40,
     )
     assert set(report["paired_comparisons"]) == {
@@ -235,8 +254,7 @@ def test_report_rejects_missing_shard_arithmetic_and_promotion(
     monkeypatch.setattr(lane, "_current_runtime", lambda: {"backend": "cpu"})
     report = lane.build_report(
         *complete_records,
-        dataset_file_sha256=lane.DATASET_FILE_SHA256,
-        dataset_semantic_sha256=lane.DATASET_SEMANTIC_SHA256,
+        dataset_provenance=lane.frozen_plan()["dataset"],
         execution_source_commit="c" * 40,
     )
     missing = copy.deepcopy(report)
@@ -262,8 +280,7 @@ def test_report_publication_is_no_replace_and_rejects_symlink_parent(
     monkeypatch.setattr(lane, "_current_runtime", lambda: {"backend": "cpu"})
     report = lane.build_report(
         *complete_records,
-        dataset_file_sha256=lane.DATASET_FILE_SHA256,
-        dataset_semantic_sha256=lane.DATASET_SEMANTIC_SHA256,
+        dataset_provenance=lane.frozen_plan()["dataset"],
         execution_source_commit="c" * 40,
     )
     destination = tmp_path / "new" / "report.json"
@@ -281,6 +298,35 @@ def test_report_publication_is_no_replace_and_rejects_symlink_parent(
     with pytest.raises(OSError):
         lane.publish_report(linked_destination, report)
     assert not (target / "report.json").exists()
+
+
+def test_reservation_is_exclusive_and_parent_swap_stays_descriptor_pinned(
+    tmp_path: Path,
+    complete_records: tuple[list[dict[str, object]], list[dict[str, object]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lane, "_current_source", lambda: {"git_commit": "c" * 40})
+    monkeypatch.setattr(lane, "_current_runtime", lambda: {"backend": "cpu"})
+    report = lane.build_report(
+        *complete_records,
+        dataset_provenance=lane.frozen_plan()["dataset"],
+        execution_source_commit="c" * 40,
+    )
+    requested = tmp_path / "requested"
+    destination = requested / "report.json"
+    monkeypatch.setattr(lane, "OUTPUT_PATH", destination)
+    reservation = lane._reserve(destination)
+    try:
+        with pytest.raises(FileExistsError):
+            lane._reserve(destination)
+        moved = tmp_path / "moved"
+        requested.rename(moved)
+        requested.mkdir()
+        lane._publish_reserved(reservation, report)
+    finally:
+        lane._release(reservation)
+    assert (moved / "report.json").is_file()
+    assert not destination.exists()
 
 
 @pytest.mark.parametrize(
