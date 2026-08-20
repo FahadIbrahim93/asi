@@ -31,6 +31,7 @@ import numpy as np
 from jax import Array
 
 from alberta_framework._float32 import round_real_to_float32_with_ratio
+from alberta_framework._scan_resources import ScanBudget, require_scan_steps
 from alberta_framework._seed_validation import require_jax_seed
 from alberta_framework.core.associative_memory import (
     AssociativeFeatureFamily,
@@ -136,7 +137,8 @@ _STEP2_ASSOCIATIVE_CONFIG_KEYS = frozenset(
 _INT32_MAX = 2**31 - 1
 # Public last-fit in tests is 128 smoke steps. Origin accepted INT32_MAX
 # and looped range(steps) with no last-fit reject — hang, not leftover INT32 math.
-_STEP2_LOOP_MAX_STEPS = 10_000
+_STEP2_LOOP_BUDGET = ScanBudget("Step 2 host loop", maximum_steps=10_000)
+_STEP2_LOOP_MAX_STEPS = _STEP2_LOOP_BUDGET.maximum_steps
 _ACTUAL_INT_TYPES = frozenset(
     {
         int,
@@ -325,11 +327,19 @@ def _require_int(
 
 def _require_step2_loop_steps(name: str, value: object, *, minimum: int = 1) -> int:
     """Reject collection/smoke lengths above the public last-fit before ``range``."""
-    if type(value) is not int or value < minimum or value > _STEP2_LOOP_MAX_STEPS:
+    if type(minimum) is not int or minimum not in (1, 2):
+        raise ValueError("Step 2 loop minimum must be one or two")
+    try:
+        steps = require_scan_steps(name, value, _STEP2_LOOP_BUDGET)
+    except ValueError:
+        raise ValueError(
+            f"{name} must be an integer in [{minimum}, {_STEP2_LOOP_MAX_STEPS}]"
+        ) from None
+    if steps < minimum:
         raise ValueError(
             f"{name} must be an integer in [{minimum}, {_STEP2_LOOP_MAX_STEPS}]"
         )
-    return value
+    return steps
 
 
 def _require_bool(name: str, value: object) -> bool:
