@@ -13,6 +13,8 @@ import pytest
 from alberta_framework.benchmarks.adamo_diagnostic import (
     ARMS,
     FROZEN_DEVELOPMENT_SEEDS,
+    FROZEN_MATCHED_DEVELOPMENT_SEEDS,
+    SCHEMA,
     main,
     run_adamo_diagnostic,
     validate_adamo_diagnostic,
@@ -42,6 +44,7 @@ def test_end_to_end_runner_binds_diagnostics_and_exact_resources(
     receipt: dict[str, object],
 ) -> None:
     assert validate_adamo_diagnostic(receipt) == receipt
+    assert receipt["schema"] == SCHEMA
     arms = receipt["arms"]
     assert isinstance(arms, list)
     assert [arm["arm"] for arm in arms] == list(ARMS)
@@ -100,6 +103,29 @@ def test_hostile_scalar_alias_and_unfrozen_seed_are_rejected(
         validate_adamo_diagnostic(hostile)
     with pytest.raises(ValueError, match="frozen"):
         run_adamo_diagnostic(*tiny_data, profile="contract-smoke", seed=9)
+
+
+def test_contract_and_matched_seed_schedules_are_disjoint(
+    tiny_data: tuple[np.ndarray, np.ndarray],
+) -> None:
+    assert set(FROZEN_DEVELOPMENT_SEEDS).isdisjoint(FROZEN_MATCHED_DEVELOPMENT_SEEDS)
+    with pytest.raises(ValueError, match="frozen"):
+        run_adamo_diagnostic(
+            *tiny_data,
+            profile="contract-smoke",
+            seed=FROZEN_MATCHED_DEVELOPMENT_SEEDS[0],
+        )
+
+
+def test_retained_receipt_can_be_validated_offline(
+    receipt: dict[str, object],
+) -> None:
+    retained = copy.deepcopy(receipt)
+    retained["runtime"]["backend"] = "gpu"
+    retained["source"]["adapter_sha256"] = "0" * 64
+    assert validate_adamo_diagnostic(retained, require_current_identity=False) == retained
+    with pytest.raises(ValueError, match="current runtime"):
+        validate_adamo_diagnostic(retained)
 
 
 @pytest.mark.parametrize(

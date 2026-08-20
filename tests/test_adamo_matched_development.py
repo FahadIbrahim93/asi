@@ -9,36 +9,47 @@ from typing import Never
 import numpy as np
 import pytest
 
-from alberta_framework.benchmarks import adamo_diagnostic
 from alberta_framework.benchmarks import adamo_matched_development as matched
-from alberta_framework.benchmarks.adamo_diagnostic import (
-    FROZEN_DEVELOPMENT_SEEDS,
-    run_adamo_diagnostic,
-)
+from alberta_framework.benchmarks.adamo_diagnostic import run_adamo_diagnostic
 
 pytestmark = pytest.mark.integration
 
 
 def _patch_identities(
     monkeypatch: pytest.MonkeyPatch, receipts: list[dict[str, object]]
-) -> None:
+) -> tuple[dict[str, object], dict[str, object], dict[str, object]]:
+    run_runtime = receipts[0]["runtime"]
+    dataset = {
+        "x": {"shape": [60_000, 784], "sha256": receipts[0]["dataset"]["x_sha256"]},
+        "y": {"shape": [60_000], "sha256": receipts[0]["dataset"]["y_sha256"]},
+    }
+    source = {"git_commit": "c" * 40, "relevant_source_sha256": "a" * 64}
+    runtime = {
+        "python": {"version": run_runtime["python"]},
+        "packages": {"jax": run_runtime["jax"], "numpy": run_runtime["numpy"]},
+        "jax": {"backend": run_runtime["backend"]},
+    }
     monkeypatch.setattr(
-        matched,
-        "_current_source_provenance",
-        lambda: {"git_commit": "c" * 40, "relevant_source_sha256": "a" * 64},
+        matched, "_current_source_provenance", lambda: source
     )
-    monkeypatch.setattr(
-        matched,
-        "_current_runtime_environment",
-        lambda: {"schema": "test-runtime", "backend": "cpu"},
+    monkeypatch.setattr(matched, "_current_runtime_environment", lambda: runtime)
+    monkeypatch.setattr(matched, "validate_adamo_diagnostic", lambda value, **_: value)
+    monkeypatch.setattr(matched, "_validated_dataset_provenance", lambda value, **_: value)
+    monkeypatch.setattr(matched, "_validated_source_provenance", lambda value, **_: value)
+    monkeypatch.setattr(matched, "_validated_runtime_environment", lambda value, **_: value)
+    return dataset, source, runtime
+
+
+def _build_report(
+    receipts: list[dict[str, object]], monkeypatch: pytest.MonkeyPatch
+) -> dict[str, object]:
+    dataset, source, runtime = _patch_identities(monkeypatch, receipts)
+    return matched.build_report(
+        receipts,
+        dataset_provenance=dataset,
+        source_provenance=source,
+        runtime_environment=runtime,
     )
-    monkeypatch.setattr(
-        matched,
-        "validate_adamo_diagnostic",
-        lambda value, *, seed_schedule: value,
-    )
-    semantic = receipts[0]["dataset"]["sha256"]
-    monkeypatch.setattr(matched, "DATASET_SEMANTIC_SHA256", semantic)
 
 
 @pytest.fixture(scope="module")
@@ -49,47 +60,44 @@ def receipts() -> list[dict[str, object]]:
         inputs,
         labels,
         profile="contract-smoke",
-        seed=FROZEN_DEVELOPMENT_SEEDS[0],
+        seed=matched.CONSUMED_QUALIFICATION_SEEDS[0],
     )
     result = []
     for seed in matched.SEEDS:
         receipt = copy.deepcopy(first)
         receipt["seed"] = seed
-        receipt["frozen_development_seeds"] = list(matched.SEEDS)
         receipt["profile"] = matched.PROFILE
+        receipt["frozen_development_seeds"] = list(matched.SEEDS)
+        receipt["dataset"]["rows"] = 60_000
+        receipt["dataset"]["loaded_numeric_bytes"] = 60_000 * (4 * 4 + 4)
         result.append(receipt)
     return result
 
 
 def test_plan_is_prospective_exact_and_permanently_nonpromoting() -> None:
     plan = matched.frozen_plan()
-    assert adamo_diagnostic.FROZEN_DEVELOPMENT_SEEDS == (15600, 15601, 15602, 15603)
-    assert adamo_diagnostic.ADAMO_MATCHED_DEVELOPMENT_SEEDS == matched.SEEDS
     assert plan["seeds"] == list(matched.SEEDS)
     assert plan["profile"] == "bounded-development"
     assert plan["execution_authorized"] is False
     assert plan["scientific_promotion_allowed"] is False
     assert plan["outcome_retention_required"] is True
     assert plan["consumed_qualification_seeds"] == [15600, 15601, 15602, 15603]
+    assert plan["quarantined_preplan_seeds"] == [25600, 25601, 25602, 25603]
+    assert set(plan["seeds"]).isdisjoint(plan["consumed_qualification_seeds"])
+    assert set(plan["seeds"]).isdisjoint(plan["quarantined_preplan_seeds"])
     assert plan["dataset"]["source"] == {
         "provider": "openml",
         "name": "mnist_784",
         "version": 1,
         "row_start": 0,
-        "row_stop_exclusive": 60000,
+        "row_stop_exclusive": 60_000,
     }
-    assert plan["dataset"]["numeric_bytes"] == 188_400_000
 
 
 def test_report_recomputes_paired_statistics_and_retains_every_outcome(
     receipts: list[dict[str, object]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _patch_identities(monkeypatch, receipts)
-    report = matched.build_report(
-        receipts,
-        dataset_file_sha256="b" * 64,
-        execution_source_commit="c" * 40,
-    )
+    report = _build_report(receipts, monkeypatch)
     assert len(report["runs"]) == len(matched.SEEDS)
     assert set(report["paired_comparisons"]) == {
         "adamo_l1e3",
@@ -105,33 +113,28 @@ def test_report_recomputes_paired_statistics_and_retains_every_outcome(
         "outcome_retained": True,
         "timing_is_telemetry_only": True,
     }
-    assert matched.validate_report(report, require_current_source=True) == report
+    assert matched.validate_report(report, require_current_execution_identity=True) == report
 
 
 def test_validator_rejects_missing_seed_tampering_and_promotion(
     receipts: list[dict[str, object]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _patch_identities(monkeypatch, receipts)
-    report = matched.build_report(
-        receipts,
-        dataset_file_sha256="b" * 64,
-        execution_source_commit="c" * 40,
-    )
+    report = _build_report(receipts, monkeypatch)
 
     missing = copy.deepcopy(report)
     missing["runs"].pop()
     with pytest.raises(ValueError, match="complete frozen seed schedule"):
-        matched.validate_report(missing, require_current_source=True)
+        matched.validate_report(missing, require_current_execution_identity=True)
 
     arithmetic = copy.deepcopy(report)
     arithmetic["paired_comparisons"]["adamo_l1e3"]["mean_accuracy_delta"] = 1.0
     with pytest.raises(ValueError, match="paired arithmetic"):
-        matched.validate_report(arithmetic, require_current_source=True)
+        matched.validate_report(arithmetic, require_current_execution_identity=True)
 
     promoting = copy.deepcopy(report)
     promoting["policy"]["scientific_promotion_allowed"] = True
     with pytest.raises(ValueError, match="permanently nonpromoting"):
-        matched.validate_report(promoting, require_current_source=True)
+        matched.validate_report(promoting, require_current_execution_identity=True)
 
 
 def test_atomic_publication_refuses_overwrite(
@@ -139,14 +142,10 @@ def test_atomic_publication_refuses_overwrite(
     receipts: list[dict[str, object]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_identities(monkeypatch, receipts)
-    report = matched.build_report(
-        receipts,
-        dataset_file_sha256="b" * 64,
-        execution_source_commit="c" * 40,
-    )
     destination = tmp_path / "report.json"
     monkeypatch.setattr(matched, "OUTPUT_PATH", destination)
+    monkeypatch.setattr(matched, "_EXECUTION_AUTHORIZED", True)
+    report = _build_report(receipts, monkeypatch)
     matched.publish_report(destination, report)
     with pytest.raises(FileExistsError):
         matched.publish_report(destination, report)
@@ -157,18 +156,6 @@ def test_execution_gate_is_closed_until_plan_review() -> None:
         matched.run_campaign(Path("unused.npz"), Path("unused.json"))
 
 
-def test_public_diagnostic_schedule_cannot_consume_reserved_matched_seed() -> None:
-    inputs = np.linspace(-1.0, 1.0, 32, dtype=np.float32).reshape(8, 4)
-    labels = np.arange(8, dtype=np.int32) % 2
-    with pytest.raises(ValueError, match="frozen, consumed development schedule"):
-        run_adamo_diagnostic(
-            inputs,
-            labels,
-            profile="contract-smoke",
-            seed=matched.SEEDS[0],
-        )
-
-
 def test_student_t_df3_constant_is_exact() -> None:
     assert matched.T95_DF3 == 3.1824463052837078
     assert matched.T95_DF3.hex() == "0x1.975a66893c1a7p+1"
@@ -177,12 +164,7 @@ def test_student_t_df3_constant_is_exact() -> None:
 def test_validator_preflights_hostile_nested_plan_without_dispatch(
     receipts: list[dict[str, object]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _patch_identities(monkeypatch, receipts)
-    report = matched.build_report(
-        receipts,
-        dataset_file_sha256="b" * 64,
-        execution_source_commit="c" * 40,
-    )
+    report = _build_report(receipts, monkeypatch)
 
     class HostileList(list[object]):
         calls = 0
@@ -198,23 +180,19 @@ def test_validator_preflights_hostile_nested_plan_without_dispatch(
     hostile = copy.deepcopy(report)
     hostile["plan"]["arms"] = HostileList(hostile["plan"]["arms"])
     with pytest.raises(ValueError, match="exact JSON"):
-        matched.validate_report(hostile, require_current_source=True)
+        matched.validate_report(hostile, require_current_execution_identity=True)
     assert HostileList.calls == 0
 
 
-def test_validator_binds_execution_commit_to_source_provenance(
+def test_offline_validation_does_not_require_the_execution_runtime(
     receipts: list[dict[str, object]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _patch_identities(monkeypatch, receipts)
-    report = matched.build_report(
-        receipts,
-        dataset_file_sha256="b" * 64,
-        execution_source_commit="c" * 40,
-    )
-    hostile = copy.deepcopy(report)
-    hostile["execution_source_commit"] = "d" * 40
-    with pytest.raises(ValueError, match="does not match source provenance"):
-        matched.validate_report(hostile, require_current_source=False)
+    report = _build_report(receipts, monkeypatch)
+    monkeypatch.setattr(matched, "_current_source_provenance", lambda: {"different": True})
+    monkeypatch.setattr(matched, "_current_runtime_environment", lambda: {"different": True})
+    assert matched.validate_report(report) == report
+    with pytest.raises(ValueError, match="current source"):
+        matched.validate_report(report, require_current_execution_identity=True)
 
 
 def test_build_report_rejects_hostile_sequence_without_hashing_its_metaclass() -> None:
@@ -228,20 +206,16 @@ def test_build_report_rejects_hostile_sequence_without_hashing_its_metaclass() -
     with pytest.raises(ValueError, match="complete frozen seed schedule"):
         matched.build_report(
             HostileSequence(),
-            dataset_file_sha256="a" * 64,
-            execution_source_commit="b" * 40,
+            dataset_provenance={},
+            source_provenance={},
+            runtime_environment={},
         )
 
 
 def test_report_schema_subclass_is_rejected_without_equality_hook(
     receipts: list[dict[str, object]], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_identities(monkeypatch, receipts)
-    report = matched.build_report(
-        receipts,
-        dataset_file_sha256="b" * 64,
-        execution_source_commit="c" * 40,
-    )
+    report = _build_report(receipts, monkeypatch)
 
     class HostileString(str):
         calls = 0
@@ -253,8 +227,27 @@ def test_report_schema_subclass_is_rejected_without_equality_hook(
     hostile = copy.deepcopy(report)
     hostile["schema"] = HostileString(matched.SCHEMA)
     with pytest.raises(ValueError, match="schema"):
-        matched.validate_report(hostile, require_current_source=False)
+        matched.validate_report(hostile)
     assert HostileString.calls == 0
+
+
+def test_dataset_provenance_subclass_is_rejected_before_validator_hooks(
+    receipts: list[dict[str, object]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    report = _build_report(receipts, monkeypatch)
+
+    class HostileDict(dict[object, object]):
+        calls = 0
+
+        def __iter__(self) -> Never:
+            type(self).calls += 1
+            raise AssertionError("must not iterate hostile provenance")
+
+    hostile = copy.deepcopy(report)
+    hostile["dataset_provenance"] = HostileDict(hostile["dataset_provenance"])
+    with pytest.raises(ValueError, match="exact JSON"):
+        matched.validate_report(hostile)
+    assert HostileDict.calls == 0
 
 
 def test_publication_rejects_symlink_parent_without_touching_target(
@@ -262,18 +255,14 @@ def test_publication_rejects_symlink_parent_without_touching_target(
     receipts: list[dict[str, object]],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_identities(monkeypatch, receipts)
-    report = matched.build_report(
-        receipts,
-        dataset_file_sha256="b" * 64,
-        execution_source_commit="c" * 40,
-    )
     real_parent = tmp_path / "real"
     real_parent.mkdir()
     linked_parent = tmp_path / "linked"
     linked_parent.symlink_to(real_parent, target_is_directory=True)
     destination = linked_parent / "report.json"
     monkeypatch.setattr(matched, "OUTPUT_PATH", destination)
+    monkeypatch.setattr(matched, "_EXECUTION_AUTHORIZED", True)
+    report = _build_report(receipts, monkeypatch)
     with pytest.raises(OSError):
         matched.publish_report(destination, report)
     assert not (real_parent / "report.json").exists()

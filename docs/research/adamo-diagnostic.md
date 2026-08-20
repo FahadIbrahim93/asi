@@ -62,13 +62,15 @@ Before a scientific comparison: locate and pin official code or independently ve
 implement the exact paper dataset/task construction, architecture, initialization and full
 diagnostic definitions; qualify the missing model families; freeze a separate preregistered
 protocol and untouched seeds; and establish calibrated compute, memory, and timing gates. The
-public `15600`-`15603` schedule was consumed by executable qualification and is excluded from
-the retained matched screen. The prospectively frozen `25600`-`25603` schedule is unavailable
-through the public diagnostic and can execute through `asi-adamo-matched-development` only after
-a separate authorization review. Any exposed outcome consumes those seeds and can never promote
-a claim. The plan freezes the independently
-reconstructable canonical IPMNIST materialization: OpenML `mnist_784` version 1 rows `0:60000`,
-float32 inputs scaled to `[-1,1]`, and int32 labels. Its input and label array hashes are
-`b8078cd833f53d89828a5e28d728517be9add34076f13fe973399f1f16381313` and
-`4f1dd9551f104f8153409e0add59f0a71568f7bad5a5f8e2274480c186fe219a`; the combined semantic
-digest is `220e4a97a6d345a9f09bbee8e6ba65e8cc117604428392ae08fed2bd8ea0ab27`.
+original `15600`-`15603` schedule was consumed by executable qualification and is excluded from
+the retained matched screen. The exposed `25600`-`25603` preplan roster is also quarantined
+because an earlier test fixture exercised seed `25600`; none of those roots may enter the retained
+matrix. The prospectively frozen, repository-audited `9156001`-`9156004` schedule can execute only
+through `asi-adamo-matched-development` after a separate authorization review. Any exposed
+outcome consumes those seeds and can never promote a claim. The plan also freezes the exact
+OpenML `mnist_784` version 1 rows 0--59999 materialization and records canonical per-array
+dtype, shape, and SHA-256 identities at execution. There is no opaque or unavailable NPZ input.
+Use `--data-home` to select an OpenML cache; it does not change the frozen source selection or
+materialized-array validation. Reports validate structurally against their pinned runtime by
+default, so a GPU-produced report remains auditable on CPU; execution and publication separately
+require an exact current source/runtime match.

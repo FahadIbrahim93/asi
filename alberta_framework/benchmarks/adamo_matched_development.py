@@ -8,47 +8,48 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import hashlib
 import json
 import math
 import os
 import secrets
 import stat
-import subprocess
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final, cast
 
 from alberta_framework.benchmarks.adamo_diagnostic import (
-    ADAMO_MATCHED_DEVELOPMENT_SEEDS,
     ARMS,
-    _load_dataset,
-    _run_adamo_diagnostic_schedule,
+    COMPARISON_ID,
+    FROZEN_MATCHED_DEVELOPMENT_SEEDS,
+    OFFICIAL_CODE,
+    OFFICIAL_CODE_SEARCH_DATE,
+    PAPER_URL,
+    run_adamo_diagnostic,
     validate_adamo_diagnostic,
 )
 from alberta_framework.benchmarks.ipmnist_screening import (
     _screening_dataset_provenance,
     _screening_runtime_environment,
     _screening_source_provenance,
+    _validated_dataset_provenance,
+    _validated_runtime_environment,
+    _validated_source_provenance,
 )
+from alberta_framework.benchmarks.upgd_ipmnist import (
+    default_openml_data_home,
+    load_mnist_train,
+)
+from alberta_framework.core.adamo import ADAMO_PAPER_REVISION
 
 SCHEMA: Final[str] = "asi.adamo-matched-development.report.v1"
 PLAN_ID: Final[str] = "issue-1560-adamo-bounded-development-v1"
 PROFILE: Final[str] = "bounded-development"
-SEEDS: Final[tuple[int, ...]] = ADAMO_MATCHED_DEVELOPMENT_SEEDS
+SEEDS: Final[tuple[int, ...]] = FROZEN_MATCHED_DEVELOPMENT_SEEDS
 CONSUMED_QUALIFICATION_SEEDS: Final[tuple[int, ...]] = (15600, 15601, 15602, 15603)
+QUARANTINED_PREPLAN_SEEDS: Final[tuple[int, ...]] = (25600, 25601, 25602, 25603)
 CONTROL_ARM: Final[str] = "adamw_control"
 CANDIDATE_ARMS: Final[tuple[str, ...]] = ("adamo_l1e3", "adam_iso_joint_l1e3")
 T95_DF3: Final[float] = 3.1824463052837078
-DATASET_SEMANTIC_SHA256: Final[str] = (
-    "220e4a97a6d345a9f09bbee8e6ba65e8cc117604428392ae08fed2bd8ea0ab27"
-)
-DATASET_INPUTS_SHA256: Final[str] = (
-    "b8078cd833f53d89828a5e28d728517be9add34076f13fe973399f1f16381313"
-)
-DATASET_LABELS_SHA256: Final[str] = (
-    "4f1dd9551f104f8153409e0add59f0a71568f7bad5a5f8e2274480c186fe219a"
-)
 DATASET_NUMERIC_BYTES: Final[int] = 188_400_000
 _EXECUTION_AUTHORIZED: Final[bool] = False
 _HEX: Final[frozenset[str]] = frozenset("0123456789abcdef")
@@ -70,15 +71,23 @@ def frozen_plan() -> dict[str, object]:
     """Return the literal plan that must be merged before any execution."""
     return {
         "plan_id": PLAN_ID,
+        "paper_revision": ADAMO_PAPER_REVISION,
+        "paper_url": PAPER_URL,
+        "official_code": OFFICIAL_CODE,
+        "official_code_search_date": OFFICIAL_CODE_SEARCH_DATE,
+        "official_parity_status": "blocked_no_author_maintained_code_located",
+        "comparison_id": COMPARISON_ID,
         "profile": PROFILE,
         "arms": list(ARMS),
         "control_arm": CONTROL_ARM,
         "candidate_arms": list(CANDIDATE_ARMS),
         "seeds": list(SEEDS),
         "consumed_qualification_seeds": list(CONSUMED_QUALIFICATION_SEEDS),
+        "quarantined_preplan_seeds": list(QUARANTINED_PREPLAN_SEEDS),
         "qualification_seed_note": (
             "15600-15603 were exercised by contract qualification and are excluded from "
-            "the retained matched matrix"
+            "the retained matched matrix; the exposed 25600-25603 preplan roster is also "
+            "quarantined because 25600 was exercised by an earlier test fixture"
         ),
         "primary_metric": "mean_online_accuracy",
         "selection_arm": "adamo_l1e3",
@@ -113,11 +122,6 @@ def frozen_plan() -> dict[str, object]:
         "allowed_task_information": ["current_example_label"],
         "diagnostic_information": ["post_task_boundary_index", "fixed_input_row_0"],
         "dataset": {
-            "semantic_sha256": DATASET_SEMANTIC_SHA256,
-            "numeric_bytes": DATASET_NUMERIC_BYTES,
-            "keys": ["inputs", "labels"],
-            "dtypes": ["float32", "int32"],
-            "shapes": [[60000, 784], [60000]],
             "source": {
                 "provider": "openml",
                 "name": "mnist_784",
@@ -125,18 +129,21 @@ def frozen_plan() -> dict[str, object]:
                 "row_start": 0,
                 "row_stop_exclusive": 60000,
             },
-            "materialization_id": "alberta.ipmnist.float32-neg1-pos1-int32-labels.v1",
-            "array_sha256": {
-                "inputs": DATASET_INPUTS_SHA256,
-                "labels": DATASET_LABELS_SHA256,
-            },
+            "numeric_bytes": DATASET_NUMERIC_BYTES,
+            "dtypes": ["<f4", "<i4"],
+            "shapes": [[60000, 784], [60000]],
             "materialization": (
-                "fetch_openml('mnist_784', version=1, as_frame=False), rows 0:60000; "
-                "inputs=np.asarray(data,float32); inputs=(inputs/255-0.5)/0.5; "
-                "labels=np.asarray(target,int32); NPZ transport bytes are recorded but are "
-                "not the semantic dataset identity"
+                "OpenML mnist_784 v1 rows 0:60000; float32 pixels scaled by "
+                "(x / 255 - 0.5) / 0.5 and int32 labels"
             ),
         },
+        "paper_protocol_differences": [
+            "IPMNIST adaptation, not reproduction of a paper task",
+            "784-300-150-10 ReLU MLP instead of the paper depth-4 width-512 MLP",
+            "existing protocol initialization instead of paper orthogonal initialization",
+            "eight tasks of 64 updates instead of a paper training horizon",
+            "no convolutional, RL, transformer, GroupSort, Newton-Schulz, NTK, or rank protocol",
+        ],
         "mechanism_off_reduction": "adamo_inert == adamw_control bit-exact",
         "resource_policy": (
             "observations, updates, data/environment steps, model queries, Jacobian rows, "
@@ -238,22 +245,12 @@ def _bounded_json(value: object, *, context: str) -> object:
     return visit(value, depth=0, label=context)
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(1024 * 1024):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _current_source_provenance() -> dict[str, object]:
     return _screening_source_provenance(_REPO_ROOT)
 
 
 def _current_runtime_environment() -> dict[str, object]:
     return _screening_runtime_environment()
-
-
 def _validate_plan(value: object) -> dict[str, object]:
     expected = frozen_plan()
     plan = _exact_object(value, frozenset(expected), context="plan")
@@ -360,8 +357,9 @@ def _paired_comparison(
 def build_report(
     receipts: Sequence[dict[str, object]],
     *,
-    dataset_file_sha256: str,
-    execution_source_commit: str,
+    dataset_provenance: Mapping[str, object],
+    source_provenance: Mapping[str, object],
+    runtime_environment: Mapping[str, object],
 ) -> dict[str, object]:
     """Build and strictly validate the complete seed-by-arm campaign report."""
     if (type(receipts) is not list and type(receipts) is not tuple) or len(receipts) != len(
@@ -371,7 +369,7 @@ def build_report(
     by_seed: dict[int, dict[str, object]] = {}
     ordered: list[dict[str, object]] = []
     for index, raw_receipt in enumerate(receipts):
-        receipt = validate_adamo_diagnostic(raw_receipt, seed_schedule=SEEDS)
+        receipt = validate_adamo_diagnostic(raw_receipt, require_current_identity=True)
         seed = receipt["seed"]
         if type(seed) is not int or seed != SEEDS[index] or seed in by_seed:
             raise ValueError("receipts must use deterministic frozen seed ordering")
@@ -379,11 +377,19 @@ def build_report(
             raise ValueError("receipt profile does not match the frozen plan")
         by_seed[seed] = receipt
         ordered.append(receipt)
-    semantic_digests = {cast(dict[str, object], item["dataset"])["sha256"] for item in ordered}
-    if len(semantic_digests) != 1:
-        raise ValueError("all receipts must bind one identical semantic dataset")
-    if semantic_digests != {DATASET_SEMANTIC_SHA256}:
-        raise ValueError("receipt semantic dataset does not match the prospectively frozen input")
+    normalized_dataset = _validated_dataset_provenance(
+        dataset_provenance, context="AdamO report"
+    )
+    normalized_source = _validated_source_provenance(
+        source_provenance, context="AdamO report"
+    )
+    normalized_runtime = _validated_runtime_environment(
+        runtime_environment, context="AdamO report"
+    )
+    if normalized_source != _current_source_provenance():
+        raise ValueError("source provenance does not match the current source")
+    if normalized_runtime != _current_runtime_environment():
+        raise ValueError("runtime environment does not match the current runtime")
     source_receipts = [item["source"] for item in ordered]
     runtime_receipts = [item["runtime"] for item in ordered]
     if any(value != source_receipts[0] for value in source_receipts[1:]):
@@ -393,15 +399,9 @@ def build_report(
     report: dict[str, object] = {
         "schema": SCHEMA,
         "plan": frozen_plan(),
-        "dataset_file_sha256": _digest(dataset_file_sha256, context="dataset file sha256"),
-        "dataset_semantic_sha256": _digest(
-            next(iter(semantic_digests)), context="dataset semantic sha256"
-        ),
-        "execution_source_commit": _digest(
-            execution_source_commit, context="execution source commit", length=40
-        ),
-        "source_provenance": _current_source_provenance(),
-        "runtime_environment": _current_runtime_environment(),
+        "dataset_provenance": normalized_dataset,
+        "source_provenance": normalized_source,
+        "runtime_environment": normalized_runtime,
         "runs": ordered,
         "paired_comparisons": {
             candidate: _paired_comparison(by_seed, candidate) for candidate in CANDIDATE_ARMS
@@ -417,24 +417,25 @@ def build_report(
     comparisons = cast(dict[str, object], report["paired_comparisons"])
     primary_comparison = cast(dict[str, object], comparisons["adamo_l1e3"])
     report["development_disposition"] = primary_comparison["outcome"]
-    return validate_report(report, require_current_source=True)
+    return validate_report(report, require_current_execution_identity=True)
 
 
 def validate_report(
-    payload: object, *, require_current_source: bool = True
+    payload: object, *, require_current_execution_identity: bool = False
 ) -> dict[str, object]:
-    """Fail closed over completeness, identities, resources, and paired arithmetic."""
-    if type(require_current_source) is not bool:
-        raise ValueError("require_current_source must be an exact bool")
+    """Validate a retained report offline, optionally requiring this execution identity."""
+    if type(require_current_execution_identity) is not bool:
+        raise ValueError("require_current_execution_identity must be an exact bool")
+    if type(payload) is not dict:
+        raise TypeError("report must be an exact dict")
+    normalized_payload = _bounded_json(payload, context="report")
     report = _exact_object(
-        payload,
+        normalized_payload,
         frozenset(
             {
                 "schema",
                 "plan",
-                "dataset_file_sha256",
-                "dataset_semantic_sha256",
-                "execution_source_commit",
+                "dataset_provenance",
                 "source_provenance",
                 "runtime_environment",
                 "runs",
@@ -448,20 +449,18 @@ def validate_report(
     if type(report["schema"]) is not str or report["schema"] != SCHEMA:
         raise ValueError("report schema does not match the frozen protocol")
     _validate_plan(report["plan"])
-    _digest(report["dataset_file_sha256"], context="dataset file sha256")
-    semantic = _digest(report["dataset_semantic_sha256"], context="dataset semantic sha256")
-    if semantic != DATASET_SEMANTIC_SHA256:
-        raise ValueError("report dataset does not match the prospectively frozen input")
-    _digest(report["execution_source_commit"], context="execution source commit", length=40)
-    source = _bounded_json(report["source_provenance"], context="source provenance")
-    runtime = _bounded_json(report["runtime_environment"], context="runtime environment")
-    if type(source) is not dict or type(runtime) is not dict:
-        raise ValueError("source and runtime identities must be exact objects")
-    if source.get("git_commit") != report["execution_source_commit"]:
-        raise ValueError("execution commit does not match source provenance")
-    if require_current_source and source != _current_source_provenance():
+    dataset_provenance = _validated_dataset_provenance(
+        report["dataset_provenance"], context="AdamO report"
+    )
+    source = _validated_source_provenance(
+        report["source_provenance"], context="AdamO report"
+    )
+    runtime = _validated_runtime_environment(
+        report["runtime_environment"], context="AdamO report"
+    )
+    if require_current_execution_identity and source != _current_source_provenance():
         raise ValueError("report source provenance does not match current source")
-    if require_current_source and runtime != _current_runtime_environment():
+    if require_current_execution_identity and runtime != _current_runtime_environment():
         raise ValueError("report runtime environment does not match the current runtime")
     policy = _exact_object(
         report["policy"],
@@ -486,16 +485,46 @@ def validate_report(
     if type(runs) is not list or len(runs) != len(SEEDS):
         raise ValueError("runs must contain the complete frozen seed schedule")
     by_seed: dict[int, dict[str, object]] = {}
+    run_source_identity: object | None = None
+    combined_dataset_identity: object | None = None
     for index, raw_run in enumerate(runs):
-        run = validate_adamo_diagnostic(raw_run, seed_schedule=SEEDS)
+        run = validate_adamo_diagnostic(
+            raw_run, require_current_identity=require_current_execution_identity
+        )
         seed = run["seed"]
         if type(seed) is not int or seed != SEEDS[index] or seed in by_seed:
             raise ValueError("runs must use deterministic frozen seed ordering")
         if run["profile"] != PROFILE:
             raise ValueError("run profile does not match the frozen plan")
-        dataset = cast(dict[str, object], run["dataset"])
-        if dataset["sha256"] != semantic:
-            raise ValueError("run semantic dataset identity does not match the aggregate")
+        run_dataset = cast(dict[str, object], run["dataset"])
+        x_binding = cast(dict[str, object], dataset_provenance["x"])
+        y_binding = cast(dict[str, object], dataset_provenance["y"])
+        if (
+            run_dataset["x_sha256"] != x_binding["sha256"]
+            or run_dataset["y_sha256"] != y_binding["sha256"]
+            or run_dataset["rows"] != cast(list[int], x_binding["shape"])[0]
+        ):
+            raise ValueError("run dataset identity does not match the aggregate")
+        if combined_dataset_identity is None:
+            combined_dataset_identity = run_dataset["sha256"]
+        elif run_dataset["sha256"] != combined_dataset_identity:
+            raise ValueError("runs do not bind one combined dataset identity")
+        if run_source_identity is None:
+            run_source_identity = run["source"]
+        elif run["source"] != run_source_identity:
+            raise ValueError("runs do not bind one diagnostic source identity")
+        run_runtime = cast(dict[str, object], run["runtime"])
+        python_binding = cast(dict[str, object], runtime["python"])
+        packages = cast(dict[str, object], runtime["packages"])
+        jax_binding = cast(dict[str, object], runtime["jax"])
+        expected_run_runtime = {
+            "python": python_binding["version"],
+            "jax": packages["jax"],
+            "numpy": packages["numpy"],
+            "backend": jax_binding["backend"],
+        }
+        if run_runtime != expected_run_runtime:
+            raise ValueError("run runtime identity does not match the aggregate")
         by_seed[seed] = run
     paired = _exact_object(
         report["paired_comparisons"], frozenset(CANDIDATE_ARMS), context="paired comparisons"
@@ -667,68 +696,47 @@ def _publish_reserved(reservation: _OutputReservation, report: dict[str, object]
 
 def publish_report(path: Path, report: object) -> Path:
     """Reserve, validate, and no-replace publish one immutable generation."""
+    if not _EXECUTION_AUTHORIZED:
+        raise RuntimeError("AdamO matched-development publication is not authorized")
     reservation = _reserve_output(path)
     try:
-        validated = validate_report(report, require_current_source=True)
+        validated = validate_report(report, require_current_execution_identity=True)
         _publish_reserved(reservation, validated)
     finally:
         _release_reservation(reservation)
     return path
 
 
-def _execution_commit() -> str:
-    completed = subprocess.run(
-        ("git", "rev-parse", "HEAD"),
-        cwd=_REPO_ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return _digest(completed.stdout.strip(), context="execution source commit", length=40)
-
-
-def run_campaign(dataset_path: Path, output_path: Path = OUTPUT_PATH) -> dict[str, object]:
+def run_campaign(
+    data_home: Path, output_path: Path = OUTPUT_PATH
+) -> dict[str, object]:
     """Execute exactly once after the separately reviewed authorization change."""
     if not _EXECUTION_AUTHORIZED:
         raise RuntimeError("AdamO matched-development execution is not authorized")
-    if type(dataset_path) is not type(Path()) or type(output_path) is not type(Path()):
-        raise ValueError("dataset and output paths must be exact pathlib.Path values")
+    if type(data_home) is not type(Path()) or type(output_path) is not type(Path()):
+        raise ValueError("data home and output paths must be exact pathlib.Path values")
     if output_path.absolute() != OUTPUT_PATH.absolute():
         raise ValueError(f"output path must be the reserved NEW path {OUTPUT_PATH}")
     reservation = _reserve_output(output_path)
     try:
-        dataset_file_sha256 = _sha256_file(dataset_path)
         source_before = _current_source_provenance()
         runtime_before = _current_runtime_environment()
-        inputs, labels = _load_dataset(dataset_path)
-        dataset_provenance = _screening_dataset_provenance(inputs, labels)
-        dataset_x = cast(dict[str, object], dataset_provenance["x"])
-        dataset_y = cast(dict[str, object], dataset_provenance["y"])
-        if (
-            dataset_x.get("sha256") != DATASET_INPUTS_SHA256
-            or dataset_y.get("sha256") != DATASET_LABELS_SHA256
-        ):
-            raise ValueError("dataset arrays do not match the prospectively frozen input")
-        if _sha256_file(dataset_path) != dataset_file_sha256:
-            raise RuntimeError("dataset container changed while it was loaded")
+        inputs, labels = load_mnist_train(data_home)
+        dataset_before = _screening_dataset_provenance(inputs, labels)
         receipts = [
-            _run_adamo_diagnostic_schedule(
-                inputs,
-                labels,
-                profile=PROFILE,
-                seed=seed,
-                seed_schedule=SEEDS,
-            )
-            for seed in SEEDS
+            run_adamo_diagnostic(inputs, labels, profile=PROFILE, seed=seed) for seed in SEEDS
         ]
         if source_before != _current_source_provenance():
             raise RuntimeError("source identity changed during matched execution")
         if runtime_before != _current_runtime_environment():
             raise RuntimeError("runtime identity changed during matched execution")
+        if dataset_before != _screening_dataset_provenance(inputs, labels):
+            raise RuntimeError("dataset identity changed during matched execution")
         report = build_report(
             receipts,
-            dataset_file_sha256=dataset_file_sha256,
-            execution_source_commit=_execution_commit(),
+            dataset_provenance=dataset_before,
+            source_provenance=source_before,
+            runtime_environment=runtime_before,
         )
         _publish_reserved(reservation, report)
         return report
@@ -739,17 +747,12 @@ def run_campaign(dataset_path: Path, output_path: Path = OUTPUT_PATH) -> dict[st
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--catalog", action="store_true")
-    parser.add_argument("--dataset", type=Path)
-    parser.add_argument("--output", type=Path, default=OUTPUT_PATH)
+    parser.add_argument("--data-home", type=Path, default=default_openml_data_home())
     args = parser.parse_args(argv)
     if args.catalog:
-        if args.dataset is not None:
-            parser.error("--catalog and --dataset are mutually exclusive")
         print(json.dumps(frozen_plan(), sort_keys=True))
         return 0
-    if args.dataset is None:
-        parser.error("--dataset is required unless --catalog is used")
-    run_campaign(args.dataset, args.output)
+    run_campaign(args.data_home)
     return 0
 
 
