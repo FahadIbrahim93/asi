@@ -1039,12 +1039,15 @@ def publish_json(path: Path, value: object, *, root: Path) -> None:
         raise TypeError("path and root must be exact Paths")
     if not _allowed_path(path, root):
         _fail("destination is outside the fixed campaign namespace")
-    if path == campaign_path(root, "plan"):
-        validate_plan_document(value)
-    elif path == campaign_path(root, "aggregate"):
-        validate_bimu_aggregate(value)
-    else:
-        validate_bimu_shard(value)
+    def validate(candidate: object) -> None:
+        if path == campaign_path(root, "plan"):
+            validate_plan_document(candidate)
+        elif path == campaign_path(root, "aggregate"):
+            validate_bimu_aggregate(candidate)
+        else:
+            validate_bimu_shard(candidate)
+
+    validate(value)
     raw = _canonical(value) + b"\n"
     destination, parent_fd = _open_output_parent(path)
     file_fd: int | None = None
@@ -1087,6 +1090,51 @@ def publish_json(path: Path, value: object, *, root: Path) -> None:
             raise FileExistsError(
                 f"refusing to replace existing campaign artifact: {destination}"
             ) from error
+        read_descriptor = os.open(
+            destination.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        try:
+            source_stat = os.fstat(file_fd)
+            before = os.fstat(read_descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_nlink != 1
+                or (before.st_dev, before.st_ino) != (source_stat.st_dev, source_stat.st_ino)
+                or before.st_size != len(raw)
+            ):
+                raise RuntimeError("published campaign artifact is not the prepared inode")
+            loaded = bytearray()
+            while len(loaded) <= len(raw):
+                chunk = os.read(read_descriptor, min(64 * 1024, len(raw) + 1 - len(loaded)))
+                if not chunk:
+                    break
+                loaded.extend(chunk)
+            after = os.fstat(read_descriptor)
+        finally:
+            os.close(read_descriptor)
+
+        def identity(item: os.stat_result) -> tuple[int, int, int, int, int]:
+            return (
+                item.st_dev,
+                item.st_ino,
+                item.st_size,
+                item.st_mtime_ns,
+                item.st_ctime_ns,
+            )
+
+        if bytes(loaded) != raw or identity(before) != identity(after):
+            raise RuntimeError("published campaign artifact changed during bounded readback")
+        try:
+            decoded = json.loads(
+                loaded,
+                object_pairs_hook=_json_object_pairs,
+                parse_constant=lambda token: _fail(f"invalid JSON constant: {token}"),
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+            raise RuntimeError("published campaign artifact is not strict JSON") from exc
+        validate(decoded)
         os.fsync(parent_fd)
     finally:
         if file_fd is not None:
@@ -1123,7 +1171,10 @@ def _validate_namespace(
         for seed in FROZEN_BIMU_MATCHED_PLAN.seeds
         for arm in _ARMS
     }
-    observed_shards = {entry.name for entry in shards_directory.iterdir()}
+    shard_entries = list(shards_directory.iterdir())
+    if any(entry.is_symlink() or not entry.is_file() for entry in shard_entries):
+        _fail("campaign shard namespace entries must be regular non-symlink files")
+    observed_shards = {entry.name for entry in shard_entries}
     if require_complete_shards:
         if observed_shards != expected_shards:
             _fail("campaign shard namespace is not the exact complete roster")
@@ -1243,6 +1294,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "shards": [],
             "aggregate": None,
         }
+        shards: list[dict[str, object]] = []
         if any_shards:
             arrays = load_frozen_bimu_dataset(args.data_home)
             shards = _load_shards(root, arrays)
@@ -1251,6 +1303,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             aggregate = validate_bimu_aggregate(
                 load_json_strict(aggregate_path, byte_ceiling=MAX_AGGREGATE_BYTES)
             )
+            if any_shards and aggregate["shards"] != shards:
+                _fail("aggregate does not contain the exact retained shard roster")
             result["aggregate"] = aggregate["aggregate_sha256"]
         _print_json(result)
         return 0

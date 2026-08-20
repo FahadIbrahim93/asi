@@ -301,6 +301,29 @@ def test_publication_is_read_only_and_rejects_symlinked_parent(tmp_path: Path) -
     assert not campaign.campaign_path(redirected, "plan").exists()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_publication_revalidates_readback_without_unlinking_visible_inode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    plan_path = campaign.campaign_path(tmp_path, "plan")
+    document = campaign.build_plan_document()
+    original = campaign.validate_plan_document
+    calls = 0
+
+    def fail_readback(value: object) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise ValueError("simulated readback rejection")
+        return original(value)
+
+    monkeypatch.setattr(campaign, "validate_plan_document", fail_readback)
+    with pytest.raises(ValueError, match="readback rejection"):
+        campaign.publish_json(plan_path, document, root=tmp_path)
+    assert plan_path.is_file()
+    assert plan_path.stat().st_mode & 0o777 == 0o444
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign file validation is Linux-only")
 def test_strict_loader_rejects_duplicate_keys_and_oversized_input(tmp_path: Path) -> None:
     duplicate = tmp_path / "duplicate.json"
