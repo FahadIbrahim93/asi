@@ -9,7 +9,7 @@ COPY coom-gymnasium.patch /tmp/coom-gymnasium.patch
 
 RUN printf '%s  %s\n' "$COOM_ARCHIVE_SHA256" /tmp/coom.tar.gz | sha256sum --check --strict \
     && printf '%s  %s\n' \
-       '08fbb5c0554ce3537a5b44941ca6180979fec38092c5fd8bacb954e11b856baa' \
+       '25bc846908e573ff1c7d02909a9bb895570e0beafe1a928dbd0d5fd4b63835a7' \
        /tmp/coom-gymnasium.patch | sha256sum --check --strict \
     && mkdir /opt/coom \
     && tar --extract --gzip --file /tmp/coom.tar.gz --directory /opt/coom --strip-components=1 \

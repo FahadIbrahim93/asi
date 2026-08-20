@@ -25,7 +25,7 @@ SOURCE_TREE = "6e935b4ad6f3e52280de871e56937071aa5cd13f"
 SOURCE_ARCHIVE_SHA256 = "a4736e9916468482d75831d53a12a8601c4da91cd40b9b24d313522034a15661"
 SOURCE_LICENSE_SHA256 = "47c8691ec5399bc8c58bcfaf0ba43b4ff48e6917c894c03748e3e0d14345d649"
 SOURCE_ASSET_MANIFEST_SHA256 = "deaa00979139cf80055f9d04d65800abc78c4feb11e061274e1a4486f9fa6cab"
-PATCH_SHA256 = "08fbb5c0554ce3537a5b44941ca6180979fec38092c5fd8bacb954e11b856baa"
+PATCH_SHA256 = "25bc846908e573ff1c7d02909a9bb895570e0beafe1a928dbd0d5fd4b63835a7"
 PATCHED_REWARD_WRAPPER_SHA256 = (
     "0ab457a6bc95dc2551b2c81608d1619549e56ced47e2c85949c39b87b8b5a8cf"
 )
@@ -196,7 +196,7 @@ def main() -> None:
             "performance_metrics_computed": False,
             "paper_parity_claimed": False,
             "scientific_promotion_allowed": False,
-            "negative_outcome_retained": True,
+            "negative_outcome_retained": False,
         },
     }
     json.dump(receipt, sys.stdout, sort_keys=True, separators=(",", ":"))
