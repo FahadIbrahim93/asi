@@ -90,7 +90,7 @@ CAMPAIGN_PAPER_SOURCES: Final[Mapping[str, Mapping[str, str]]] = {
         "official_repository": "none located",
         "official_commit": "none",
         "license_status": "not applicable",
-        "implementation_source": "paper Algorithm 1 and Property 1",
+        "implementation_source": "paper Algorithm 2 simplified element-wise rule",
     },
     "deep_fourier": {
         "publication": "ICLR-2025:NIkfix2eDQ",
@@ -432,7 +432,13 @@ def _policy(stage: str) -> dict[str, object]:
         "permanently_nonpromoting": True,
         "scientific_promotion_allowed": False,
         "reference_dev_update_allowed": False,
-        "negative_results_retained": True,
+        "completed_shard_negative_results_retained": True,
+        "execution_failure_receipts_retained": False,
+        "execution_failure_note": (
+            "an execution failure does not produce a result shard; the failed matrix is "
+            "incomplete and cannot be aggregated, and the external scheduler must retain "
+            "its failure log before any separately authorized retry"
+        ),
         "timing_is_telemetry_only": True,
         "execution_attestation": False,
         "cross_stage_seed_reuse": False,
@@ -558,7 +564,7 @@ def _resource_plan(stage: str, n_train: int) -> dict[str, object]:
             "model_queries": 2 * steps,
             "allocated_parameter_scalars": allocated,
             "persistent_numeric_bytes": 4 * (allocated + 2 * config.input_dim + 1),
-            "peak_schedule_working_bytes": schedule_bytes,
+            "retained_schedule_numeric_bytes": schedule_bytes,
         },
         "matrix_totals": {
             "data_steps": shards * steps,
@@ -1047,7 +1053,7 @@ def _resource_summary(shards: Sequence[dict[str, object]]) -> dict[str, object]:
                 "allocated_parameter_scalars",
                 "active_parameter_scalars",
                 "persistent_numeric_bytes",
-                "peak_schedule_working_bytes",
+                "retained_schedule_numeric_bytes",
             )
         },
         "timing_seconds_total_telemetry_only": math.fsum(

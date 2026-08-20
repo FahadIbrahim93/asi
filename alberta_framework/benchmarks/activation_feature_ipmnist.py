@@ -325,7 +325,7 @@ def activation_feature_spec(name: object) -> ScreeningSpec:
 def _preflight_activation_feature_resources(
     config: IPMNISTConfig, *, n_train: int | None = None
 ) -> int:
-    """Reject schedules that exceed the lane's bounded persistent envelope."""
+    """Reject retained schedule payloads outside the lane's bounded envelope."""
     sampled_width = config.task_length if n_train is None else n_train
     if type(sampled_width) is not int or sampled_width < 1:
         raise ValueError("activation/feature training-row count must be positive")
@@ -385,7 +385,7 @@ class ActivationFeatureRunResult:
     source_identity: tuple[str, str, str]
     runtime_identity: tuple[str, str, str, str]
     n_train: int
-    peak_schedule_working_bytes: int
+    retained_schedule_numeric_bytes: int
 
     @property
     def config_name(self) -> str:
@@ -445,7 +445,7 @@ def run_activation_feature_arm(
     host_y = _host_array(data_y, name="data_y", dtype=np.dtype(np.int32))
     if host_x.ndim != 2 or host_y.ndim != 1 or host_x.shape[0] != host_y.shape[0]:
         raise ValueError("activation/feature data must be matched rank-2/rank-1 arrays")
-    peak_schedule_bytes = _preflight_activation_feature_resources(
+    retained_schedule_bytes = _preflight_activation_feature_resources(
         config, n_train=int(host_x.shape[0])
     )
     root = jr.key(np.uint32(seed), impl="threefry2x32")
@@ -463,7 +463,7 @@ def run_activation_feature_arm(
         source_identity=_current_source_identity(),
         runtime_identity=_runtime_identity(),
         n_train=int(host_x.shape[0]),
-        peak_schedule_working_bytes=peak_schedule_bytes,
+        retained_schedule_numeric_bytes=retained_schedule_bytes,
     )
 
 
@@ -506,7 +506,7 @@ _RESOURCE_FIELDS = frozenset(
         "sigmoid_evaluations",
         "trigonometric_evaluations",
         "persistent_numeric_bytes",
-        "peak_schedule_working_bytes",
+        "retained_schedule_numeric_bytes",
         "timing_seconds",
         "timing_is_telemetry_only",
     }
@@ -680,7 +680,7 @@ def _activation_feature_result_payload(
             "sigmoid_evaluations": sigmoid_evaluations,
             "trigonometric_evaluations": trig_evaluations,
             "persistent_numeric_bytes": 4 * (allocated + 2 * config.input_dim + 1),
-            "peak_schedule_working_bytes": result.peak_schedule_working_bytes,
+            "retained_schedule_numeric_bytes": result.retained_schedule_numeric_bytes,
             "timing_seconds": float(result.wall_clock_seconds),
             "timing_is_telemetry_only": True,
         },
@@ -802,7 +802,7 @@ def _validate_activation_feature_result(
         or not validated_config.task_length <= n_train_value <= _MAX_STEPS
     ):
         raise ValueError("n_train must be an exact bounded dataset row count")
-    peak_schedule_bytes = _preflight_activation_feature_resources(
+    retained_schedule_bytes = _preflight_activation_feature_resources(
         validated_config, n_train=n_train_value
     )
     hp = _exact_dict(root["hyperparameters"], frozenset(spec.hyperparameters), "hyperparameters")
@@ -893,7 +893,7 @@ def _validate_activation_feature_result(
         "sigmoid_evaluations": sigmoid_evaluations,
         "trigonometric_evaluations": trig_evaluations,
         "persistent_numeric_bytes": 4 * (allocated + 2 * input_dim + 1),
-        "peak_schedule_working_bytes": peak_schedule_bytes,
+        "retained_schedule_numeric_bytes": retained_schedule_bytes,
     }
     for name, expected in expected_resources.items():
         if resources[name] != expected:

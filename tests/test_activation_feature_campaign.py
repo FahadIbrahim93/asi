@@ -77,7 +77,7 @@ def _receipt(
         source_identity=activation._current_source_identity(),
         runtime_identity=activation._runtime_identity(),
         n_train=data[0].shape[0],
-        peak_schedule_working_bytes=activation._preflight_activation_feature_resources(
+        retained_schedule_numeric_bytes=activation._preflight_activation_feature_resources(
             config, n_train=data[0].shape[0]
         ),
     )
@@ -216,6 +216,15 @@ def test_plan_binds_exact_source_runtime_dataset_resources_and_paper_limits(
     parity = cast(dict[str, Any], cheap_plan["paper_parity"])
     assert parity["paper_protocol_parity_claimed"] is False
     assert parity["paper_result_reproduction_claimed"] is False
+    assert parity["sources"]["aid"]["implementation_source"] == (
+        "paper Algorithm 2 simplified element-wise rule"
+    )
+    policy = cast(dict[str, Any], cheap_plan["policy"])
+    assert policy["completed_shard_negative_results_retained"] is True
+    assert policy["execution_failure_receipts_retained"] is False
+    assert "incomplete" in policy["execution_failure_note"]
+    per_shard = cast(dict[str, Any], resources["per_shard"])
+    assert per_shard["retained_schedule_numeric_bytes"] == 4 * 2 * (784 + 5_000)
 
 
 def test_plan_rejects_noncanonical_dataset_metadata_before_hashing(
@@ -390,6 +399,23 @@ def test_full_gate_runs_before_any_arm_execution(
             seed=campaign.FULL_CONFIRMATION_SEEDS[0],
         )
     assert calls == 0
+
+
+def test_execution_failure_is_not_misrepresented_as_a_retained_result_shard(
+    cheap_plan: dict[str, object],
+    data: tuple[np.ndarray, np.ndarray],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failed_execution(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("simulated execution failure")
+
+    monkeypatch.setattr(campaign, "run_activation_feature_arm", failed_execution)
+    with pytest.raises(RuntimeError, match="simulated execution failure"):
+        campaign.build_shard(cheap_plan, *data, arm="aid", seed=0)
+
+    policy = cast(dict[str, object], cheap_plan["policy"])
+    assert policy["execution_failure_receipts_retained"] is False
+    assert policy["completed_shard_negative_results_retained"] is True
 
 
 def test_aggregate_rejects_missing_duplicate_and_self_consistent_statistic_forgery(

@@ -277,7 +277,7 @@ def test_receipt_rejects_config_whose_schedule_cannot_execute() -> None:
         validate_activation_feature_result(payload)
 
 
-def test_receipt_rejects_forged_current_identity_and_peak_schedule_bytes() -> None:
+def test_receipt_rejects_forged_identity_and_retained_schedule_bytes() -> None:
     x, y = _data()
     payload = activation_feature_result_payload(
         run_activation_feature_arm(x, y, arm="aid", seed=0, config=SMALL),
@@ -288,8 +288,8 @@ def test_receipt_rejects_forged_current_identity_and_peak_schedule_bytes() -> No
     with pytest.raises(ValueError, match="current runtime identity"):
         validate_activation_feature_result(forged_runtime)
     forged_peak = copy.deepcopy(payload)
-    forged_peak["resources"]["peak_schedule_working_bytes"] = 1
-    with pytest.raises(ValueError, match="peak_schedule_working_bytes"):
+    forged_peak["resources"]["retained_schedule_numeric_bytes"] = 1
+    with pytest.raises(ValueError, match="retained_schedule_numeric_bytes"):
         validate_activation_feature_result(forged_peak)
 
 

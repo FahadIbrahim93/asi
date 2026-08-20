@@ -44,7 +44,7 @@ contains every registered arm exactly once for one seed; its validator requires
 identical configuration, observation/update/query counts, parameter allocation,
 persistent numeric bytes, and learner-visible information. The learner receives
 the current example label but no task-boundary identifier. Receipts allow only
-`supported`, `rejected`, or `inconclusive`, retain every outcome permanently,
+`supported`, `rejected`, or `inconclusive`, retain every completed outcome permanently,
 and can never authorize scientific promotion.
 
 The receipt keeps ASI whole-stream metrics separate and explicitly says that
@@ -77,7 +77,8 @@ the gate never authorizes a selected-candidate subset.
 
 Each plan binds the exact MNIST bytes, current implementation sources,
 Python/JAX/dependency/runtime identity, configuration, schedule-derived receipt
-identity, resource schedule, and output namespace. Shard receipts use the
+identity, retained schedule numeric-byte bound, resource schedule, and output namespace.
+Shard receipts use the
 `asi.activation_feature_ipmnist.result.v1` contract for the cheap screen and
 `asi.activation_feature_ipmnist.result.v2` for full confirmation. Every shard
 binds an immutable plan digest, and aggregation does not reinterpret its
@@ -90,7 +91,9 @@ with 4 degrees of freedom uses Bonferroni alpha `0.05 / 8` (critical value
 `5.261057575065803`). A simultaneous interval wholly above zero is
 `supported`, wholly below zero is `rejected`, and every other result is
 `inconclusive`. These are permanently nonpromoting development outcomes. The
-aggregate retains every shard, decision, resource count, and negative outcome;
+aggregate retains every completed shard, decision, resource count, and completed negative
+outcome. An execution failure produces no result shard, leaves the matrix incomplete, and
+must be retained by the external scheduler before any separately authorized retry;
 timing is telemetry only and consistency hashes are not execution attestation.
 
 Canonical append-only namespaces are:
