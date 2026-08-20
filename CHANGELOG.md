@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Added the execution-gated `asi-bimu-matched-development` campaign for the
+  bounded five-task BiMU mechanism-on versus memory-off comparison. Its fixed
+  six-shard namespace, fresh-process roster, paired outcome rule, validators,
+  and resource/provenance bindings are permanently nonpromoting and not
+  paper-comparable; execution remains explicitly unauthorized.
 - Added the unfrozen `preview1` reference-agent transaction ledger, primitive
   Prototype adapter, aggregate SwitchingTwoState/RiverSwim life runner, and
   development-only quiescent checkpoint codec. These L0 mechanisms enforce

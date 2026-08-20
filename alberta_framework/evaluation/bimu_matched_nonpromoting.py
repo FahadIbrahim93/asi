@@ -20,13 +20,16 @@ import numpy as np
 
 from alberta_framework.benchmarks.bimu import BiMUConfig, _dataset_sha256
 
-PLAN_SCHEMA: Final = "asi.bimu.matched-development-plan.v2"
+PLAN_SCHEMA: Final = "asi.bimu.matched-development-plan.v3"
 MANIFEST_SCHEMA: Final = "asi.bimu.matched-development-execution-manifest.v1"
+OUTPUT_NAMESPACE: Final = Path("outputs/bimu_matched/development.v1")
+EXECUTION_AUTHORIZED: Final = False
 _MAX_JSON_NODES = 20_000
 _MAX_TEXT_BYTES = 4096
 _MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 _MAX_DATASET_BYTES = 16 * 1024 * 1024
 _DIGEST = "85c681c2f5fc5c274870b30c9accb3d2a6e9eb90a4575a2bf1ccca64f58b6227"
+FROZEN_PLAN_SHA256: Final = "11ddfacd0aca8108a39bd8a68225149de246efb7420d2fdb864f36ea75681f71"
 
 INVALID_PRIOR_ATTEMPT: Final[Mapping[str, object]] = MappingProxyType({
     "pull_request": 1686,
@@ -243,7 +246,7 @@ def _plan_payload(plan: BiMUMatchedDevelopmentPlan) -> dict[str, object]:
             "label_queries": label_queries,
             "optimizer_seen": observations,
             "model_forward_queries": model_forward_queries,
-            "optimizer_updates_rule": "reported_nonzero_gradient_subcount_at_most_label_queries",
+            "optimizer_updates": observations,
         },
         "expected_resources_per_arm": {
             "trainable_scalar_count": config.trainable_scalar_count,
@@ -264,7 +267,28 @@ def _plan_payload(plan: BiMUMatchedDevelopmentPlan) -> dict[str, object]:
         },
         "primary_metric": "paper_late_five_test_accuracy",
         "secondary_metric": "asi_whole_stream_online_accuracy",
+        "paired_outcome_rule": {
+            "schema": "asi.bimu.paired-outcome-rule.v1",
+            "metric": "paper_late_five_test_accuracy",
+            "supported": "all_three_paired_deltas_strictly_positive",
+            "rejected": "all_three_paired_deltas_nonpositive",
+            "otherwise": "inconclusive",
+            "ties_are_positive": False,
+            "secondary_metric_affects_outcome": False,
+        },
+        "output_namespace": str(OUTPUT_NAMESPACE),
+        "execution_authorized": EXECUTION_AUTHORIZED,
     }
+
+
+def frozen_plan_payload() -> dict[str, object]:
+    """Return the literal plan only when its preregistered digest still matches."""
+
+    payload = _plan_payload(FROZEN_BIMU_MATCHED_PLAN)
+    observed = hashlib.sha256(_canonical(payload)).hexdigest()
+    if observed != FROZEN_PLAN_SHA256:
+        raise RuntimeError("frozen BiMU plan payload drifted from its literal digest")
+    return payload
 
 
 def _repository_root() -> Path:
@@ -277,7 +301,8 @@ def _source_identity() -> dict[str, str]:
         Path("alberta_framework/benchmarks/bimu.py"),
         Path("alberta_framework/benchmarks/upgd_ipmnist.py"),
         Path("alberta_framework/evaluation/bimu_matched_nonpromoting.py"),
-        Path("uv.lock"),
+        Path("alberta_framework/evaluation/bimu_matched_campaign.py"),
+        Path("pyproject.toml"),
     )
     return {str(path): hashlib.sha256((root / path).read_bytes()).hexdigest() for path in paths}
 
@@ -322,6 +347,18 @@ def _runtime_identity() -> dict[str, object]:
             "jax_threefry_partitionable": jax.config.jax_threefry_partitionable,
         },
         "environment": {name: os.environ.get(name) for name in environment_names},
+    }
+
+
+def _dependency_identity() -> dict[str, object]:
+    root = _repository_root()
+    return {
+        "schema": "asi.bimu.matched-dependencies.v1",
+        "packages": {
+            name: importlib.metadata.version(name)
+            for name in ("chex", "jax", "jaxlib", "numpy", "scikit-learn")
+        },
+        "uv_lock_sha256": hashlib.sha256((root / "uv.lock").read_bytes()).hexdigest(),
     }
 
 

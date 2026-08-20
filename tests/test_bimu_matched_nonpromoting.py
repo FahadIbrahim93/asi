@@ -8,6 +8,7 @@ import pytest
 import alberta_framework.evaluation.bimu_matched_nonpromoting as bimu_plan
 from alberta_framework.evaluation.bimu_matched_nonpromoting import (
     FROZEN_BIMU_MATCHED_PLAN,
+    FROZEN_PLAN_SHA256,
     INVALID_PRIOR_ATTEMPT,
     _plan_payload,
     build_bimu_execution_manifest,
@@ -31,11 +32,13 @@ def test_frozen_bimu_plan_is_matched_and_prospective() -> None:
     candidate = plan.candidate_config.to_protocol_payload()
     assert {key for key in control if control[key] != candidate[key]} == {"memory_window"}
     assert plan.dataset_sha256 == "85c681c2f5fc5c274870b30c9accb3d2a6e9eb90a4575a2bf1ccca64f58b6227"
+    assert FROZEN_PLAN_SHA256 == "11ddfacd0aca8108a39bd8a68225149de246efb7420d2fdb864f36ea75681f71"
     assert INVALID_PRIOR_ATTEMPT["pull_request"] == 1686
     assert INVALID_PRIOR_ATTEMPT["seed"] == 23
     payload = _plan_payload(plan)
     assert payload["expected_counters_per_arm"]["observations"] == 1280
     assert payload["expected_counters_per_arm"]["model_forward_queries"] == 10240
+    assert payload["expected_counters_per_arm"]["optimizer_updates"] == 1280
     assert payload["expected_resources_per_arm"] == {
         "trainable_scalar_count": 25408,
         "parameter_numeric_bytes": 101632,
@@ -48,6 +51,17 @@ def test_frozen_bimu_plan_is_matched_and_prospective() -> None:
         "numeric_resource_ceiling_bytes": 256 * 1024 * 1024,
     }
     assert payload["comparison_scope"]["paper_comparable"] is False
+    assert payload["execution_authorized"] is False
+    assert payload["output_namespace"] == "outputs/bimu_matched/development.v1"
+    assert payload["paired_outcome_rule"] == {
+        "schema": "asi.bimu.paired-outcome-rule.v1",
+        "metric": "paper_late_five_test_accuracy",
+        "supported": "all_three_paired_deltas_strictly_positive",
+        "rejected": "all_three_paired_deltas_nonpositive",
+        "otherwise": "inconclusive",
+        "ties_are_positive": False,
+        "secondary_metric_affects_outcome": False,
+    }
     with pytest.raises(TypeError):
         INVALID_PRIOR_ATTEMPT["seed"] = 157001  # type: ignore[index]
 
@@ -114,3 +128,11 @@ def test_manifest_rejects_hostile_metaclass_without_hooks() -> None:
     with pytest.raises(ValueError, match="exact JSON"):
         bimu_plan._json_preflight({"value": Hostile()})
     assert HostileMeta.calls == 0
+
+
+def test_literal_plan_digest_fails_closed_on_unreviewed_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(bimu_plan, "EXECUTION_AUTHORIZED", True)
+    with pytest.raises(RuntimeError, match="literal digest"):
+        bimu_plan.frozen_plan_payload()
