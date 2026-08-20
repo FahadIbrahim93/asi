@@ -29,4 +29,4 @@ def test_rejects_oversized_resample_product_before_rng(
 
     monkeypatch.setattr("alberta_framework.utils.statistics.np.random.default_rng", fail)
     with pytest.raises(ValueError, match="step-units exceed"):
-        bootstrap_ci([1.0] * 101)
+        bootstrap_ci([1.0] * 1001)

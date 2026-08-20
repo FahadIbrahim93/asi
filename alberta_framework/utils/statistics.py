@@ -49,7 +49,7 @@ _BOOTSTRAP_BUDGET = ScanBudget(
     "bootstrap resampling",
     maximum_steps=10_000,
     maximum_parallel=10_000,
-    maximum_step_units=1_000_000,
+    maximum_step_units=10_000_000,
 )
 _BOOTSTRAP_MAX_COUNT = _BOOTSTRAP_BUDGET.maximum_steps
 
