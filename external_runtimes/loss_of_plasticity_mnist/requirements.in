@@ -1,0 +1,8 @@
+torch @ https://download-r2.pytorch.org/whl/cpu/torch-2.1.0%2Bcpu-cp38-cp38-linux_x86_64.whl#sha256=9e5cfd931a65b38d222755a45dabb53b836be31bc620532bc66fee77e3ff67dc
+torchvision @ https://download-r2.pytorch.org/whl/cpu/torchvision-0.16.0%2Bcpu-cp38-cp38-linux_x86_64.whl#sha256=512ec79de67e04ff28b2d96353f6da555151dec89fc9b10c73bec8b2a1b304f6
+numpy==1.24.1
+# Upstream's Python 3.8 README conflicts with its SciPy 1.11.2 pin. SciPy
+# 1.10.1 is the final Python 3.8-compatible line; this is a declared
+# qualification-only compatibility deviation, never paper/code parity.
+scipy==1.10.1
+tqdm==4.66.1
