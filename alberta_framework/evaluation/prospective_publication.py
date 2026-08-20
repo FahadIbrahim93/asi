@@ -13,7 +13,7 @@ def open_directory_chain(root: Path, segments: Sequence[str]) -> int:
     """Open/create a directory chain without following its named components."""
     if type(root) is not PosixPath or not root.is_absolute():
         raise ValueError("publication root must be an exact absolute POSIX Path")
-    if type(segments) not in (tuple, list) or any(
+    if (type(segments) is not tuple and type(segments) is not list) or any(
         type(segment) is not str
         or not segment
         or segment in {".", ".."}

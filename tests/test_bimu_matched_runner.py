@@ -38,6 +38,8 @@ def test_matched_runner_executes_complete_two_arm_three_seed_roster() -> None:
         "scientific_promotion_allowed": False,
         "sota_claim_allowed": False,
         "negative_results_retained": True,
+        "execution_authorized": False,
+        "authorization_transition_approved": False,
     }
     rows = result["rows"]
     assert [(row["seed"], row["arm"]) for row in rows] == [
@@ -89,28 +91,54 @@ def test_matched_runner_rejects_dataset_before_execution(monkeypatch: pytest.Mon
     assert called is False
 
 
-def test_public_runner_and_writer_fail_closed_before_input_work(tmp_path: Path) -> None:
+def test_public_runner_and_writer_fail_closed_before_input_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     with pytest.raises(RuntimeError, match="not independently authorized"):
         runner.run_bimu_matched_development(object(), object(), object(), object())
     with pytest.raises(RuntimeError, match="not independently authorized"):
-        write_bimu_matched_result(
-            tmp_path / "result.json", object(), object(), object(), object(), object()
-        )
+        write_bimu_matched_result(object(), object(), object(), object(), object())
+    monkeypatch.setattr(runner, "AUTHORIZATION_TRANSITION_APPROVED", True)
+    with pytest.raises(RuntimeError, match="not independently authorized"):
+        runner.run_bimu_matched_development(object(), object(), object(), object())
+    monkeypatch.setattr(runner, "AUTHORIZATION_TRANSITION_APPROVED", False)
+    monkeypatch.setattr(runner, "EXECUTION_AUTHORIZED", True)
+    with pytest.raises(RuntimeError, match="not independently authorized"):
+        runner.run_bimu_matched_development(object(), object(), object(), object())
 
 
 def test_matched_result_writer_is_append_only(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(runner, "EXECUTION_AUTHORIZED", True)
     monkeypatch.setattr(runner, "AUTHORIZATION_TRANSITION_APPROVED", True)
+    monkeypatch.setattr(runner, "_REGISTERED_REPOSITORY_ROOT", tmp_path)
     plan = _test_plan(input_dim=3, n_classes=2, examples=4)
     result = _execute_bimu_matched_development(*_data(), plan=plan)
-    destination = tmp_path / "matched-result.json"
-
-    write_bimu_matched_result(destination, result, *_data(), plan=plan)
+    destination = write_bimu_matched_result(result, *_data(), plan=plan)
     retained = json.loads(destination.read_bytes())
     validate_bimu_matched_result(retained, *_data(), plan=plan)
     with pytest.raises(FileExistsError):
-        write_bimu_matched_result(destination, result, *_data(), plan=plan)
+        write_bimu_matched_result(result, *_data(), plan=plan)
+
+
+def test_writer_rejects_invalid_root_and_symlinked_namespace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "EXECUTION_AUTHORIZED", True)
+    monkeypatch.setattr(runner, "AUTHORIZATION_TRANSITION_APPROVED", True)
+    plan = _test_plan(input_dim=3, n_classes=2, examples=4)
+    result = _execute_bimu_matched_development(*_data(), plan=plan)
+    monkeypatch.setattr(runner, "_REGISTERED_REPOSITORY_ROOT", Path("relative"))
+    with pytest.raises(RuntimeError, match="absolute POSIX Path"):
+        write_bimu_matched_result(result, *_data(), plan=plan)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "outputs").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(runner, "_REGISTERED_REPOSITORY_ROOT", tmp_path)
+    with pytest.raises(OSError):
+        write_bimu_matched_result(result, *_data(), plan=plan)
+    assert list(outside.iterdir()) == []
 
 
 def _resign(result: dict[str, Any], plan: BiMUMatchedDevelopmentPlan) -> None:
@@ -155,6 +183,16 @@ def test_validator_reexecutes_and_rejects_rehashed_forged_metrics() -> None:
     _resign(forged, plan)
 
     with pytest.raises(ValueError, match="does not reproduce"):
+        validate_bimu_matched_result(forged, *_data(), plan=plan)
+
+
+def test_validator_rejects_rehashed_authorization_flag_mismatch() -> None:
+    plan = _test_plan(input_dim=3, n_classes=2, examples=4)
+    forged = copy.deepcopy(_execute_bimu_matched_development(*_data(), plan=plan))
+    forged["identity"]["authorization"]["execution_authorized"] = True
+    forged["policy"]["execution_authorized"] = True
+    _resign(forged, plan)
+    with pytest.raises(ValueError, match="identity|policy"):
         validate_bimu_matched_result(forged, *_data(), plan=plan)
 
 

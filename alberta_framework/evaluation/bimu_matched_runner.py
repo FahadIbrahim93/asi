@@ -6,7 +6,7 @@ import hashlib
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PosixPath
 from typing import Final, cast
 
 import jax.random as jr
@@ -31,7 +31,10 @@ from alberta_framework.evaluation.bimu_matched_nonpromoting import (
     _plan_payload,
     _runtime_identity,
 )
-from alberta_framework.evaluation.prospective_publication import publish_prepared_json_at
+from alberta_framework.evaluation.prospective_publication import (
+    open_directory_chain,
+    publish_prepared_json_at,
+)
 
 RESULT_SCHEMA: Final = "asi.bimu.matched-development-result.v1"
 _POLICY: Final = {
@@ -40,6 +43,8 @@ _POLICY: Final = {
     "sota_claim_allowed": False,
     "negative_results_retained": True,
 }
+_OUTPUT_SEGMENTS: Final = ("outputs", "bimu_matched", "development.v1")
+_REGISTERED_REPOSITORY_ROOT: Final = Path(__file__).parents[2]
 _MATCHED_COUNTERS: Final = (
     "environment_steps",
     "observations",
@@ -61,8 +66,19 @@ AUTHORIZATION_TRANSITION_APPROVED: Final = False
 
 
 def _require_execution_authorized() -> None:
-    if AUTHORIZATION_TRANSITION_APPROVED is not True:
+    if EXECUTION_AUTHORIZED is not True or AUTHORIZATION_TRANSITION_APPROVED is not True:
         raise RuntimeError("BiMU matched execution is not independently authorized")
+
+
+def _authorization_identity() -> dict[str, bool]:
+    return {
+        "execution_authorized": EXECUTION_AUTHORIZED,
+        "authorization_transition_approved": AUTHORIZATION_TRANSITION_APPROVED,
+    }
+
+
+def _policy() -> dict[str, object]:
+    return {**_POLICY, **_authorization_identity()}
 
 
 def _canonical(value: object) -> bytes:
@@ -235,9 +251,10 @@ def _execute_bimu_matched_development(
             "plan_sha256": hashlib.sha256(_canonical(plan_payload)).hexdigest(),
             "source_sha256": _source_identity(),
             "runtime": _runtime_identity(),
+            "authorization": _authorization_identity(),
             "consistency_not_attestation": True,
         },
-        "policy": dict(_POLICY),
+        "policy": _policy(),
         "rows": rows,
         "aggregate": _aggregate(rows, checked_plan),
     }
@@ -289,11 +306,12 @@ def validate_bimu_matched_result(
         "plan_sha256": hashlib.sha256(_canonical(expected_plan)).hexdigest(),
         "source_sha256": _source_identity(),
         "runtime": _runtime_identity(),
+        "authorization": _authorization_identity(),
         "consistency_not_attestation": True,
     }
     if root["identity"] != expected_identity:
         raise ValueError("matched result identity drifted")
-    if root["policy"] != _POLICY:
+    if root["policy"] != _policy():
         raise ValueError("matched result must remain permanently nonpromoting")
     raw_rows = root["rows"]
     if type(raw_rows) is not list or len(raw_rows) != len(checked_plan.seeds) * 2:
@@ -383,7 +401,6 @@ def validate_bimu_matched_result(
 
 
 def write_bimu_matched_result(
-    destination: Path,
     value: object,
     train_x: object,
     train_y: object,
@@ -391,13 +408,19 @@ def write_bimu_matched_result(
     test_y: object,
     *,
     plan: BiMUMatchedDevelopmentPlan = FROZEN_BIMU_MATCHED_PLAN,
-) -> None:
+) -> Path:
     """Durably publish one validated result without replacing existing evidence."""
     _require_execution_authorized()
-    if type(destination) is not type(Path()):
-        raise TypeError("destination must be an exact Path")
-    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
-    directory = os.open(destination.parent, flags)
+    repository_root = _REGISTERED_REPOSITORY_ROOT
+    if type(repository_root) is not PosixPath or not repository_root.is_absolute():
+        raise RuntimeError("registered repository root must be an exact absolute POSIX Path")
+    if type(value) is not dict or type(value.get("result_sha256")) is not str:
+        raise ValueError("matched result lacks an exact claimed digest")
+    digest = cast(str, value["result_sha256"])
+    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError("matched result claimed digest is invalid")
+    name = f"result.{digest}.json"
+    directory = open_directory_chain(repository_root, _OUTPUT_SEGMENTS)
     try:
 
         def prepare() -> bytes:
@@ -409,10 +432,11 @@ def write_bimu_matched_result(
 
         publish_prepared_json_at(
             directory,
-            destination.name,
+            name,
             prepare=prepare,
             validate_loaded=validate_loaded,
             max_bytes=_MAX_RESULT_BYTES,
         )
     finally:
         os.close(directory)
+    return repository_root.joinpath(*_OUTPUT_SEGMENTS, name)
