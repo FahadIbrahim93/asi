@@ -120,6 +120,24 @@ def test_current_runtime_rejects_oversized_environment_before_use(
         lane._current_runtime()
 
 
+def test_runtime_identity_bounds_device_inventory_before_attribute_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class HostileDevice:
+        def __getattribute__(self, name: str) -> object:
+            nonlocal calls
+            calls += 1
+            raise AssertionError(f"device attribute accessed before bound: {name}")
+
+    oversized = [HostileDevice() for _ in range(lane._MAX_RUNTIME_DEVICES + 1)]
+    monkeypatch.setattr(lane.jax, "devices", lambda: oversized)
+    with pytest.raises(RuntimeError, match="device inventory is out of bounds"):
+        lane._runtime_identity()
+    assert calls == 0
+
+
 @pytest.mark.parametrize(
     ("fixed", "off"),
     [

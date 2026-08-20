@@ -83,6 +83,7 @@ _MAX_JSON_NODES: Final[int] = 200_000
 _MAX_STRING_BYTES: Final[int] = 2 * 1024 * 1024
 _MAX_TIMING_NS: Final[int] = 7 * 24 * 60 * 60 * 1_000_000_000
 _MAX_REPORT_BYTES: Final[int] = 64 * 1024 * 1024
+_MAX_RUNTIME_DEVICES: Final[int] = 64
 _AGENT_RNG_IMPL: Final[str] = "threefry2x32"
 _REPO_ROOT: Final[Path] = Path(__file__).resolve().parents[2]
 OUTPUT_PATH: Final[Path] = (
@@ -303,6 +304,9 @@ def _runtime_identity() -> dict[str, object]:
         "JAX_RANDOM_SEED_OFFSET",
         "XLA_FLAGS",
     )
+    devices = tuple(jax.devices())
+    if len(devices) == 0 or len(devices) > _MAX_RUNTIME_DEVICES:
+        raise RuntimeError("Intentional Updates runtime device inventory is out of bounds")
     return {
         "schema": "asi.intentional-updates.runtime.v1",
         "python": list(sys.version_info[:3]),
@@ -335,7 +339,7 @@ def _runtime_identity() -> dict[str, object]:
                     "device_kind": str(device.device_kind),
                     "process_index": int(device.process_index),
                 }
-                for device in jax.devices()
+                for device in devices
             ],
             "config": {
                 "jax_default_matmul_precision": str(
