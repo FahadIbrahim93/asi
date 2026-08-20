@@ -595,7 +595,7 @@ def run_option_value_duration_from_arrays(
     if observations.dtype != jnp.float32:
         raise ValueError("observations must have dtype float32")
     num_steps = _require_option_duration_scan_steps(
-        "num_steps", observations.shape[0]
+        "scan sequence length num_steps", observations.shape[0]
     )
     output_scalars = num_steps * (4 * learner.n_options + 3)
     if output_scalars > _INT32_MAX or 4 * output_scalars > _INT32_MAX:

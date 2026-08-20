@@ -119,8 +119,14 @@ def _require_upgd_loop_steps(name: str, value: object) -> int:
 
 def _require_upgd_array_steps(observations: object, targets: object) -> int:
     """Reject pre-collected scan lengths above the public last-fit before scan."""
-    if not isinstance(observations, jax.Array) or not isinstance(targets, jax.Array):
-        raise TypeError("observations and targets must be JAX arrays")
+    if not isinstance(observations, jax.Array):
+        raise TypeError(
+            "observations must be a trusted array; observations and targets must be JAX arrays"
+        )
+    if not isinstance(targets, jax.Array):
+        raise TypeError(
+            "targets must be a trusted array; observations and targets must be JAX arrays"
+        )
     try:
         num_steps = require_jax_leading_length(
             "observations", observations, _UPGD_LOOP_BUDGET, ranks=(2,)
@@ -3446,11 +3452,11 @@ def run_upgd_arrays(
         ValueError: If ``num_steps`` is not an exact integer in
             ``[1, 10_000]``.
     """
+    num_steps = _require_upgd_array_steps(observations, targets)
     if type(learner) is not UPGDLearner:
         raise TypeError("learner must be an exact UPGDLearner")
     if type(state) is not UPGDState:
         raise TypeError("state must be an exact UPGDState")
-    num_steps = _require_upgd_array_steps(observations, targets)
 
     feature_dim = (
         state.trunk_params.weights[0].shape[1]
@@ -3508,11 +3514,11 @@ def run_upgd_loop[StreamStateT](
         ValueError: If ``num_steps`` exceeds the documented protocol ceiling
             (``10_000``).
     """
+    num_steps = _require_upgd_loop_steps("num_steps", num_steps)
     if type(learner) is not UPGDLearner:
         raise TypeError("learner must be an exact UPGDLearner")
     if learner_state is not None and type(learner_state) is not UPGDState:
         raise TypeError("learner_state must be an exact UPGDState")
-    num_steps = _require_upgd_loop_steps("num_steps", num_steps)
     _require_float32_resource("upgd loop metrics", vector_scalars=4 * num_steps)
     stream_key, init_key = jax.random.split(key)
     if learner_state is None:

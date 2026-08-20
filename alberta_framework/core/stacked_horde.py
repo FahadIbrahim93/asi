@@ -688,9 +688,9 @@ def run_stacked_horde_scan(
         ``(num_steps - 1, n_demons)``.
     """
     if type(horde) is not StackedLinearHorde:
-        raise TypeError("horde must be an exact StackedLinearHorde")
+        raise TypeError("horde must be an actual StackedLinearHorde")
     if type(state) is not StackedHordeState:
-        raise TypeError("state must be an exact StackedHordeState")
+        raise TypeError("state must be an actual StackedHordeState")
 
     if not _has_trusted_array_type(features):
         raise TypeError("features must be a trusted array")
@@ -732,9 +732,12 @@ def run_stacked_horde_scan(
     if rhos is None:
         checked_rhos = jnp.ones((num_steps,), dtype=jnp.float32)
     else:
-        checked_rhos = _trusted_array(
-            "rhos", rhos, shape=(num_steps,), dtype=jnp.float32
-        )
+        try:
+            checked_rhos = _trusted_array(
+                "rhos", rhos, shape=(num_steps,), dtype=jnp.float32
+            )
+        except ValueError:
+            raise ValueError("rhos must have shape (num_steps,)") from None
 
     def step_fn(
         carry: StackedHordeState,
