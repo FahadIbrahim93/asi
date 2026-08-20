@@ -16,7 +16,7 @@ from alberta_framework.evaluation.bimu_matched_nonpromoting import (
     _test_plan,
 )
 from alberta_framework.evaluation.bimu_matched_runner import (
-    run_bimu_matched_development,
+    _execute_bimu_matched_development,
     validate_bimu_matched_result,
     write_bimu_matched_result,
 )
@@ -30,7 +30,7 @@ def _data() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
 
 def test_matched_runner_executes_complete_two_arm_three_seed_roster() -> None:
     plan = _test_plan(input_dim=3, n_classes=2, examples=4)
-    result = cast(dict[str, Any], run_bimu_matched_development(*_data(), plan=plan))
+    result = cast(dict[str, Any], _execute_bimu_matched_development(*_data(), plan=plan))
     validate_bimu_matched_result(result, *_data(), plan=plan)
 
     assert result["policy"] == {
@@ -48,15 +48,14 @@ def test_matched_runner_executes_complete_two_arm_three_seed_roster() -> None:
         assert control["result"]["dataset_sha256"] == candidate["result"]["dataset_sha256"]
         assert control["result"]["schedule_sha256"] == candidate["result"]["schedule_sha256"]
         assert (
-            control["result"]["initial_state_sha256"]
-            == candidate["result"]["initial_state_sha256"]
+            control["result"]["initial_state_sha256"] == candidate["result"]["initial_state_sha256"]
         )
         assert control["result"]["counters"] == candidate["result"]["counters"]
 
 
 def test_matched_validator_recomputes_aggregate_and_rejects_axis_forgery() -> None:
     plan = _test_plan(input_dim=3, n_classes=2, examples=4)
-    result = cast(dict[str, Any], run_bimu_matched_development(*_data(), plan=plan))
+    result = cast(dict[str, Any], _execute_bimu_matched_development(*_data(), plan=plan))
 
     forged = copy.deepcopy(result)
     forged["aggregate"]["paired_late_five_delta_mean"] += 0.01
@@ -86,13 +85,25 @@ def test_matched_runner_rejects_dataset_before_execution(monkeypatch: pytest.Mon
         "alberta_framework.evaluation.bimu_matched_runner.run_bimu_development", fail
     )
     with pytest.raises(ValueError, match="dataset"):
-        run_bimu_matched_development(*bad, plan=plan)
+        _execute_bimu_matched_development(*bad, plan=plan)
     assert called is False
 
 
-def test_matched_result_writer_is_append_only(tmp_path: Path) -> None:
+def test_public_runner_and_writer_fail_closed_before_input_work(tmp_path: Path) -> None:
+    with pytest.raises(RuntimeError, match="not independently authorized"):
+        runner.run_bimu_matched_development(object(), object(), object(), object())
+    with pytest.raises(RuntimeError, match="not independently authorized"):
+        write_bimu_matched_result(
+            tmp_path / "result.json", object(), object(), object(), object(), object()
+        )
+
+
+def test_matched_result_writer_is_append_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(runner, "AUTHORIZATION_TRANSITION_APPROVED", True)
     plan = _test_plan(input_dim=3, n_classes=2, examples=4)
-    result = run_bimu_matched_development(*_data(), plan=plan)
+    result = _execute_bimu_matched_development(*_data(), plan=plan)
     destination = tmp_path / "matched-result.json"
 
     write_bimu_matched_result(destination, result, *_data(), plan=plan)
@@ -111,7 +122,7 @@ def _resign(result: dict[str, Any], plan: BiMUMatchedDevelopmentPlan) -> None:
 
 def test_validator_derives_frozen_counters_schedule_and_initial_state() -> None:
     plan = _test_plan(input_dim=3, n_classes=2, examples=4)
-    original = cast(dict[str, Any], run_bimu_matched_development(*_data(), plan=plan))
+    original = cast(dict[str, Any], _execute_bimu_matched_development(*_data(), plan=plan))
 
     forged = copy.deepcopy(original)
     for row in forged["rows"]:
@@ -120,7 +131,7 @@ def test_validator_derives_frozen_counters_schedule_and_initial_state() -> None:
         counters["optimizer_updates"] = 0
         counters["model_forward_queries"] = 120
     _resign(forged, plan)
-    with pytest.raises(ValueError, match="counter"):
+    with pytest.raises(ValueError, match="counter|does not reproduce"):
         validate_bimu_matched_result(forged, *_data(), plan=plan)
 
     for field in ("schedule_sha256", "initial_state_sha256"):
@@ -128,16 +139,32 @@ def test_validator_derives_frozen_counters_schedule_and_initial_state() -> None:
         for row in forged["rows"]:
             row["result"][field] = "0" * 64
         _resign(forged, plan)
-        with pytest.raises(ValueError, match="schedule|initial"):
+        with pytest.raises(ValueError, match="schedule|initial|does not reproduce"):
             validate_bimu_matched_result(forged, *_data(), plan=plan)
 
 
-def test_source_identity_contains_only_installed_package_sources() -> None:
+def test_validator_reexecutes_and_rejects_rehashed_forged_metrics() -> None:
+    plan = _test_plan(input_dim=3, n_classes=2, examples=4)
+    forged = copy.deepcopy(_execute_bimu_matched_development(*_data(), plan=plan))
+    metrics = forged["rows"][0]["result"]["metrics"]
+    metrics["asi_whole_stream_online_accuracy"] = 0.0
+    metrics["paper_late_five_test_accuracy"] = 0.0
+    metrics["online_correct"] = 0
+    metrics["final_five_test_accuracy"] = [0.0] * 5
+    metrics["final_five_test_correct"] = [0] * 5
+    _resign(forged, plan)
+
+    with pytest.raises(ValueError, match="does not reproduce"):
+        validate_bimu_matched_result(forged, *_data(), plan=plan)
+
+
+def test_source_identity_preserves_audited_dependency_lock() -> None:
     identity = runner._source_identity()
     assert "uv.lock" not in identity
     assert set(identity) == {
         "alberta_framework/benchmarks/bimu.py",
         "alberta_framework/evaluation/bimu_matched_nonpromoting.py",
         "alberta_framework/evaluation/bimu_matched_runner.py",
+        "alberta_framework/evaluation/prospective_publication.py",
     }
-    assert "uv.lock" not in bimu_plan._source_identity()
+    assert "uv.lock" in bimu_plan._source_identity()
