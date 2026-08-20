@@ -175,7 +175,7 @@ def _load_config(path: Path) -> dict[str, Any]:
     value = load_strict_json_object(path)
     if not isinstance(value, dict):
         _fail(f"configuration must be an object: {path}")
-    return cast(dict[str, Any], value)
+    return value
 
 
 def _canonical_sqlite(path: Path) -> dict[str, Any]:
