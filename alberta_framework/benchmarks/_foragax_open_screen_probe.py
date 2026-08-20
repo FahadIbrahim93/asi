@@ -20,6 +20,8 @@ import sys
 from pathlib import Path, PurePosixPath
 from typing import Any, NoReturn, TypeGuard, cast
 
+from alberta_framework._strict_json import load_strict_json_object
+
 _SOURCE_ROOT = Path("/opt/foragax-agents")
 _PROTOCOL_ROOT = Path("/protocol")
 _BASE_PROTOCOL_ROOT = Path("/protocol-input")
@@ -170,11 +172,10 @@ def _root_is_read_only() -> bool:
 
 
 def _load_config(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as stream:
-        value = json.load(stream)
+    value = load_strict_json_object(path)
     if not isinstance(value, dict):
         _fail(f"configuration must be an object: {path}")
-    return cast(dict[str, Any], value)
+    return value
 
 
 def _canonical_sqlite(path: Path) -> dict[str, Any]:

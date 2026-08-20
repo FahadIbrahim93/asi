@@ -38,6 +38,14 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def test_probe_configuration_rejects_duplicate_json_keys(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate.json"
+    path.write_text('{"run_id":"first","run_id":"second"}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="duplicate JSON object key"):
+        probe._load_config(path)
+
+
 def _result_root(config: screen.FrozenConfiguration) -> str:
     return f"results/synthetic/{config.run_id}"
 
