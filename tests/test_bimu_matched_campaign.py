@@ -579,6 +579,41 @@ def test_cli_replays_before_retaining_completed_shard_and_receipts_forgery(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_cli_retains_failure_receipt_when_strict_replay_raises_runtime_error(
+    tmp_path: Path, tiny_campaign: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    campaign.publish_json(
+        campaign.campaign_path(tmp_path, "plan"),
+        campaign.build_plan_document(),
+        root=tmp_path,
+    )
+
+    def fail_replay(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("hostile replay failure must not escape")
+
+    monkeypatch.setattr(campaign, "validate_bimu_shard_by_reexecution", fail_replay)
+    assert (
+        campaign.main(
+            [
+                "run-shard",
+                "--root",
+                str(tmp_path),
+                "--arm",
+                "bimu",
+                "--seed",
+                "157002",
+            ]
+        )
+        == 1
+    )
+    destination = campaign.campaign_path(tmp_path, "shard", arm="bimu", seed=157002)
+    retained = campaign.validate_failed_bimu_shard(
+        campaign.load_json_strict(destination, byte_ceiling=campaign.MAX_SHARD_BYTES)
+    )
+    assert retained["status"] == "failed"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
 def test_cli_does_not_misreport_publication_failure_as_execution_receipt(
     tmp_path: Path, tiny_campaign: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

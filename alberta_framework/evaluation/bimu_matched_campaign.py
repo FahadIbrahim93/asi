@@ -1304,7 +1304,7 @@ def publish_json(
                     ):
                         _fail("completed shard publication requires strict replay arrays")
                     validate_bimu_shard_by_reexecution(candidate, *_completed_replay_arrays)
-                except (TypeError, ValueError) as exc:
+                except Exception as exc:
                     raise _CompletedShardAdmissionError(
                         "completed shard failed strict dataset-bound admission"
                     ) from exc
