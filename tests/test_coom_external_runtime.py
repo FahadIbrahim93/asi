@@ -92,7 +92,7 @@ def test_coom_runtime_smoke_is_bounded_external_and_nonpromoting() -> None:
     assert '_file_sha256(root / "LICENSE.txt")' in source
     assert '_file_sha256(root / "COOM/wrappers/reward.py")' in source
     assert "_source_tree_sha1(root) != SOURCE_TREE" in source
-    assert "_validate_receipt(receipt)" in source
+    assert "validate_receipt(receipt)" in source
     assert "EXPECTED_TRACE_SHA256" in source
     assert '_exact_keys(reset_info, frozenset(), name="reset info")' in source
     assert '_exact_keys(info, frozenset(), name="step info")' in source
@@ -100,6 +100,7 @@ def test_coom_runtime_smoke_is_bounded_external_and_nonpromoting() -> None:
 
 def test_coom_receipt_validator_rejects_hostile_provider_payloads(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     smoke = _smoke_module()
     manifest = json.loads((ROOT / "qualification-manifest.json").read_bytes())
@@ -188,27 +189,59 @@ def test_coom_receipt_validator_rejects_hostile_provider_payloads(
             "negative_outcome_retained": False,
         },
     }
-    smoke._validate_receipt(receipt)
+    smoke.validate_receipt(receipt)
+
+    retained = tmp_path / "receipt.json"
+    smoke.write_new_receipt(retained, receipt)
+    assert smoke.validate_receipt_file(retained) == receipt
+    assert retained.stat().st_mode & 0o222 == 0
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        smoke.write_new_receipt(retained, receipt)
+
+    duplicate = tmp_path / "duplicate.json"
+    encoded = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+    duplicate.write_text(encoded[:-1] + ',"schema":"duplicate"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate"):
+        smoke.load_receipt(duplicate)
+
+    oversized = tmp_path / "oversized.json"
+    oversized.write_bytes(b" " * (smoke._MAX_RECEIPT_BYTES + 1))
+    with pytest.raises(ValueError, match="byte limit"):
+        smoke.load_receipt(oversized)
+
+    linked = tmp_path / "linked.json"
+    linked.symlink_to(retained)
+    with pytest.raises(OSError):
+        smoke.load_receipt(linked)
 
     hostile = copy.deepcopy(receipt)
     hostile["trace"]["records"][0]["steps"][0]["info"] = {"object": object()}
     with pytest.raises(ValueError, match="receipt step info"):
-        smoke._validate_receipt(hostile)
+        smoke.validate_receipt(hostile)
     hostile = copy.deepcopy(receipt)
     hostile["claims"]["execution_attested"] = True
     with pytest.raises(ValueError, match="claims exceed"):
-        smoke._validate_receipt(hostile)
+        smoke.validate_receipt(hostile)
     hostile = copy.deepcopy(receipt)
     hostile["resource_receipt"]["environment_steps"] = True
     with pytest.raises(ValueError, match="resource receipt"):
-        smoke._validate_receipt(hostile)
+        smoke.validate_receipt(hostile)
 
+    hostile = copy.deepcopy(receipt)
+    hostile["trace"]["records"][0]["steps"].pop()
+    hostile_trace_sha256 = hashlib.sha256(
+        json.dumps(hostile["trace"], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    hostile["trace_sha256"] = hostile_trace_sha256
+    monkeypatch.setattr(smoke, "EXPECTED_TRACE_SHA256", hostile_trace_sha256)
+    with pytest.raises(ValueError, match="two step records"):
+        smoke.validate_receipt(hostile)
 
     hostile = copy.deepcopy(receipt)
     hostile["trace"]["sequence"] = _HookStr("CO8")
     _HookStr.calls = 0
     with pytest.raises(ValueError, match="trace sequence"):
-        smoke._validate_receipt(hostile)
+        smoke.validate_receipt(hostile)
     assert _HookStr.calls == 0
 
 
@@ -217,18 +250,19 @@ def test_coom_retained_receipt_loader_is_bounded_and_fail_closed(tmp_path: Path)
     receipt = tmp_path / "receipt.json"
     receipt.write_text('{"schema":"first","schema":"second"}', encoding="utf-8")
     with pytest.raises(ValueError, match="duplicate"):
-        smoke._load_receipt(receipt)
+        smoke.load_receipt(receipt)
 
     receipt.write_text("NaN", encoding="utf-8")
     with pytest.raises(ValueError, match="non-finite"):
-        smoke._load_receipt(receipt)
+        smoke.load_receipt(receipt)
 
     target = tmp_path / "target.json"
     target.write_text("{}", encoding="utf-8")
     receipt.unlink()
     receipt.symlink_to(target)
-    with pytest.raises(ValueError, match="regular file"):
-        smoke._load_receipt(receipt)
+    with pytest.raises(OSError):
+        smoke.load_receipt(receipt)
+
 
 
 def test_retained_receipt_loader_rejects_path_subclass_before_hooks(tmp_path: Path) -> None:
@@ -244,7 +278,7 @@ def test_retained_receipt_loader_rejects_path_subclass_before_hooks(tmp_path: Pa
     hostile = HostilePath(tmp_path / "receipt.json")
     HostilePath.calls = 0
     with pytest.raises(ValueError, match="exact concrete Path"):
-        smoke._load_receipt(hostile)
+        smoke.load_receipt(hostile)
     assert HostilePath.calls == 0
 
 
@@ -264,8 +298,8 @@ def test_retained_receipt_loader_rejects_symlink_swap_at_open_boundary(
         return real_open(path, flags)
 
     monkeypatch.setattr(smoke.os, "open", swap_then_open)
-    with pytest.raises(ValueError, match="opened safely"):
-        smoke._load_receipt(receipt)
+    with pytest.raises(OSError):
+        smoke.load_receipt(receipt)
 
 
 def test_exact_key_admission_rejects_hostile_key_without_dispatch() -> None:
@@ -276,6 +310,17 @@ def test_exact_key_admission_rejects_hostile_key_without_dispatch() -> None:
     with pytest.raises(ValueError, match="keys must be exact strings"):
         smoke._exact_keys(value, {"schema"}, name="hostile")
     assert _HookStr.calls == 0
+
+
+def test_reward_admission_matches_real_coom_scalar_without_coercion() -> None:
+    smoke = _smoke_module()
+
+    assert smoke._trusted_reward(0.0) == 0.0
+    assert smoke._trusted_reward(smoke.np.float64(-0.1)) == -0.1
+    _ArrayHook.calls = 0
+    with pytest.raises(ValueError, match="exact float scalar"):
+        smoke._trusted_reward(_ArrayHook())
+    assert _ArrayHook.calls == 0
 
 
 def test_provider_observation_is_rejected_before_array_hook(

@@ -25,21 +25,19 @@ Build and execute from this directory:
 docker build --tag asi-coom-qualification:development .
 docker run --rm asi-coom-qualification:development > receipt.json
 docker run --rm asi-coom-qualification:development > receipt.second.json
-```
-
-Validate a retained receipt against the same image-bound schema and input
-manifest without starting COOM:
-
-```bash
-docker run --rm --volume "$PWD/receipt.json:/receipt.json:ro" \
-  asi-coom-qualification:development --validate-receipt /receipt.json
+mkdir -p receipts
+docker run --rm -v "$PWD/receipts:/output" asi-coom-qualification:development \
+  --output /output/receipt.json
+docker run --rm -v "$PWD/receipts:/input:ro" asi-coom-qualification:development \
+  --validate-receipt /input/receipt.json
 ```
 
 Compare `trace_sha256`, not the telemetry-only elapsed time or platform string.
 The smoke consumes seed 1582000, all eight official CO8 tasks, and two action-0
 steps per task. A matching trace is a deterministic runtime qualification check,
-not authenticated execution attestation or a COOM result. Local audit receipts
-are not retained by this directory, and failures exit nonzero without a structured
-negative-outcome receipt. Callers that need a durable qualification record must
-publish the complete stdout receipt in a separately reviewed, append-only output
-namespace.
+not authenticated execution attestation or a COOM result. Receipts are not
+retained automatically; `--output` publishes one read-only file atomically and
+refuses replacement, while `--validate-receipt` strictly reloads it inside the
+bound image without starting COOM. Failures still exit nonzero without a
+structured negative-outcome receipt. Any repository retention belongs in a
+separately reviewed, append-only output namespace.

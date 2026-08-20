@@ -8,6 +8,8 @@ runtime qualification receipt, not a performance result.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import importlib.metadata
 import json
@@ -19,6 +21,7 @@ import sys
 import time
 from collections.abc import Sequence
 from pathlib import Path
+from typing import NoReturn, cast
 
 import numpy as np
 
@@ -48,16 +51,6 @@ STEPS_PER_TASK = 2
 _QUALIFICATION_ROOT = Path("/opt/qualification")
 _MAX_MANIFEST_BYTES = 8192
 _MAX_RECEIPT_BYTES = 1024 * 1024
-
-
-def _stat_fingerprint(value: os.stat_result) -> tuple[int, int, int, int, int]:
-    return (
-        value.st_dev,
-        value.st_ino,
-        value.st_size,
-        value.st_mtime_ns,
-        value.st_ctime_ns,
-    )
 
 
 def _array_sha256(value: np.ndarray) -> str:
@@ -147,6 +140,19 @@ def _exact_keys(
     return value
 
 
+def _json_pairs(items: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in items:
+        if type(key) is not str or key in result:
+            raise ValueError("JSON contains duplicate or non-string keys")
+        result[key] = value
+    return result
+
+
+def _reject_constant(token: str) -> NoReturn:
+    raise ValueError(f"non-finite JSON token {token}")
+
+
 def _exact_str(value: object, *, name: str, maximum: int = 256) -> str:
     if type(value) is not str or not 1 <= len(value.encode("utf-8")) <= maximum:
         raise ValueError(f"{name} must be a bounded exact string")
@@ -188,6 +194,18 @@ def _trusted_observation(value: object, *, name: str) -> np.ndarray:
     return value
 
 
+def _trusted_reward(value: object) -> float:
+    # COOM's pitfall wrapper returns one exact np.float64 scalar on the fixed
+    # trace; admit only that concrete provider type and Python float. Avoid
+    # isinstance/coercion of arbitrary objects, which could dispatch hooks.
+    if type(value) not in (float, np.float64):
+        raise ValueError("COOM reward must be an exact float scalar")
+    reward = float(cast(float | np.float64, value))
+    if not math.isfinite(reward):
+        raise ValueError("COOM reward must be finite")
+    return reward
+
+
 def _sha256(value: object, *, name: str) -> str:
     if (
         type(value) is not str
@@ -203,20 +221,10 @@ def _load_qualification_manifest() -> dict[str, object]:
     if len(raw) > _MAX_MANIFEST_BYTES:
         raise ValueError("qualification manifest exceeds its byte limit")
 
-    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, value in items:
-            if type(key) is not str or key in result:
-                raise ValueError("qualification manifest contains duplicate or non-string keys")
-            result[key] = value
-        return result
-
     value = json.loads(
         raw,
-        object_pairs_hook=pairs,
-        parse_constant=lambda token: (_ for _ in ()).throw(
-            ValueError(f"non-finite JSON token {token}")
-        ),
+        object_pairs_hook=_json_pairs,
+        parse_constant=_reject_constant,
     )
     manifest = _exact_keys(
         value,
@@ -252,75 +260,160 @@ def _load_qualification_manifest() -> dict[str, object]:
     return manifest
 
 
-def _load_receipt(path: Path) -> dict[str, object]:
-    """Load one bounded canonical receipt for strict offline validation."""
+def load_receipt(path: Path) -> dict[str, object]:
+    """Strictly load one bounded regular receipt without following a final symlink."""
+
     if type(path) is not type(Path()):
         raise ValueError("receipt path must be an exact concrete Path")
-    raw_path = os.fspath(path)
-    before = os.lstat(raw_path)
-    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-        raise ValueError("receipt must be a uniquely linked regular file")
-    if before.st_size > _MAX_RECEIPT_BYTES:
-        raise ValueError("receipt exceeds its byte limit")
-
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise OSError("strict receipt loading requires O_NOFOLLOW")
+    descriptor = os.open(
+        Path(path),
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+    )
     try:
-        descriptor = os.open(
-            raw_path,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-        )
-    except OSError as error:
-        raise ValueError("receipt could not be opened safely") from error
-    try:
-        opened = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or opened.st_nlink != 1
-            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
-            or _stat_fingerprint(opened) != _stat_fingerprint(before)
-        ):
-            raise ValueError("receipt changed before its descriptor was admitted")
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError("receipt input must be a regular file")
+        if before.st_nlink != 1:
+            raise ValueError("receipt input must have exactly one filesystem link")
+        if before.st_size > _MAX_RECEIPT_BYTES:
+            raise ValueError("receipt input exceeds its byte limit")
         chunks: list[bytes] = []
-        remaining = opened.st_size
+        remaining = _MAX_RECEIPT_BYTES + 1
         while remaining:
-            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
             if not chunk:
-                raise ValueError("receipt changed while it was being read")
+                break
             chunks.append(chunk)
             remaining -= len(chunk)
-        if os.read(descriptor, 1):
-            raise ValueError("receipt exceeds its admitted byte length")
-        after = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(after.st_mode)
-            or after.st_nlink != 1
-            or _stat_fingerprint(after) != _stat_fingerprint(opened)
-        ):
-            raise ValueError("receipt changed while it was being read")
         raw = b"".join(chunks)
+        after = os.fstat(descriptor)
+        stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if (
+            len(raw) != before.st_size
+            or len(raw) > _MAX_RECEIPT_BYTES
+            or any(getattr(before, field) != getattr(after, field) for field in stable)
+        ):
+            raise ValueError("receipt input changed while being read")
     finally:
         os.close(descriptor)
-
-    def pairs(items: list[tuple[str, object]]) -> dict[str, object]:
-        result: dict[str, object] = {}
-        for key, value in items:
-            if type(key) is not str or key in result:
-                raise ValueError("receipt contains duplicate or non-string keys")
-            result[key] = value
-        return result
-
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("receipt input must be UTF-8") from exc
     value = json.loads(
-        raw,
-        object_pairs_hook=pairs,
-        parse_constant=lambda token: (_ for _ in ()).throw(
-            ValueError(f"non-finite JSON token {token}")
-        ),
+        text,
+        object_pairs_hook=_json_pairs,
+        parse_constant=_reject_constant,
     )
     if type(value) is not dict:
-        raise ValueError("receipt root must be an exact object")
+        raise ValueError("receipt input must be an exact JSON object")
     return value
 
 
-def _trace() -> tuple[list[dict[str, object]], int]:
+def _open_output_parent(path: Path) -> tuple[Path, int]:
+    destination = Path(os.path.abspath(os.fspath(path)))
+    descriptor = os.open(os.path.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for component in destination.parent.parts[1:]:
+            if component in ("", ".", ".."):
+                raise ValueError("output path contains an unsafe directory component")
+            next_descriptor = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return destination, descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def preflight_new_output(path: Path) -> None:
+    destination, parent_fd = _open_output_parent(path)
+    try:
+        try:
+            os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        raise FileExistsError(f"refusing to overwrite immutable receipt: {destination}")
+    finally:
+        os.close(parent_fd)
+
+
+def _link_unnamed_file(file_fd: int, parent_fd: int, name: str) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    linkat = libc.linkat
+    linkat.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    )
+    linkat.restype = ctypes.c_int
+    if linkat(file_fd, b"", parent_fd, os.fsencode(name), 0x1000) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), name)
+        raise OSError(error, os.strerror(error), name)
+
+
+def write_new_receipt(path: Path, receipt: dict[str, object]) -> Path:
+    """Atomically publish one validated receipt without replacing existing bytes."""
+
+    validate_receipt(receipt)
+    destination, parent_fd = _open_output_parent(path)
+    encoded = json.dumps(
+        receipt,
+        allow_nan=False,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8") + b"\n"
+    if len(encoded) > _MAX_RECEIPT_BYTES:
+        os.close(parent_fd)
+        raise ValueError("receipt output exceeds its byte limit")
+    file_fd: int | None = None
+    try:
+        try:
+            os.stat(destination.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(f"refusing to overwrite immutable receipt: {destination}")
+        if not hasattr(os, "O_TMPFILE"):
+            raise OSError("immutable receipt publication requires Linux O_TMPFILE")
+        file_fd = os.open(
+            ".",
+            os.O_WRONLY | os.O_CLOEXEC | os.O_TMPFILE,
+            0o600,
+            dir_fd=parent_fd,
+        )
+        view = memoryview(encoded)
+        written = 0
+        while written < len(view):
+            written += os.write(file_fd, view[written:])
+        os.fsync(file_fd)
+        os.fchmod(file_fd, 0o444)
+        try:
+            _link_unnamed_file(file_fd, parent_fd, destination.name)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"refusing to overwrite immutable receipt: {destination}"
+            ) from exc
+        os.fsync(parent_fd)
+        return destination
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(parent_fd)
+
+
+def _trace() -> tuple[list[dict[str, object]], int, int, int]:
     from COOM.env.builder import (  # type: ignore[import-not-found]
         build_multi_discrete_actions,
         make_sequence,
@@ -329,6 +422,8 @@ def _trace() -> tuple[list[dict[str, object]], int]:
 
     start = time.perf_counter_ns()
     records: list[dict[str, object]] = []
+    task_resets = 0
+    environment_steps = 0
     environments_value = make_sequence(
         Sequence.CO8,
         doom_kwargs={
@@ -369,6 +464,7 @@ def _trace() -> tuple[list[dict[str, object]], int]:
             observation, reset_info = reset_result
             _exact_keys(reset_info, frozenset(), name="reset info")
             reset = _trusted_observation(observation, name="reset observation")
+            task_resets += 1
             steps: list[dict[str, object]] = []
             for _ in range(STEPS_PER_TASK):
                 step_result = environment.step(0)
@@ -377,8 +473,7 @@ def _trace() -> tuple[list[dict[str, object]], int]:
                 observation, reward, terminated, truncated, info = step_result
                 _exact_keys(info, frozenset(), name="step info")
                 value = _trusted_observation(observation, name="step observation")
-                if type(reward) is not float or not math.isfinite(reward):
-                    raise ValueError("COOM reward must be an exact finite float")
+                trusted_reward = _trusted_reward(reward)
                 if type(terminated) is not bool or type(truncated) is not bool:
                     raise ValueError("COOM termination flags must be exact bools")
                 steps.append(
@@ -387,12 +482,13 @@ def _trace() -> tuple[list[dict[str, object]], int]:
                         "observation_sha256": _array_sha256(value),
                         "observation_shape": list(value.shape),
                         "observation_dtype": value.dtype.str,
-                        "reward": reward,
+                        "reward": trusted_reward,
                         "terminated": terminated,
                         "truncated": truncated,
                         "info": {},
                     }
                 )
+                environment_steps += 1
             records.append(
                 {
                     "task_index": task_index,
@@ -407,10 +503,10 @@ def _trace() -> tuple[list[dict[str, object]], int]:
     finally:
         for environment in environments:
             environment.close()
-    return records, time.perf_counter_ns() - start
+    return records, time.perf_counter_ns() - start, task_resets, environment_steps
 
 
-def _validate_receipt(receipt: object) -> None:
+def validate_receipt(receipt: object) -> None:
     root = _exact_keys(
         receipt,
         {
@@ -608,10 +704,12 @@ def _validate_receipt(receipt: object) -> None:
         },
         name="resource receipt",
     )
+    derived_resets = len(records)
+    derived_steps = sum(len(cast(list[object], record["steps"])) for record in records)
     expected_resources = {
-        "task_resets": 8,
-        "environment_steps": 16,
-        "environment_step_queries": 16,
+        "task_resets": derived_resets,
+        "environment_steps": derived_steps,
+        "environment_step_queries": derived_steps,
         "policy_queries": 0,
         "learner_updates": 0,
         "model_queries": 0,
@@ -651,18 +749,7 @@ def _validate_receipt(receipt: object) -> None:
         raise ValueError("receipt claims exceed the bounded unattested qualification")
 
 
-def main(argv: Sequence[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--validate-receipt",
-        type=Path,
-        help="strictly validate a retained receipt without executing COOM",
-    )
-    arguments = parser.parse_args(argv)
-    if arguments.validate_receipt is not None:
-        _validate_receipt(_load_receipt(arguments.validate_receipt))
-        return
-
+def build_receipt() -> dict[str, object]:
     qualification_inputs = _load_qualification_manifest()
     root = Path("/opt/coom")
     if _source_tree_sha1(root) != SOURCE_TREE:
@@ -681,7 +768,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         SOURCE_ASSET_MANIFEST_SHA256,
     ):
         raise SystemExit("COOM WAD/config asset manifest differs from the audited source pin")
-    records, elapsed_ns = _trace()
+    records, elapsed_ns, task_resets, environment_steps = _trace()
     trace = {
         "seed": SEED,
         "sequence": "CO8",
@@ -692,7 +779,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         "records": records,
     }
     trace_bytes = json.dumps(trace, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    receipt = {
+    receipt: dict[str, object] = {
         "schema": SCHEMA,
         "qualification_inputs": qualification_inputs,
         "source": {
@@ -722,9 +809,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "trace": trace,
         "trace_sha256": hashlib.sha256(trace_bytes).hexdigest(),
         "resource_receipt": {
-            "task_resets": 8,
-            "environment_steps": 8 * STEPS_PER_TASK,
-            "environment_step_queries": 8 * STEPS_PER_TASK,
+            "task_resets": task_resets,
+            "environment_steps": environment_steps,
+            "environment_step_queries": environment_steps,
             "policy_queries": 0,
             "learner_updates": 0,
             "model_queries": 0,
@@ -740,10 +827,54 @@ def main(argv: Sequence[str] | None = None) -> None:
             "negative_outcome_retained": False,
         },
     }
-    _validate_receipt(receipt)
-    json.dump(receipt, sys.stdout, sort_keys=True, separators=(",", ":"))
-    sys.stdout.write("\n")
+    validate_receipt(receipt)
+    return receipt
+
+
+def validate_receipt_file(path: Path) -> dict[str, object]:
+    receipt = load_receipt(path)
+    validate_receipt(receipt)
+    return receipt
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--output", type=Path, help="atomically retain a new receipt")
+    mode.add_argument(
+        "--validate-receipt",
+        "--validate",
+        dest="validate_receipt",
+        type=Path,
+        help="strictly validate a retained receipt",
+    )
+    args = parser.parse_args(argv)
+    if args.validate_receipt is not None:
+        receipt = validate_receipt_file(args.validate_receipt)
+        print(
+            json.dumps(
+                {
+                    "valid": True,
+                    "schema": receipt["schema"],
+                    "trace_sha256": receipt["trace_sha256"],
+                    "scientific_promotion_allowed": False,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        return 0
+    if args.output is not None:
+        preflight_new_output(args.output)
+    receipt = build_receipt()
+    if args.output is None:
+        json.dump(receipt, sys.stdout, sort_keys=True, separators=(",", ":"))
+        sys.stdout.write("\n")
+    else:
+        write_new_receipt(args.output, receipt)
+        print(args.output)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
