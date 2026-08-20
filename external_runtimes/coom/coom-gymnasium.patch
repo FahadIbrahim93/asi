@@ -2,12 +2,6 @@ diff --git a/COOM/wrappers/reward.py b/COOM/wrappers/reward.py
 index c5f386e..f84a9ec 100644
 --- a/COOM/wrappers/reward.py
 +++ b/COOM/wrappers/reward.py
-@@ -1,7 +1,7 @@
- from typing import Callable
- 
- import numpy as np
+@@ -4 +4 @@ import numpy as np
 -from gym import RewardWrapper
 +from gymnasium import RewardWrapper
- from vizdoom import GameVariable
- 
- 
