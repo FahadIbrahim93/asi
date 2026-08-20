@@ -473,6 +473,8 @@ def run_bimu_shard(
     result = run_bimu_development(*arrays, config=config, seed=seed)
     wall_seconds = time.perf_counter() - started_wall
     cpu_seconds = time.process_time() - started_cpu
+    if _dataset_sha256(*arrays) != FROZEN_BIMU_MATCHED_PLAN.dataset_sha256:
+        _fail("campaign dataset changed during shard execution")
     validate_bimu_result(result)
     payload: dict[str, object] = {
         "schema": SHARD_SCHEMA,
@@ -663,6 +665,43 @@ def validate_bimu_shard(value: object) -> dict[str, object]:
         _fail("shard digest drifted")
     if len(_canonical(root)) > MAX_SHARD_BYTES:
         _fail("shard exceeds byte ceiling")
+    return root
+
+
+def validate_bimu_shard_by_reexecution(
+    value: object,
+    train_x: object,
+    train_y: object,
+    test_x: object,
+    test_y: object,
+) -> dict[str, object]:
+    """Reexecute one shard and compare every deterministic result field."""
+
+    root = validate_bimu_shard(value)
+    arrays = _validated_arrays(
+        train_x,
+        train_y,
+        test_x,
+        test_y,
+        plan=FROZEN_BIMU_MATCHED_PLAN,
+    )
+    spec = cast(dict[str, object], root["spec"])
+    config = _arm_config(FROZEN_BIMU_MATCHED_PLAN, cast(str, spec["arm"]))
+    replay = run_bimu_development(
+        *arrays,
+        config=config,
+        seed=cast(int, spec["seed"]),
+    )
+    validate_bimu_result(replay)
+    reported = cast(dict[str, object], root["result"])
+    deterministic_fields = set(replay) - {"timing"}
+    if set(reported) - {"timing"} != deterministic_fields or any(
+        not _json_exact_equal(reported[field], replay[field])
+        for field in deterministic_fields
+    ):
+        _fail("shard result does not match strict seed/arm reexecution")
+    if _dataset_sha256(*arrays) != FROZEN_BIMU_MATCHED_PLAN.dataset_sha256:
+        _fail("campaign dataset changed during strict shard reexecution")
     return root
 
 
@@ -1096,16 +1135,24 @@ def _validate_namespace(
         _fail("campaign shard namespace contains an unexpected entry")
 
 
-def _load_shards(root: Path) -> list[dict[str, object]]:
+def _load_shards(
+    root: Path,
+    arrays: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None,
+) -> list[dict[str, object]]:
     return [
-        validate_bimu_shard(
-            load_json_strict(
-                campaign_path(root, "shard", arm=arm, seed=seed),
-                byte_ceiling=MAX_SHARD_BYTES,
-            )
+        (
+            validate_bimu_shard(loaded)
+            if arrays is None
+            else validate_bimu_shard_by_reexecution(loaded, *arrays)
         )
         for seed in FROZEN_BIMU_MATCHED_PLAN.seeds
         for arm in _ARMS
+        for loaded in (
+            load_json_strict(
+                campaign_path(root, "shard", arm=arm, seed=seed),
+                byte_ceiling=MAX_SHARD_BYTES,
+            ),
+        )
     ]
 
 
@@ -1121,6 +1168,8 @@ def _parser() -> argparse.ArgumentParser:
     for name in ("plan", "summarize", "validate"):
         command = subparsers.add_parser(name)
         command.add_argument("--root", type=Path, required=True)
+        if name in {"summarize", "validate"}:
+            command.add_argument("--data-home", type=Path)
     shard = subparsers.add_parser("run-shard")
     shard.add_argument("--root", type=Path, required=True)
     shard.add_argument("--arm", choices=_ARMS, required=True)
@@ -1172,7 +1221,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             require_aggregate=False,
         )
         _load_plan(root)
-        aggregate = summarize_bimu_shards(_load_shards(root))
+        arrays = load_frozen_bimu_dataset(args.data_home)
+        aggregate = summarize_bimu_shards(_load_shards(root, arrays))
         destination = campaign_path(root, "aggregate")
         publish_json(destination, aggregate, root=root)
         _print_json(cast(dict[str, object], aggregate["outcome"]))
@@ -1198,7 +1248,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "aggregate": None,
         }
         if any_shards:
-            shards = _load_shards(root)
+            arrays = load_frozen_bimu_dataset(args.data_home)
+            shards = _load_shards(root, arrays)
             result["shards"] = [shard["shard_sha256"] for shard in shards]
         if aggregate_path.exists():
             aggregate = validate_bimu_aggregate(

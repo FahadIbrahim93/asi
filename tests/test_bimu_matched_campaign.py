@@ -192,6 +192,20 @@ def test_shard_validator_rejects_forged_nested_receipts_and_hostile_trees(
         campaign.validate_plan_document(plan)
 
 
+def test_strict_shard_validator_reexecutes_final_state(tiny_campaign: Any) -> None:
+    arrays = _slice_data()
+    shard = campaign.run_bimu_shard("bimu", 157002)
+    assert campaign.validate_bimu_shard_by_reexecution(shard, *arrays) == shard
+
+    forged = copy.deepcopy(shard)
+    forged["result"]["final_state_sha256"] = "0" * 64
+    forged["result"]["resources"]["state_changed"] = True
+    _resign(forged)
+    assert campaign.validate_bimu_shard(forged) == forged
+    with pytest.raises(ValueError, match="reexecution"):
+        campaign.validate_bimu_shard_by_reexecution(forged, *arrays)
+
+
 def _six_shards() -> list[dict[str, Any]]:
     return [
         campaign.run_bimu_shard(arm, seed)
