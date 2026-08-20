@@ -17,11 +17,14 @@ import pytest
 
 from alberta_framework.benchmarks import forager_matched_executor as executor
 from alberta_framework.benchmarks import forager_matched_qualification as qualification
+from tests._forager_matched_platform import HAS_PROCFS_DESCRIPTORS
 
 pytestmark = pytest.mark.unit
 
 
 def _open_fd_count() -> int:
+    if not HAS_PROCFS_DESCRIPTORS:
+        pytest.skip("descriptor-count regression requires procfs")
     return len(list(Path("/proc/self/fd").iterdir()))
 
 

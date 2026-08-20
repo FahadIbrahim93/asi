@@ -33,6 +33,11 @@ from alberta_framework.benchmarks import forager_matched_executor as executor
 from alberta_framework.benchmarks import forager_matched_protocol as protocol
 from alberta_framework.benchmarks import forager_matched_seal as seal
 from tests import test_forager_matched_evidence as evidence_fixtures
+from tests._forager_matched_platform import (
+    HAS_RENAMEAT2,
+    requires_procfs_descriptors,
+    requires_renameat2,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -370,6 +375,7 @@ def _roots(tmp_path: Path) -> tuple[Path, Path, Path]:
     return qualification_root, campaign_root, tmp_path / "seal"
 
 
+@requires_renameat2
 def test_atomic_seal_round_trip_keeps_content_and_external_trust_separate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -590,6 +596,7 @@ def test_execution_plan_rejects_non_integer_horizon(
         )
 
 
+@requires_renameat2
 def test_literal_v1_qualification_carriers_and_seal_manifest_are_rejected(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -654,6 +661,7 @@ def test_literal_v1_qualification_carriers_and_seal_manifest_are_rejected(
         seal._validate_manifest_shape(legacy_manifest)
 
 
+@requires_renameat2
 def test_content_valid_cache_cannot_authenticate_itself(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -682,6 +690,7 @@ def test_content_valid_cache_cannot_authenticate_itself(
         )
 
 
+@requires_renameat2
 def test_no_authenticated_wrapper_is_exposed_and_authentication_returns_plain_bindings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -741,6 +750,7 @@ def test_create_rejects_anchor_and_subject_pins_before_resolver(
     assert not output_root.exists()
 
 
+@requires_renameat2
 def test_authentication_rejects_all_pin_mismatches_before_resolver(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -849,6 +859,31 @@ def test_resolver_failure_creates_no_output_or_parent(
     assert not output_root.parent.exists()
 
 
+@pytest.mark.skipif(HAS_RENAMEAT2, reason="Linux publishes the bundle instead of refusing")
+def test_publication_fails_closed_without_renameat2(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    completed, bindings = _completed_campaign(tmp_path)
+    _install_completed_loader(monkeypatch, completed)
+    qualification_root, campaign_root, output_root = _roots(tmp_path)
+
+    with pytest.raises(
+        seal.ForagerMatchedSealError,
+        match="renameat2 is required for seal publication",
+    ):
+        seal.create_forager_matched_seal_bundle(
+            qualification_root,
+            campaign_root,
+            output_root,
+            resolver=lambda _request: bindings,
+            expected_trust_anchor_identity=bindings.trust_anchor_identity,
+        )
+    assert not output_root.exists()
+    assert not tuple(output_root.parent.glob(".seal-partial-*"))
+
+
+@requires_renameat2
 def test_create_replays_then_fsyncs_then_publishes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -953,6 +988,7 @@ def test_existing_output_is_never_replaced_or_resolved(
     assert marker.read_text(encoding="utf-8") == "existing"
 
 
+@requires_renameat2
 def test_publish_loses_a_concurrent_create_without_replacing_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1067,6 +1103,7 @@ def test_parent_inode_substitution_is_rejected_without_touching_replacement(
     assert not tuple(moved_parent.glob(".seal-partial-*"))
 
 
+@requires_renameat2
 def test_parent_fsync_failure_reports_published_destination_as_uncertain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1093,6 +1130,7 @@ def test_parent_fsync_failure_reports_published_destination_as_uncertain(
     assert seal.load_forager_matched_seal_bundle_content(output_root).output_root == output_root
 
 
+@requires_renameat2
 def test_post_publish_replay_failure_reports_destination_as_uncertain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1132,6 +1170,7 @@ def test_post_publish_replay_failure_reports_destination_as_uncertain(
     assert (output_root / "seal.json").is_file()
 
 
+@requires_renameat2
 def test_loader_rejects_unknown_links_and_artifact_tampering(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1163,6 +1202,7 @@ def test_loader_rejects_unknown_links_and_artifact_tampering(
         seal.load_forager_matched_seal_bundle_content(output_root)
 
 
+@requires_renameat2
 def test_seal_closes_over_canonical_plan_and_live_runtime_artifacts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1283,6 +1323,7 @@ def test_frozen_selection_replay_cap_rejects_before_resolver(
     assert not output_root.exists()
 
 
+@requires_renameat2
 def test_loader_detects_inventory_mutation_after_all_artifact_reads(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1324,6 +1365,7 @@ def test_loader_detects_inventory_mutation_after_all_artifact_reads(
     assert injected is True
 
 
+@requires_renameat2
 def test_loader_holds_original_root_inode_and_rejects_path_swap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1364,6 +1406,8 @@ def test_loader_holds_original_root_inode_and_rejects_path_swap(
     assert not (output_root / "seal.json").exists()
 
 
+@requires_renameat2
+@requires_procfs_descriptors
 def test_fsync_walk_visits_all_files_before_root_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

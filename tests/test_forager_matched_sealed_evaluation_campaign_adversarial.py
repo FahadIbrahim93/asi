@@ -39,6 +39,11 @@ from alberta_framework.benchmarks import (
 )
 from tests import test_forager_matched_evidence as evidence_fixtures
 from tests import test_forager_matched_seal as seal_fixtures
+from tests._forager_matched_platform import (
+    HAS_RENAMEAT2,
+    requires_o_tmpfile,
+    requires_renameat2,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -314,6 +319,8 @@ def _tree_snapshot(root: Path) -> tuple[tuple[str, str, str], ...]:
 
 @pytest.fixture(scope="module")
 def real_seal_bundle(tmp_path_factory: pytest.TempPathFactory) -> Any:
+    if not HAS_RENAMEAT2:
+        pytest.skip("a real seal bundle can only be published with Linux renameat2")
     root = tmp_path_factory.mktemp("sealed-campaign-real-auth")
     _manifest, _raw, qualification_digest = _qualification_material()
     patcher = pytest.MonkeyPatch()
@@ -488,6 +495,7 @@ def test_exact_six_by_thirty_rebuild_and_seed_major_schedule(
     assert [cell["ordinal"] for cell in schedule["cells"]] == list(range(180))
 
 
+@requires_renameat2
 def test_initial_publication_has_exact_immutable_inventory(tmp_path: Path) -> None:
     inputs = _synthetic_inputs(tmp_path)
     live = _fake_live()
@@ -554,6 +562,7 @@ def test_publication_rejects_changed_qualification_bytes_before_writing(
     assert not output_root.parent.exists()
 
 
+@requires_renameat2
 def test_v1_campaign_manifest_is_rejected_as_nonexact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -884,6 +893,7 @@ def test_run_auth_failure_does_not_repair_and_resolver_precedes_engine(
     assert events == ["load", "resolver", "engine"]
 
 
+@requires_o_tmpfile
 def test_read_only_entry_points_never_resolve_authority(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -986,6 +996,7 @@ def test_completion_summary_rejects_false_authority_and_closure(tmp_path: Path) 
         validator(context, receipt, scores, request, numeric_alias)
 
 
+@requires_o_tmpfile
 def test_partial_final_artifacts_fail_closed_without_repair(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1026,6 +1037,7 @@ def test_partial_final_artifacts_fail_closed_without_repair(
     assert not partial.with_name(f"{partial.name}.sha256").exists()
 
 
+@requires_o_tmpfile
 def test_root_and_dynamic_root_substitution_are_rejected(tmp_path: Path) -> None:
     root = tmp_path / "root-swap" / "evaluation"
     _minimal_locked_root(root)
