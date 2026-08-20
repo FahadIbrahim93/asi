@@ -51,7 +51,10 @@ _POLICY: Final = {
     "development_only": True,
     "scientific_promotion_allowed": False,
     "sota_claim_allowed": False,
-    "negative_results_retained": True,
+    "completed_outcomes_retained_in_result": True,
+    "atomic_execution_and_publication": False,
+    "execution_failure_receipts_retained": False,
+    "post_start_retry_prevention": False,
 }
 _MAX_STEPS: Final = 2_000_000
 _MAX_PERSISTENT_BYTES: Final = 256 * 1024 * 1024
@@ -112,11 +115,16 @@ def frozen_plan() -> dict[str, object]:
             "campaign_rejected": "both candidates are rejected",
             "otherwise": "inconclusive",
         },
-        "reviewed_execution_transition": _REVIEWED_EXECUTION_TRANSITION,
-        "execution_authorized": _EXECUTION_AUTHORIZED,
+        # These are immutable properties of this reviewed plan. A future source
+        # transition must not rewrite the historical plan that preceded it.
+        "reviewed_execution_transition": False,
+        "execution_authorized": False,
         "development_only": True,
         "scientific_promotion_allowed": False,
-        "negative_results_retained": True,
+        "completed_outcomes_retained_in_result": True,
+        "atomic_execution_and_publication": False,
+        "execution_failure_receipts_retained": False,
+        "post_start_retry_prevention": False,
         "output_path": "outputs/bounded_elastic_matched_development/report.v1.json",
     }
 

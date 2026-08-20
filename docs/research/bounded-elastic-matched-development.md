@@ -24,10 +24,15 @@ development-selection outcome only; it is not a significance test or scientific 
 
 Execution, strict reexecution, and publication are hard-disabled until both a separately reviewed
 source transition and runtime authorization become exact `true`. The future output path is NEW.
-Before any dataset load or runner dispatch, the campaign publisher must reserve that path through
-per-segment no-follow directory descriptors. Publication is create-only, fsynced, uniquely linked,
-bounded-reread, duplicate-key rejected, and strictly revalidated. Every result is development-only,
-permanently nonpromoting, and retains negative or inconclusive outcomes.
+The reviewed plan records both authorization fields as literal `false`; a later transition cannot
+retroactively change that plan identity. The current runner and publisher are separate primitives,
+not an atomic campaign transaction: an in-memory run can precede output reservation, execution
+failures produce no durable receipt, and a failed attempt does not prevent retry. A future
+authorization must either add a reserve-before-execution coordinator with explicit failure
+semantics or retain these limitations. The existing publisher reserves its NEW path before strict
+reexecution, then publishes create-only via a fsynced unique link with bounded reread, duplicate-key
+rejection, and strict revalidation. Completed results retain their outcome in the returned or
+published object. Every outcome remains development-only and permanently nonpromoting.
 
 The read-only catalog is available without loading MNIST:
 

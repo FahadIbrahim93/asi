@@ -38,6 +38,14 @@ def test_plan_is_prospective_and_public_execution_is_hard_disabled(
     assert plan["seeds"] == [51_562_001, 51_562_002, 51_562_003, 51_562_004, 51_562_005]
     assert plan["reviewed_execution_transition"] is False
     assert plan["execution_authorized"] is False
+    assert plan["atomic_execution_and_publication"] is False
+    assert plan["execution_failure_receipts_retained"] is False
+    assert plan["post_start_retry_prevention"] is False
+    monkeypatch.setattr(runner, "_REVIEWED_EXECUTION_TRANSITION", True)
+    monkeypatch.setattr(runner, "_EXECUTION_AUTHORIZED", True)
+    assert runner.frozen_plan() == plan
+    monkeypatch.setattr(runner, "_REVIEWED_EXECUTION_TRANSITION", False)
+    monkeypatch.setattr(runner, "_EXECUTION_AUTHORIZED", False)
     calls = 0
 
     def forbidden(*args: object, **kwargs: object) -> object:
