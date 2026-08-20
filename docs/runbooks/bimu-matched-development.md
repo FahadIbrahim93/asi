@@ -29,12 +29,17 @@ the authorized revision before any shard starts. That review must also update
 the literal `FROZEN_PLAN_SHA256`; an authorization flip without the matching
 reviewed plan digest fails closed.
 
-Generate and validate the currently unauthorized plan:
+Inspect the currently unauthorized plan in a disposable root. Do not publish it
+under the repository's immutable output namespace:
 
 ```bash
-.venv/bin/asi-bimu-matched-development plan --root .
-.venv/bin/asi-bimu-matched-development validate --root .
+campaign_root=$(mktemp -d)
+.venv/bin/asi-bimu-matched-development plan --root "$campaign_root"
+.venv/bin/asi-bimu-matched-development validate --root "$campaign_root"
 ```
+
+If any file already exists in `development.v1`, the authorization change must
+advance the namespace rather than replace that file.
 
 After separate authorization, launch each of the six commands in its own fresh
 Linux process. Substitute each frozen arm and seed exactly once:

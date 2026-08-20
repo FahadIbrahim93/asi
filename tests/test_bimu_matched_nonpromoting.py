@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import copy
-
-import numpy as np
 import pytest
 
 import alberta_framework.evaluation.bimu_matched_nonpromoting as bimu_plan
@@ -11,15 +8,7 @@ from alberta_framework.evaluation.bimu_matched_nonpromoting import (
     FROZEN_PLAN_SHA256,
     INVALID_PRIOR_ATTEMPT,
     _plan_payload,
-    build_bimu_execution_manifest,
-    validate_bimu_execution_manifest,
 )
-
-
-def _data() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    x = np.arange(8 * 4, dtype=np.float32).reshape(8, 4) / 32.0
-    y = np.arange(8, dtype=np.int32) % 2
-    return x[:4], y[:4], x[4:], y[4:]
 
 
 def test_frozen_bimu_plan_is_matched_and_prospective() -> None:
@@ -64,70 +53,6 @@ def test_frozen_bimu_plan_is_matched_and_prospective() -> None:
     }
     with pytest.raises(TypeError):
         INVALID_PRIOR_ATTEMPT["seed"] = 157001  # type: ignore[index]
-
-
-def test_manifest_binds_exact_data_source_runtime_and_plan(monkeypatch: pytest.MonkeyPatch) -> None:
-    import alberta_framework.evaluation.bimu_matched_nonpromoting as module
-
-    tiny_plan = module._test_plan(input_dim=4, n_classes=2, examples=4)
-    monkeypatch.setattr(module, "FROZEN_BIMU_MATCHED_PLAN", tiny_plan)
-    manifest = build_bimu_execution_manifest(*_data())
-    validate_bimu_execution_manifest(manifest, *_data())
-    assert manifest["policy"]["scientific_promotion_allowed"] is False
-    assert manifest["identity"]["consistency_not_attestation"] is True
-
-
-def test_manifest_rejects_forged_nested_identity() -> None:
-    import alberta_framework.evaluation.bimu_matched_nonpromoting as module
-
-    plan = module._test_plan(input_dim=4, n_classes=2, examples=4)
-    original = module.FROZEN_BIMU_MATCHED_PLAN
-    module.FROZEN_BIMU_MATCHED_PLAN = plan
-    try:
-        manifest = build_bimu_execution_manifest(*_data())
-        forged = copy.deepcopy(manifest)
-        forged["plan"]["seeds"][0] = 23
-        with pytest.raises(ValueError, match="plan"):
-            validate_bimu_execution_manifest(forged, *_data())
-    finally:
-        module.FROZEN_BIMU_MATCHED_PLAN = original
-
-
-def test_manifest_rejects_hostile_key_without_hooks() -> None:
-    class Hostile(str):
-        calls = 0
-
-        def __hash__(self) -> int:
-            self.calls += 1
-            return super().__hash__()
-
-        def __eq__(self, other: object) -> bool:
-            self.calls += 1
-            raise AssertionError("must not compare")
-
-    key = Hostile("schema")
-    payload = {key: "x"}
-    key.calls = 0
-    with pytest.raises(ValueError, match="exact JSON"):
-        validate_bimu_execution_manifest(payload, *_data())
-    assert key.calls == 0
-
-
-def test_manifest_rejects_hostile_metaclass_without_hooks() -> None:
-    class HostileMeta(type):
-        calls = 0
-
-        def __eq__(cls, other: object) -> bool:
-            cls.calls += 1
-            raise AssertionError("must not compare runtime types")
-
-    class Hostile(metaclass=HostileMeta):
-        pass
-
-    HostileMeta.calls = 0
-    with pytest.raises(ValueError, match="exact JSON"):
-        bimu_plan._json_preflight({"value": Hostile()})
-    assert HostileMeta.calls == 0
 
 
 def test_literal_plan_digest_fails_closed_on_unreviewed_drift(

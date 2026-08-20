@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import importlib.metadata
 import json
-import math
 import os
 import platform
 import sys
@@ -13,7 +12,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Final, cast
+from typing import Final
 
 import jax
 import numpy as np
@@ -21,13 +20,8 @@ import numpy as np
 from alberta_framework.benchmarks.bimu import BiMUConfig, _dataset_sha256
 
 PLAN_SCHEMA: Final = "asi.bimu.matched-development-plan.v3"
-MANIFEST_SCHEMA: Final = "asi.bimu.matched-development-execution-manifest.v1"
 OUTPUT_NAMESPACE: Final = Path("outputs/bimu_matched/development.v1")
 EXECUTION_AUTHORIZED: Final = False
-_MAX_JSON_NODES = 20_000
-_MAX_TEXT_BYTES = 4096
-_MAX_MANIFEST_BYTES = 2 * 1024 * 1024
-_MAX_DATASET_BYTES = 16 * 1024 * 1024
 _DIGEST = "85c681c2f5fc5c274870b30c9accb3d2a6e9eb90a4575a2bf1ccca64f58b6227"
 FROZEN_PLAN_SHA256: Final = "11ddfacd0aca8108a39bd8a68225149de246efb7420d2fdb864f36ea75681f71"
 
@@ -166,48 +160,6 @@ def _canonical(value: object) -> bytes:
     return json.dumps(
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
     ).encode("ascii")
-
-
-def _json_preflight(value: object) -> None:
-    pending = [value]
-    nodes = 0
-    while pending:
-        current = pending.pop()
-        nodes += 1
-        if nodes > _MAX_JSON_NODES:
-            raise ValueError("manifest exceeds exact JSON node ceiling")
-        if type(current) is dict:
-            mapping = cast(dict[object, object], current)
-            if len(mapping) > _MAX_JSON_NODES:
-                raise ValueError("manifest exceeds exact JSON node ceiling")
-            for key in mapping.keys():
-                if type(key) is not str or len(key.encode("utf-8")) > _MAX_TEXT_BYTES:
-                    raise ValueError("manifest must be an exact JSON tree")
-            pending.extend(mapping.values())
-        elif type(current) is list:
-            if len(cast(list[object], current)) > _MAX_JSON_NODES:
-                raise ValueError("manifest exceeds exact JSON node ceiling")
-            pending.extend(cast(list[object], current))
-        elif type(current) is str:
-            if len(current.encode("utf-8")) > _MAX_TEXT_BYTES:
-                raise ValueError("manifest text exceeds ceiling")
-        elif type(current) is int:
-            if not -(2**63) <= current <= 2**63 - 1:
-                raise ValueError("manifest integer exceeds signed-int64")
-        elif type(current) is float:
-            if not math.isfinite(current):
-                raise ValueError("manifest float must be finite")
-        elif type(current) is not bool and type(current) is not type(None):
-            raise ValueError("manifest must be an exact JSON tree")
-
-
-def _fields(value: object, expected: tuple[str, ...], name: str) -> dict[str, object]:
-    if type(value) is not dict:
-        raise ValueError(f"{name} must be an exact object")
-    mapping = cast(dict[str, object], value)
-    if len(mapping) != len(expected) or set(mapping) != set(expected):
-        raise ValueError(f"{name} fields drifted")
-    return mapping
 
 
 def _plan_payload(plan: BiMUMatchedDevelopmentPlan) -> dict[str, object]:
@@ -360,111 +312,3 @@ def _dependency_identity() -> dict[str, object]:
         },
         "uv_lock_sha256": hashlib.sha256((root / "uv.lock").read_bytes()).hexdigest(),
     }
-
-
-def _validated_dataset_arrays(
-    train_x: object, train_y: object, test_x: object, test_y: object
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    plan = FROZEN_BIMU_MATCHED_PLAN
-    config = plan.candidate_config
-    expected = (
-        (
-            "train_x",
-            train_x,
-            np.dtype(np.float32),
-            (config.train_examples_per_task, config.input_dim),
-        ),
-        ("train_y", train_y, np.dtype(np.int32), (config.train_examples_per_task,)),
-        ("test_x", test_x, np.dtype(np.float32), (config.test_examples_per_task, config.input_dim)),
-        ("test_y", test_y, np.dtype(np.int32), (config.test_examples_per_task,)),
-    )
-    arrays: list[np.ndarray] = []
-    total_bytes = 0
-    for name, value, dtype, shape in expected:
-        if type(value) is not np.ndarray or value.dtype != dtype or value.shape != shape:
-            raise ValueError(f"{name} does not match the frozen exact shape/dtype")
-        total_bytes += value.size * value.dtype.itemsize
-        if total_bytes > _MAX_DATASET_BYTES:
-            raise ValueError("dataset exceeds the frozen byte ceiling")
-        arrays.append(value)
-    for name, features in (("train_x", arrays[0]), ("test_x", arrays[2])):
-        if not np.all(np.isfinite(features)):
-            raise ValueError(f"{name} must contain only finite values")
-    for name, labels in (("train_y", arrays[1]), ("test_y", arrays[3])):
-        if np.any(labels < 0) or np.any(labels >= config.n_classes):
-            raise ValueError(f"{name} contains an out-of-range label")
-    return arrays[0], arrays[1], arrays[2], arrays[3]
-
-
-def build_bimu_execution_manifest(
-    train_x: object, train_y: object, test_x: object, test_y: object
-) -> dict[str, object]:
-    arrays = _validated_dataset_arrays(train_x, train_y, test_x, test_y)
-    plan = FROZEN_BIMU_MATCHED_PLAN
-    digest = _dataset_sha256(
-        *arrays,
-    )
-    if digest != plan.dataset_sha256:
-        raise ValueError("dataset does not match the frozen plan")
-    plan_payload = _plan_payload(plan)
-    manifest: dict[str, object] = {
-        "schema": MANIFEST_SCHEMA,
-        "plan": plan_payload,
-        "identity": {
-            "source_sha256": _source_identity(),
-            "runtime": _runtime_identity(),
-            "plan_sha256": hashlib.sha256(_canonical(plan_payload)).hexdigest(),
-            "consistency_not_attestation": True,
-        },
-        "policy": {
-            "development_only": True,
-            "scientific_promotion_allowed": False,
-            "execution_authorized": False,
-            "output_retained": False,
-        },
-    }
-    manifest["manifest_sha256"] = hashlib.sha256(_canonical(manifest)).hexdigest()
-    validate_bimu_execution_manifest(manifest, train_x, train_y, test_x, test_y)
-    return manifest
-
-
-def validate_bimu_execution_manifest(
-    value: object, train_x: object, train_y: object, test_x: object, test_y: object
-) -> None:
-    _json_preflight(value)
-    root = _fields(value, ("schema", "plan", "identity", "policy", "manifest_sha256"), "manifest")
-    if root["schema"] != MANIFEST_SCHEMA:
-        raise ValueError("manifest schema drifted")
-    expected_plan = _plan_payload(FROZEN_BIMU_MATCHED_PLAN)
-    if root["plan"] != expected_plan:
-        raise ValueError("plan does not match the prospective frozen plan")
-    arrays = _validated_dataset_arrays(train_x, train_y, test_x, test_y)
-    digest = _dataset_sha256(*arrays)
-    if digest != FROZEN_BIMU_MATCHED_PLAN.dataset_sha256:
-        raise ValueError("dataset does not match the frozen plan")
-    identity = _fields(
-        root["identity"],
-        ("source_sha256", "runtime", "plan_sha256", "consistency_not_attestation"),
-        "identity",
-    )
-    expected_identity = {
-        "source_sha256": _source_identity(),
-        "runtime": _runtime_identity(),
-        "plan_sha256": hashlib.sha256(_canonical(expected_plan)).hexdigest(),
-        "consistency_not_attestation": True,
-    }
-    if identity != expected_identity:
-        raise ValueError("execution identity drifted")
-    if root["policy"] != {
-        "development_only": True,
-        "scientific_promotion_allowed": False,
-        "execution_authorized": False,
-        "output_retained": False,
-    }:
-        raise ValueError("policy drifted")
-    unsigned = dict(root)
-    claimed = unsigned.pop("manifest_sha256")
-    if type(claimed) is not str or claimed != hashlib.sha256(_canonical(unsigned)).hexdigest():
-        raise ValueError("manifest digest drifted")
-    if len(_canonical(root)) > _MAX_MANIFEST_BYTES:
-        raise ValueError("manifest exceeds byte ceiling")

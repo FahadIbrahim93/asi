@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import hashlib
+import os
 import sys
 from pathlib import Path
 from typing import Any, cast
@@ -270,6 +271,58 @@ def test_fixed_namespace_publication_is_append_only(
         campaign.main(["validate", "--root", str(tmp_path)])
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_publication_parent_swap_never_writes_through_replacement(
+    tmp_path: Path, tiny_campaign: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = campaign.campaign_path(tmp_path, "plan")
+    retired = tmp_path / "retired"
+    replacement_bytes = b"replacement-directory"
+    original_link = campaign._link_unnamed_file
+
+    def swap_parent(file_descriptor: int, parent_descriptor: int, name: str) -> None:
+        path.parent.rename(retired)
+        path.parent.mkdir()
+        path.write_bytes(replacement_bytes)
+        original_link(file_descriptor, parent_descriptor, name)
+
+    monkeypatch.setattr(campaign, "_link_unnamed_file", swap_parent)
+    with pytest.raises(RuntimeError, match="parent changed"):
+        campaign.publish_json(path, campaign.build_plan_document(), root=tmp_path)
+
+    assert path.read_bytes() == replacement_bytes
+    assert (retired / path.name).is_file()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="campaign publication is Linux-only")
+def test_publication_race_retains_concurrent_destination(
+    tmp_path: Path, tiny_campaign: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = campaign.campaign_path(tmp_path, "plan")
+    competitor = b"concurrent-winner"
+    original_link = campaign._link_unnamed_file
+
+    def occupy_destination(file_descriptor: int, parent_descriptor: int, name: str) -> None:
+        competitor_descriptor = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o444,
+            dir_fd=parent_descriptor,
+        )
+        try:
+            os.write(competitor_descriptor, competitor)
+            os.fsync(competitor_descriptor)
+        finally:
+            os.close(competitor_descriptor)
+        original_link(file_descriptor, parent_descriptor, name)
+
+    monkeypatch.setattr(campaign, "_link_unnamed_file", occupy_destination)
+    with pytest.raises(FileExistsError, match="refusing to replace"):
+        campaign.publish_json(path, campaign.build_plan_document(), root=tmp_path)
+
+    assert path.read_bytes() == competitor
+
+
 @pytest.mark.skipif(sys.platform != "linux", reason="campaign file validation is Linux-only")
 def test_strict_loader_rejects_duplicate_keys_and_oversized_input(tmp_path: Path) -> None:
     duplicate = tmp_path / "duplicate.json"
@@ -288,6 +341,30 @@ def test_strict_loader_rejects_duplicate_keys_and_oversized_input(tmp_path: Path
     linked_alias.hardlink_to(linked)
     with pytest.raises(ValueError, match="hard-link"):
         campaign.load_json_strict(linked, byte_ceiling=1024)
+
+    long_key = tmp_path / "long-key.json"
+    long_key.write_text('{"' + "x" * (campaign.MAX_TEXT_BYTES + 1) + '":0}', encoding="utf-8")
+    with pytest.raises(ValueError, match="keys|text"):
+        campaign.load_json_strict(long_key, byte_ceiling=campaign.MAX_TEXT_BYTES + 32)
+
+    recursive = tmp_path / "recursive.json"
+    recursive.write_text("[" * 2000 + "0" + "]" * 2000, encoding="ascii")
+    with pytest.raises(ValueError, match="strict document|nesting"):
+        campaign.load_json_strict(recursive, byte_ceiling=5000)
+
+
+def test_json_tree_rejects_hostile_exact_type_subclasses_without_hooks() -> None:
+    class Hostile(str):
+        calls = 0
+
+        def encode(self, *args: object, **kwargs: object) -> bytes:
+            self.calls += 1
+            raise AssertionError("subclass hooks must not run")
+
+    key = Hostile("schema")
+    with pytest.raises(ValueError, match="keys"):
+        campaign._validate_json_tree({key: "value"})
+    assert key.calls == 0
 
 
 def test_cli_has_only_plan_run_shard_summarize_and_validate() -> None:

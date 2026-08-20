@@ -9,13 +9,14 @@ never contributes to the paired outcome.
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import hashlib
 import json
 import math
 import os
 import secrets
 import stat
-import tempfile
 import time
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -942,6 +943,51 @@ def _allowed_path(path: Path, root: Path) -> bool:
     return path in candidates
 
 
+def _open_output_parent(path: Path, *, create: bool) -> tuple[Path, int]:
+    """Open an absolute parent through no-follow directory descriptors."""
+
+    destination = Path(os.path.abspath(os.fspath(path)))
+    descriptor = os.open(os.path.sep, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for component in destination.parent.parts[1:]:
+            if component in ("", ".", ".."):
+                _fail("campaign path contains an unsafe directory component")
+            if create:
+                try:
+                    os.mkdir(component, mode=0o755, dir_fd=descriptor)
+                except FileExistsError:
+                    pass
+            next_descriptor = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                dir_fd=descriptor,
+            )
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return destination, descriptor
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
+def _link_unnamed_file(file_descriptor: int, parent_descriptor: int, name: str) -> None:
+    libc = ctypes.CDLL(None, use_errno=True)
+    linkat = libc.linkat
+    linkat.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+    )
+    linkat.restype = ctypes.c_int
+    if linkat(file_descriptor, b"", parent_descriptor, os.fsencode(name), 0x1000) != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise FileExistsError(error, os.strerror(error), name)
+        raise OSError(error, os.strerror(error), name)
+
+
 def publish_json(path: Path, value: object, *, root: Path) -> None:
     """Atomically publish one canonical campaign file without replacement."""
 
@@ -956,40 +1002,58 @@ def publish_json(path: Path, value: object, *, root: Path) -> None:
     else:
         validate_bimu_shard(value)
     raw = _canonical(value) + b"\n"
-    root.mkdir(parents=True, exist_ok=True)
-    namespace = root / OUTPUT_NAMESPACE
-    namespace.mkdir(parents=True, exist_ok=True)
-    (namespace / "shards").mkdir(exist_ok=True)
-    for component in (root, *namespace.parents, namespace, path.parent):
-        if component.exists() and component.is_symlink():
-            _fail("campaign publication path contains a symlink")
-    if os.path.lexists(path):
-        raise FileExistsError(f"refusing to replace existing campaign artifact: {path}")
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
+    shard_path = campaign_path(
+        root,
+        "shard",
+        arm=_ARMS[0],
+        seed=FROZEN_BIMU_MATCHED_PLAN.seeds[0],
     )
-    temporary = Path(temporary_name)
-    published = False
+    _, shard_parent_descriptor = _open_output_parent(shard_path, create=True)
+    os.close(shard_parent_descriptor)
+    destination, parent_descriptor = _open_output_parent(path, create=True)
+    file_descriptor: int | None = None
     try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(raw)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.link(temporary, path, follow_symlinks=False)
-        published = True
-        directory_descriptor = os.open(path.parent, os.O_RDONLY)
         try:
-            os.fsync(directory_descriptor)
+            os.stat(destination.name, dir_fd=parent_descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            pass
+        else:
+            raise FileExistsError(
+                f"refusing to replace existing campaign artifact: {destination}"
+            )
+        if not hasattr(os, "O_TMPFILE"):
+            raise OSError("immutable publication requires Linux O_TMPFILE support")
+        file_descriptor = os.open(
+            ".",
+            os.O_WRONLY | os.O_CLOEXEC | os.O_TMPFILE,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
+        view = memoryview(raw)
+        written = 0
+        while written < len(view):
+            written += os.write(file_descriptor, view[written:])
+        os.fsync(file_descriptor)
+        os.fchmod(file_descriptor, 0o444)
+        try:
+            _link_unnamed_file(file_descriptor, parent_descriptor, destination.name)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"refusing to replace existing campaign artifact: {destination}"
+            ) from exc
+        os.fsync(parent_descriptor)
+        _, live_parent_descriptor = _open_output_parent(destination, create=False)
+        try:
+            pinned = os.fstat(parent_descriptor)
+            live = os.fstat(live_parent_descriptor)
+            if (pinned.st_dev, pinned.st_ino) != (live.st_dev, live.st_ino):
+                raise RuntimeError("campaign publication parent changed during publication")
         finally:
-            os.close(directory_descriptor)
-    except BaseException:
-        if published:
-            path.unlink(missing_ok=True)
-        raise
+            os.close(live_parent_descriptor)
     finally:
-        temporary.unlink(missing_ok=True)
+        if file_descriptor is not None:
+            os.close(file_descriptor)
+        os.close(parent_descriptor)
 
 
 def _load_plan(root: Path) -> dict[str, object]:
