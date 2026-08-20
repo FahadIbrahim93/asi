@@ -10,6 +10,7 @@ from typing import Never
 import numpy as np
 import pytest
 
+import alberta_framework.benchmarks.adamo_diagnostic as diagnostic
 from alberta_framework.benchmarks.adamo_diagnostic import (
     ARMS,
     FROZEN_DEVELOPMENT_SEEDS,
@@ -121,6 +122,48 @@ def test_contract_and_matched_seed_schedules_are_disjoint(
             profile="bounded-development",
             seed=FROZEN_MATCHED_DEVELOPMENT_SEEDS[0],
         )
+
+
+def test_public_function_cannot_consume_reserved_matched_seed(
+    tiny_data: tuple[np.ndarray, np.ndarray], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def forbidden_run(*args: object, **kwargs: object) -> Never:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("reserved matched execution must not start")
+
+    monkeypatch.setattr(diagnostic, "run_screening_config", forbidden_run)
+    with pytest.raises(ValueError, match="contract-smoke"):
+        run_adamo_diagnostic(
+            *tiny_data,
+            profile="bounded-development",
+            seed=FROZEN_MATCHED_DEVELOPMENT_SEEDS[0],
+        )
+    assert calls == 0
+
+
+def test_public_cli_cannot_consume_reserved_matched_seed_before_loading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def forbidden_load(path: Path) -> Never:
+        nonlocal calls
+        calls += 1
+        raise AssertionError("reserved matched CLI must not load data")
+
+    monkeypatch.setattr(diagnostic, "_load_dataset", forbidden_load)
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "--dataset", str(tmp_path / "unused.npz"),
+                "--profile", "bounded-development",
+                "--seed", str(FROZEN_MATCHED_DEVELOPMENT_SEEDS[0]),
+            ]
+        )
+    assert calls == 0
 
 
 def test_retained_receipt_can_be_validated_offline(
