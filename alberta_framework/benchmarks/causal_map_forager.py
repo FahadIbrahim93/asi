@@ -62,10 +62,12 @@ _CAUSAL_MAP_ENVIRONMENT_PRNG_IMPL = "threefry2x32"
 _EXACT_NUMPY_INTEGER_TYPES = (
     np.int8,
     np.int16,
+    np.intc,
     np.int32,
     np.int64,
     np.uint8,
     np.uint16,
+    np.uintc,
     np.uint32,
     np.uint64,
 )

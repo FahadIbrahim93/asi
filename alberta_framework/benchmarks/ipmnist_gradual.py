@@ -46,11 +46,13 @@ _ADAMW_IDENTITY = tuple(sorted(ADAMW_PROTOCOL_HYPERPARAMETERS.items()))
 _NUMPY_INTEGER_TYPES = (
     np.int8,
     np.int16,
+    np.intc,
     np.int32,
     np.int64,
     np.longlong,
     np.uint8,
     np.uint16,
+    np.uintc,
     np.uint32,
     np.uint64,
     np.ulonglong,
