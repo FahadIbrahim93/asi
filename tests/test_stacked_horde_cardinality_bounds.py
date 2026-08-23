@@ -98,6 +98,16 @@ def test_nexting_spec_rejects_oversized_product() -> None:
         )
 
 
+def test_nexting_spec_bounds_before_per_element_walk() -> None:
+    # Every element is invalid (negative), so if the per-element validation
+    # walk ran first the rejection would be a per-element error. The
+    # cardinality gate must fire on the raw lengths before any element is
+    # inspected.
+    oversized = tuple(-1 for _ in range(4097))
+    with pytest.raises(ValueError, match="derived n_demons"):
+        nexting_spec(feature_dim=2, cumulant_indices=oversized, gammas=(0.9,))
+
+
 def test_nexting_spec_accepts_boundary_product() -> None:
     cfg = nexting_spec(
         feature_dim=2,

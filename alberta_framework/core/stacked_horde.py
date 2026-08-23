@@ -362,6 +362,13 @@ def nexting_spec(
     feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
     raw_indices = _require_sequence("cumulant_indices", cumulant_indices)
     raw_gammas = _require_sequence("gammas", gammas)
+    # Bound the derived demon product on the raw lengths before the
+    # per-element validation walk, so an oversized input is rejected by the
+    # cardinality gate rather than walked element-by-element first.
+    if len(raw_indices) * len(raw_gammas) > _MAX_STACKED_HORDE_DEMONS:
+        raise ValueError(
+            f"derived n_demons must be in [1, {_MAX_STACKED_HORDE_DEMONS}]"
+        )
     canonical_indices = tuple(
         _require_int32(f"cumulant_indices[{i}]", value, minimum=0)
         for i, value in enumerate(raw_indices)
