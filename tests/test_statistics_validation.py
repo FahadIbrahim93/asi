@@ -668,7 +668,9 @@ class TestIdenticalWilcoxonRejection:
         assert result.test_name == "Wilcoxon signed-rank"
         assert result.statistic == pytest.approx(0.0)
         assert result.p_value < 1.0
-        assert result.effect_size == cohens_d([1.0, 2.0, 3.0], [0.5, 1.5, 2.5])
+        # Paired effect size is d_z on the within-pair differences (#2154):
+        # constant +0.5 shift -> zero-variance differences -> signed infinity.
+        assert result.effect_size == float("inf")
 
 
 class TestOneSampleRejection:
