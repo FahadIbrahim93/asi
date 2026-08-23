@@ -23,7 +23,10 @@ pytestmark = pytest.mark.unit
 
 C_INT_SIGNED = [np.int8, np.int16, np.int32, np.int64, np.intc]
 C_INT_UNSIGNED = [np.uint8, np.uint16, np.uint32, np.uint64, np.uintc]
-ALL_C_INT = C_INT_SIGNED + C_INT_UNSIGNED
+# longlong/ulonglong are the orphan family on LP64 (Linux/macOS), where
+# np.intc is np.int32 and np.longlong is the distinct 64-bit C type.
+# Including them makes the suite ABI-complete on both LLP64 and LP64.
+ALL_C_INT = C_INT_SIGNED + C_INT_UNSIGNED + [np.longlong, np.ulonglong]
 
 
 def test_gradual_transition_config_accepts_every_c_int_family() -> None:
@@ -56,9 +59,14 @@ def test_task_sampling_mask_accepts_every_c_int_family() -> None:
     # int (JAX key domain) — that is separate from the #2295 allowlist defect.
     mask = task_sampling_mask(seed=7, transition_id=np.intc(2), count=16, alpha=0.5)
     assert mask.shape == (16,)
-    for family in C_INT_UNSIGNED:
+    for family in C_INT_UNSIGNED + [np.ulonglong]:
         mask = task_sampling_mask(
             seed=7, transition_id=family(2), count=family(16), alpha=0.5
+        )
+        assert mask.shape == (16,)
+    for family in C_INT_SIGNED + [np.longlong]:
+        mask = task_sampling_mask(
+            seed=7, transition_id=family(2), count=16, alpha=0.5
         )
         assert mask.shape == (16,)
 
