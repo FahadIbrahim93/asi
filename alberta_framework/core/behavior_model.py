@@ -230,6 +230,16 @@ def floor_and_renormalize_probabilities(
         jnp.asarray(1e-12, dtype=jnp.float32),
     )
     normalized = clipped / normalizer
+    # The affine step below is a simplex only when ``normalized`` sums to one.
+    # A zero clipped mass, or a float32 normalizer so large that the reciprocal
+    # underflows (XLA evaluates ``clipped / normalizer`` as multiply-by-reciprocal),
+    # leaves ``normalized`` all-zero, which would otherwise return
+    # ``min_probability`` in every slot instead of a distribution.  Fall back to
+    # uniform in that case; well-formed inputs keep ``normalized`` bit-for-bit.
+    normalized_sum = jnp.sum(normalized, axis=-1, keepdims=True)
+    usable = normalized_sum > jnp.asarray(0.5, dtype=jnp.float32)
+    uniform = jnp.ones_like(probs) / n_actions
+    normalized = jnp.where(usable, normalized, uniform)
     floor_mass = jnp.asarray(min_probability * n_actions, dtype=jnp.float32)
     return jnp.asarray(min_probability, dtype=jnp.float32) + (1.0 - floor_mass) * normalized
 
