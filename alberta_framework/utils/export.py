@@ -19,7 +19,7 @@ from numpy.typing import NDArray
 
 from alberta_framework._seed_validation import require_unique_jax_seeds
 from alberta_framework.utils.experiments import AggregatedResults, MetricSummary
-from alberta_framework.utils.statistics import SignificanceResult
+from alberta_framework.utils.statistics import SignificanceResult, common_final_window
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -261,6 +261,19 @@ def _preflight_export_results(
             if actual_statistics != expected_statistics:
                 raise ValueError(f"{qualified_name} statistics do not match values")
             export_cells = _checked_export_cells(export_cells, int(summary.values.size))
+
+    if metric is not None:
+        # A metric-ranked export compares the configs' final-value summaries,
+        # each averaged over min(100, n_steps) steps by aggregate_metrics; the
+        # comparison is only meaningful when that window agrees across configs.
+        common_final_window(
+            {
+                name: int(aggregate.metric_arrays[metric].shape[1])
+                for name, aggregate in results.items()
+            },
+            100,
+            metric,
+        )
 
 
 def _write_text_atomically(filepath: Path, payload: str) -> None:
