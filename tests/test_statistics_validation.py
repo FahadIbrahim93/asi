@@ -1179,3 +1179,55 @@ class TestPairwiseComparisons:
     def test_common_final_window_requires_positive_integer(self, window: object) -> None:
         with pytest.raises(ValueError, match="window must be a positive integer"):
             common_final_window({"learner": 10}, window, "squared_error")
+
+
+class TestProbabilityPrecision:
+    """Stored p-values and alphas keep full float64 precision.
+
+    p-values are measurement outputs and alpha is a preregistered decision
+    threshold; neither has a float32 consumer, so narrowing them to binary32
+    corrupts the recorded artifact (anything below ~1.4e-45 flushes to an
+    impossible exact 0) and makes verdicts depend on the host container type
+    of the same real number.
+    """
+
+    def test_ttest_p_value_matches_scipy_exactly(self) -> None:
+        scipy_stats = pytest.importorskip("scipy.stats")
+        rng = np.random.default_rng(11)
+        x = rng.normal(0.0, 1.0, 20)
+        y = x + 0.9 + rng.normal(0.0, 0.05, 20)
+        expected = float(scipy_stats.ttest_rel(x, y).pvalue)
+        result = ttest_comparison(x, y, paired=True)
+        assert result.p_value == expected
+
+    def test_extreme_p_value_is_not_flushed_to_zero(self) -> None:
+        scipy_stats = pytest.importorskip("scipy.stats")
+        rng = np.random.default_rng(20260823)
+        a = 0.010 + rng.normal(0.0, 0.00008, 20)
+        b = 0.500 + rng.normal(0.0, 0.00080, 20)
+        expected = float(scipy_stats.ttest_rel(a, b).pvalue)
+        assert 0.0 < expected < 1e-45
+        result = ttest_comparison(a, b, paired=True)
+        assert result.p_value == expected
+        assert result.p_value > 0.0
+
+    def test_alpha_is_recorded_exactly(self) -> None:
+        result = ttest_comparison(
+            np.asarray([1.0, 2.0, 4.0, 8.0]),
+            np.asarray([1.5, 2.5, 3.5, 6.0]),
+            paired=True,
+            alpha=np.float64(0.01),
+        )
+        assert result.alpha == 0.01
+
+    @pytest.mark.parametrize("correction", [bonferroni_correction, holm_correction])
+    def test_correction_verdicts_do_not_depend_on_host_container(
+        self, correction: Any
+    ) -> None:
+        boundary = 0.016666666666666663
+        assert boundary < 0.05 / 3
+        from_double = correction([np.float64(boundary)] * 3, alpha=0.05)
+        from_builtin = correction([boundary] * 3, alpha=0.05)
+        assert from_double == from_builtin
+        significant = from_double[0] if correction is bonferroni_correction else from_double
+        assert list(significant) == [True, True, True]
