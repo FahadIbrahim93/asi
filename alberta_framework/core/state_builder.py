@@ -70,6 +70,7 @@ from alberta_framework.core.working_memory import (
 )
 
 _INT32_MAX = 2**31 - 1
+_MAX_FIXED_TRACE_DECAY_RATES = 1 << 12
 _ACTUAL_INT_TYPES = frozenset(
     {
         int,
@@ -119,6 +120,10 @@ def _require_decay_rates(name: str, value: object) -> tuple[float, ...]:
     if type(value) is not tuple:
         raise ValueError(f"{name} must be an actual tuple")
     rates = cast(tuple[object, ...], value)
+    if len(rates) > _MAX_FIXED_TRACE_DECAY_RATES:
+        raise ValueError(
+            f"{name} must contain at most {_MAX_FIXED_TRACE_DECAY_RATES} decay rates"
+        )
     return tuple(
         validated_float32_scalar(
             f"{name}[{index}]",
@@ -1036,12 +1041,20 @@ class FixedTraceStateBuilderConfig:
         obs_decays = data["observation_decay_rates"]
         act_decays = data["action_decay_rates"]
         out_decays = data["outcome_decay_rates"]
-        if (
-            not isinstance(obs_decays, (list, tuple))
-            or not isinstance(act_decays, (list, tuple))
-            or not isinstance(out_decays, (list, tuple))
+        for name, value in (
+            ("observation_decay_rates", obs_decays),
+            ("action_decay_rates", act_decays),
+            ("outcome_decay_rates", out_decays),
         ):
-            raise ValueError("decay rates must be lists or tuples")
+            # Exact-type check rejects list subclasses before any length or
+            # iteration hook can run; the length cap bounds the tuple copy.
+            if type(value) not in (list, tuple):
+                raise ValueError("decay rates must be lists or tuples")
+            if len(value) > _MAX_FIXED_TRACE_DECAY_RATES:
+                raise ValueError(
+                    f"{name} must contain at most "
+                    f"{_MAX_FIXED_TRACE_DECAY_RATES} decay rates"
+                )
         return cls(
             observation_dim=data["observation_dim"],
             n_actions=data["n_actions"],
