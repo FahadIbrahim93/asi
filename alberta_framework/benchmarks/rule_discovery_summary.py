@@ -13,8 +13,8 @@ import numpy as np
 
 import alberta_framework.benchmarks.rule_discovery as rule_discovery_module
 from alberta_framework._seed_validation import require_jax_seed, require_unique_jax_seeds
-from alberta_framework._strict_json import load_strict_json_object
 from alberta_framework.benchmarks.ipmnist_provenance import analysis_provenance
+from alberta_framework.benchmarks.ipmnist_screening import load_shard
 from alberta_framework.benchmarks.rule_discovery import NONPROMOTING_POLICY
 
 SCREEN_ARMS = (
@@ -37,13 +37,38 @@ DISCOVERY_ARMS = (
 CHAMPION = "sigma0_shiftnorm_d099"
 
 
-def _arm(directory: Path, name: str, seeds: Sequence[int]) -> dict[str, Any]:
+def _require_stage_geometry(payload: dict[str, Any], expected_arm: str,
+                            expected_n_tasks: int, path: Path) -> None:
+    """Require the load_shard-validated payload to match its expected slot.
+
+    ``load_shard`` already validates the shard's internal consistency
+    (schema, config_name against the registry, curves, seed, environment).
+    This adds the rule-discovery-specific binding: the registered arm must
+    be the one this builder reads the file under, and the stage geometry
+    must match (60 tasks for screen, 200 for confirmation, length 5,000),
+    so semantic substitution is rejected before aggregation or provenance.
+    """
+    if payload["config_name"] != expected_arm:
+        raise ValueError(
+            f"{path}: config_name {payload['config_name']!r} does not match "
+            f"expected arm {expected_arm!r}"
+        )
+    n_tasks = payload["config"]["n_tasks"]
+    if n_tasks != expected_n_tasks:
+        raise ValueError(f"{path}: n_tasks must be {expected_n_tasks}, got {n_tasks!r}")
+    if payload["config"]["task_length"] != 5000:
+        raise ValueError(f"{path}: task_length must be 5000")
+
+
+def _arm(directory: Path, name: str, seeds: Sequence[int],
+         expected_n_tasks: int) -> dict[str, Any]:
     values = []
     for seed in seeds:
         path = directory / f"{name}_seed{seed}.json"
         if not path.exists():
             raise ValueError(f"{name} is missing seed {seed} in {directory}")
-        payload = load_strict_json_object(path)
+        payload = load_shard(path)
+        _require_stage_geometry(payload, name, expected_n_tasks, path)
         if (
             type(payload.get("per_task_accuracy")) is not list
             or not payload["per_task_accuracy"]
@@ -71,7 +96,8 @@ def build_legacy_rule_discovery_summary(
 ) -> dict[str, Any]:
     """Reconstruct the exact legacy v1 payload for compatibility checks."""
     seeds = require_unique_jax_seeds(seeds)
-    screen = {name: _arm(screen_dir, name, seeds) for name in SCREEN_ARMS}
+    screen = {name: _arm(screen_dir, name, seeds, expected_n_tasks=60)
+              for name in SCREEN_ARMS}
     confirm_names = ("disc_r1_pscale_norms", CHAMPION)
     present = [
         (confirm_dir / f"{name}_seed{seed}.json").exists()
@@ -81,7 +107,8 @@ def build_legacy_rule_discovery_summary(
     if any(present) and not all(present):
         raise ValueError("rule-discovery confirmation seeds are incomplete")
     full = (
-        {name: _arm(confirm_dir, name, seeds) for name in confirm_names}
+        {name: _arm(confirm_dir, name, seeds, expected_n_tasks=200)
+         for name in confirm_names}
         if all(present)
         else {}
     )

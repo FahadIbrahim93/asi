@@ -47,12 +47,54 @@ class _StringSubclass(str):
     pass
 
 
-def _shard(path: Path, *, seed: int, accuracy: float) -> None:
+def _shard(path: Path, *, seed: int, accuracy: float,
+            config_name: str = "disc_r1", n_tasks: int | None = None) -> None:
+    """Write a valid legacy v1 shard that survives ``_validate_shard_payload``.
+
+    The filename-derived config_name and n_tasks are inferred from the path so
+    rule-discovery and campaign-tools fixtures keep working after #2134 adds
+    payload-level arm / stage validation. Override config_name and n_tasks only
+    when constructing deliberate substitution probes.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"seed": seed, "per_task_accuracy": [accuracy, accuracy]}),
-        encoding="utf-8",
-    )
+    # Derive config_name + n_tasks from the expected filename / directory so the
+    # payload matches the arm and stage the builder will read it under.
+    stem = path.stem
+    if stem.endswith(f"_seed{seed}"):
+        inferred_name = stem[: -len(f"_seed{seed}")]
+    else:
+        inferred_name = config_name
+    # Infer stage from the parent directory name: "confirm" -> 200 tasks,
+    # everything else (e.g. "screen") -> 60 tasks.
+    if n_tasks is None:
+        parent_name = path.parent.name.lower()
+        n_tasks = 200 if parent_name == "confirm" else 60
+    payload = {
+        "schema": "alberta.ipmnist_screening.shard.v1",
+        "config_name": inferred_name,
+        "base_learner": "upgd_w",
+        "seed": seed,
+        "hyperparameters": {},
+        "per_task_accuracy": [accuracy] * n_tasks,
+        "per_task_loss": [0.5] * n_tasks,
+        "per_task_plasticity": [0.3] * n_tasks,
+        "wall_clock_seconds": 1.0,
+        "config": {
+            "input_dim": 784,
+            "hidden1": 300,
+            "hidden2": 150,
+            "n_classes": 10,
+            "n_tasks": n_tasks,
+            "task_length": 5000,
+        },
+        "environment": {
+            "jax": "0.11.0",
+            "numpy": "2.5.1",
+            "python": "3.12.3",
+            "platform": "Linux-7.0.0-28-generic-x86_64-with-glibc2.39",
+        },
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _ceiling_run(
