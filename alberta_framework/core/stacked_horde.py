@@ -355,6 +355,8 @@ def nexting_spec(
     feature_dim = _require_int32("feature_dim", feature_dim, minimum=1)
     raw_indices = _require_sequence("cumulant_indices", cumulant_indices)
     raw_gammas = _require_sequence("gammas", gammas)
+    if len(raw_indices) * len(raw_gammas) > _INT32_MAX:
+        raise ValueError("derived n_demons must be in the signed int32 domain")
     canonical_indices = tuple(
         _require_int32(f"cumulant_indices[{i}]", value, minimum=0)
         for i, value in enumerate(raw_indices)
@@ -365,7 +367,7 @@ def nexting_spec(
     )
     canonical_lamda = validated_float32_scalar("lamda", lamda, lower=0.0, upper=1.0)
     n_demons = len(canonical_indices) * len(canonical_gammas)
-    if n_demons < 1 or n_demons > _INT32_MAX:
+    if n_demons < 1:
         raise ValueError("derived n_demons must be in the signed int32 domain")
     _preflight_horde_resources(n_demons, feature_dim)
     _preflight_stacked_horde_update_working_set(n_demons, feature_dim)
