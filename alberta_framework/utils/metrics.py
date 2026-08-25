@@ -447,8 +447,10 @@ def compute_forward_transfer(
     on a task probed *before* it is ever trained on, minus a task-specific
     baseline (in GEM, the untrained-network performance).
 
-    Task 0, and any task without a finite pre-exposure probe, receives ``NaN``.
-    The sign is normalized so positive values always mean beneficial transfer.
+    The skip is keyed on the ``first_exposure`` row, not the task index.
+    Any task whose ``first_exposure`` row is 0 receives ``NaN`` because no
+    pre-exposure probe exists; the sign is normalized so positive values
+    always mean beneficial transfer.
     """
 
     higher_is_better = _require_exact_bool("higher_is_better", higher_is_better)
