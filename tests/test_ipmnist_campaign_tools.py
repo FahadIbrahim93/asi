@@ -425,7 +425,7 @@ def test_ceiling_confirm_alignment_rejects_delta_above_frozen_tolerance(
     tmp_path: Path,
 ) -> None:
     confirm = tmp_path / "confirm"
-    _shard(confirm / "sigma0_ndecay099_seed0.json", seed=0, accuracy=0.8)
+    _shard(confirm / "sigma0_ndecay099_seed0.json", seed=0, accuracy=0.8, n_tasks=2)
     run = {"seed": 0, "per_task_accuracy": [0.8, 0.8 + 2 * CONFIRM_ALIGNMENT_ATOL]}
 
     with pytest.raises(ValueError, match="exceeds atol"):
