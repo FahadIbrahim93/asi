@@ -451,6 +451,33 @@ def test_report_preflight_rejects_before_output_directory_mutation(
     assert list(existing.iterdir()) == [sentinel]
 
 
+def test_report_preserves_higher_is_better_table_direction(tmp_path: Path) -> None:
+    weak = _constant_result("weak", 0.2)
+    strong = _constant_result("strong", 0.9)
+    results = {
+        name: result._replace(
+            metric_arrays={"accuracy": result.metric_arrays[_METRIC]},
+            summary={"accuracy": result.summary[_METRIC]},
+        )
+        for name, result in (("weak", weak), ("strong", strong))
+    }
+
+    artifacts = save_experiment_report(
+        results,
+        tmp_path,
+        "accuracy_comparison",
+        metric="accuracy",
+        lower_is_better=False,
+    )
+
+    assert "| weak | 0.2000 ± 0.0000 |" in artifacts["markdown_table"].read_text()
+    assert "| strong | **0.9000** ± 0.0000 |" in artifacts["markdown_table"].read_text()
+    assert r"weak & 0.2000 $\pm$ 0.0000" in artifacts["latex_table"].read_text()
+    assert r"strong & \textbf{0.9000} $\pm$ 0.0000" in artifacts[
+        "latex_table"
+    ].read_text()
+
+
 @pytest.mark.parametrize("mode", ["summary_csv", "timeseries_csv", "json"])
 def test_shared_preflight_accepts_uint32_seed_boundaries(mode: str, tmp_path: Path) -> None:
     result = _timeseries_result()._replace(seeds=[0, (1 << 32) - 1])
