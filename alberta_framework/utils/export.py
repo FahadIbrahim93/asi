@@ -550,15 +550,13 @@ def _all_default_alpha(
     return all(result.alpha == 0.05 for result in significance_results.values())
 
 
-def _significance_star_count(p_value: float, alpha: float, *, legacy: bool) -> int:
+def _significance_star_count(p_value: float, alpha: float) -> int:
     """Star tier for one significant result, keyed to its own threshold.
 
-    Legacy mode (every result carries the historical uncorrected alpha 0.05)
-    preserves the exact historical raw-p tiers so default-path artifacts
-    render bit-identically.  Otherwise the tiers scale by orders of magnitude
-    below the result's own operative decision threshold.
+    The historical 0.05 threshold retains its raw-p tiers independently of
+    other comparisons. Other thresholds scale by orders of magnitude.
     """
-    if legacy:
+    if alpha == 0.05:
         if p_value < 0.001:
             return 3
         if p_value < 0.01:
@@ -585,9 +583,10 @@ def _significance_legend_markdown(
         return _LEGACY_MD_LEGEND
     segments = []
     for alpha in _distinct_alphas(significance_results):
+        tier2, tier3 = (0.01, 0.001) if alpha == 0.05 else (alpha / 10.0, alpha / 100.0)
         segments.append(
-            f"\\* p < {alpha:g}, \\*\\* p < {alpha / 10.0:g}, "
-            f"\\*\\*\\* p < {alpha / 100.0:g}"
+            f"alpha = {alpha:g}: \\* p < {alpha:g}, \\*\\* p < {tier2:g}, "
+            f"\\*\\*\\* p < {tier3:g}"
         )
     return "; ".join(segments)
 
@@ -600,9 +599,10 @@ def _significance_legend_latex(
         return _LEGACY_LATEX_LEGEND
     segments = []
     for alpha in _distinct_alphas(significance_results):
+        tier2, tier3 = (0.01, 0.001) if alpha == 0.05 else (alpha / 10.0, alpha / 100.0)
         segments.append(
-            f"$^*$ $p < {alpha:g}$, $^{{**}}$ $p < {alpha / 10.0:g}$, "
-            f"$^{{***}}$ $p < {alpha / 100.0:g}$"
+            f"alpha = {alpha:g}: $^*$ $p < {alpha:g}$, $^{{**}}$ $p < {tier2:g}$, "
+            f"$^{{***}}$ $p < {tier3:g}$"
         )
     return r"\footnotesize{" + "; ".join(segments) + "}"
 
@@ -633,7 +633,6 @@ def _get_significance_marker(
     stars = _significance_star_count(
         result.p_value,
         result.alpha,
-        legacy=_all_default_alpha(significance_results),
     )
     return _LATEX_STARS[stars]
 
@@ -723,7 +722,6 @@ def _get_md_significance_marker(
     stars = _significance_star_count(
         result.p_value,
         result.alpha,
-        legacy=_all_default_alpha(significance_results),
     )
     return " " + "*" * stars
 

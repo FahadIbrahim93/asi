@@ -17,7 +17,6 @@ from alberta_framework._scan_resources import (
     require_step_units,
 )
 from alberta_framework.utils.export import (
-    _all_default_alpha,
     _significance_star_count,
 )
 
@@ -682,6 +681,5 @@ def _get_significance_marker_for_plot(
     stars = _significance_star_count(
         result.p_value,
         result.alpha,
-        legacy=_all_default_alpha(significance_results),
     )
     return "*" * stars

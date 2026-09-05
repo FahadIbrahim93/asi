@@ -112,3 +112,15 @@ def test_plot_marker_matches_markdown_marker() -> None:
         md = _get_md_significance_marker("b", "a", d).strip()
         plot = _get_significance_marker_for_plot("b", "a", d)
         assert md == plot
+
+
+def test_unrelated_alpha_does_not_change_default_comparison_marker() -> None:
+    results = _dict(0.007, 0.05)
+    assert _get_md_significance_marker("b", "a", results) == " **"
+    results[("c", "a")] = _result(0.02, 0.10)
+    assert _get_md_significance_marker("b", "a", results) == " **"
+    assert _get_significance_marker("b", "a", results) == r"$^{**}$"
+    assert _get_significance_marker_for_plot("b", "a", results) == "**"
+    legend = _significance_legend_markdown(results)
+    assert "alpha = 0.05" in legend
+    assert "p < 0.01" in legend
