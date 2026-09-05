@@ -230,20 +230,30 @@ def _require_sample_vector(values: object, *, name: str) -> NDArray[np.float64]:
 
 
 def _require_probability(value: object, *, name: str, strict: bool) -> float:
+    """Return ``value`` as the exact host double after checking its domain.
+
+    Probabilities here are measurement outputs (p-values) or preregistered
+    decision thresholds (alpha), not float32-consumed configuration, so the
+    stored value keeps full float64 precision; narrowing a p-value to
+    binary32 flushes anything below ~1.4e-45 to an impossible exact 0 and
+    perturbs every stored value and verdict boundary by the container type.
+    """
+    domain = "strictly between 0 and 1" if strict else "in [0, 1]"
+    message = f"{name} must be a finite real {domain}"
     if type(value) not in _ALLOWED_REAL_TYPES:
-        domain = "strictly between 0 and 1" if strict else "in [0, 1]"
-        raise ValueError(f"{name} must be a finite real {domain}")
+        raise ValueError(message)
     try:
-        if strict:
-            return validated_float32_scalar(
-                name, value, positive=True, upper=1.0, upper_inclusive=False
-            )
-        return validated_float32_scalar(
-            name, value, lower=0.0, upper=1.0, upper_inclusive=True
-        )
-    except ValueError:
-        domain = "strictly between 0 and 1" if strict else "in [0, 1]"
-        raise ValueError(f"{name} must be a finite real {domain}") from None
+        converted = float(cast(Any, value))
+    except (OverflowError, ValueError):
+        raise ValueError(message) from None
+    if not math.isfinite(converted):
+        raise ValueError(message)
+    if strict:
+        if not 0.0 < converted < 1.0:
+            raise ValueError(message)
+    elif not 0.0 <= converted <= 1.0:
+        raise ValueError(message)
+    return converted
 
 
 def _require_alpha(alpha: object) -> float:
